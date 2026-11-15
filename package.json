@@ -1,0 +1,37 @@
+{
+  "name": "bean-import-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Web UI for importing Alipay/WeChat/bank/YunShanFu statements into beancount",
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "tsx watch src/server/index.ts",
+    "dev:web": "vite",
+    "build": "vite build",
+    "start": "tsx src/server/index.ts",
+    "smoke": "tsx scripts/smoke.ts"
+  },
+  "dependencies": {
+    "@types/multer": "^2.3.0",
+    "express": "^4.21.2",
+    "iconv-lite": "^0.6.3",
+    "multer": "^2.5.0",
+    "pdfjs-dist": "^6.5.438",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.0",
+    "pdf-lib": "^1.17.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11"
+  }
+}
