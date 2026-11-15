@@ -65,13 +65,13 @@ export default function ReviewEditor({ tx, draft, dirty, accounts, disabled, onC
   return <div className="review-editor">
     <fieldset disabled={disabled}>
       <div className="editor-grid">
-        <label>标签<input value={draft.tags} placeholder="trip2026 reimbursement" onChange={(event) => onChange({ ...draft, tags: event.target.value })} /><small>空格或逗号分隔。标签用英文字母、数字及 _ . / -；中文写在审阅备注中。</small>{badTags.length > 0 && <small className="error-line">标签格式无效：{badTags.join("、")}</small>}</label>
-        <label>账本标记<select value={draft.flag} onChange={(event) => onChange({ ...draft, flag: event.target.value as "*" | "!" })}><option value="*">* 正常</option><option value="!">! 待核实</option></select><small>标记独立于「是否入账」。</small></label>
+        <label>标签<input value={draft.tags} placeholder="trip2026 reimbursement" onChange={(event) => onChange({ ...draft, tags: event.target.value })} /><small>空格分隔；中文写审阅备注。</small>{badTags.length > 0 && <small className="error-line">标签格式无效：{badTags.join("、")}</small>}</label>
+        <label>账本标记<select value={draft.flag} onChange={(event) => onChange({ ...draft, flag: event.target.value as "*" | "!" })}><option value="*">* 正常</option><option value="!">! 待核实</option></select></label>
         <label className="wide">审阅备注<textarea rows={2} value={draft.reviewNote} onChange={(event) => onChange({ ...draft, reviewNote: event.target.value })} placeholder="记录优惠、代付或需要核实的原因" /></label>
       </div>
       <label className="check-label"><input type="checkbox" checked={draft.split} onChange={(event) => onChange({ ...draft, split: event.target.checked })} />手动编辑多条 posting（拆分优惠、代付、混合支付）</label>
       {draft.split && <div className="posting-editor">
-        <p className="muted">填写带正负号的金额，每个币种合计须为 0。保存后以这些 posting 生成分录。</p>
+        <p className="muted">金额带正负号，每个币种合计为 0。</p>
         {draft.postings.map((posting, index) => <div className="posting-row" key={index}>
           <AccountSelect value={posting.account} accounts={accounts} label={`第 ${index + 1} 条 posting 账户`} onChange={(account) => setPosting(index, { account })} />
           <input inputMode="decimal" aria-label={`第 ${index + 1} 条 posting 金额`} value={posting.amount} onChange={(event) => setPosting(index, { amount: event.target.value })} placeholder="带正负号的金额" />
@@ -81,7 +81,7 @@ export default function ReviewEditor({ tx, draft, dirty, accounts, disabled, onC
         <button className="btn small" onClick={() => onChange({ ...draft, postings: [...draft.postings, { account: "", amount: "0", currency: tx.currency }] })}>＋ 添加 posting</button>
         {splitError && <p className="error-line" role="alert">{invalid ? "请补全账户、金额和币种。" : draft.postings.length < 2 ? "至少保留两条 posting。" : `尚未平衡：${imbalances.map(([currency, amount]) => `${amount.toFixed(2)} ${currency}`).join("；")}`}</p>}
       </div>}
-      <div className="toolbar editor-actions"><button className="btn primary small" disabled={!dirty || Boolean(splitError) || badTags.length > 0} onClick={onSave}>保存此笔编辑</button><button className="btn small" disabled={!dirty} onClick={onDiscard}>放弃未保存编辑</button>{dirty && <span className="muted">有未保存编辑，生成预览已失效。</span>}</div>
+      <div className="toolbar editor-actions"><button className="btn primary small" disabled={!dirty || Boolean(splitError) || badTags.length > 0} onClick={onSave}>保存此笔编辑</button><button className="btn small" disabled={!dirty} onClick={onDiscard}>放弃这些改动</button>{dirty && <span className="muted">未保存，预览已失效。</span>}</div>
     </fieldset>
     <div className="source-details"><b>原始来源</b> {tx.sourceFile} · 第 {tx.row} 行 · {tx.source}<br />支付方式：{tx.rawAccount || "未提供"} · 状态：{tx.sourceStatus || "未提供"} · 原始收支：{tx.originalDirection || tx.direction}{tx.sourceTxId && <><br />交易号：<code>{tx.sourceTxId}</code></>}{tx.excludedReason && <p className="error-line">排除原因：{tx.excludedReason}</p>}{tx.issues?.map((issue, index) => <p className="error-line" key={index}>{issue}</p>)}</div>
   </div>;

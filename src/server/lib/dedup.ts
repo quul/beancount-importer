@@ -60,8 +60,8 @@ export function markDuplicates(allTxs: ParsedTx[], ledgerTxs: LedgerTx[]): Dedup
       && ledger.postings.some((posting) => posting.account === tx.fundingAccount && posting.currency === tx.currency && sameAmount(posting.amount, signedAmount(tx))));
     tx.matches = candidates.map((ledger) => ({ id: ledger.id, date: ledger.date, payee: ledger.payee, narration: ledger.narration,
       file: ledger.file, line: ledger.line, postings: ledger.postings,
-      reason: normPayee(ledger.payee) === normPayee(tx.payee) ? "同日、同资金账户、同币种、同方向金额及商户；缺少来源交易号，需人工确认" : "同日、同资金账户、同币种及同方向金额；商户描述可能不同，需人工确认" }));
-    if (candidates.length) addIssue(tx, candidates.length > 1 ? "已有账本存在多个可能匹配，请逐笔核对" : "已有账本存在可能匹配，确认重复后再排除");
+      reason: normPayee(ledger.payee) === normPayee(tx.payee) ? "账本中已有同日同金额的相似交易，请确认是否重复" : "账本中已有同日同金额的交易（商户不同），请确认是否重复" }));
+    if (candidates.length) addIssue(tx, candidates.length > 1 ? "可能和账本中的多笔历史交易重复，请逐笔核对" : "可能和账本中的历史交易重复，请确认");
   }
   // Preserve one-to-one semantics: no same-day amount-only candidate is consumed or discarded.
   const groups = new Map<string, ParsedTx[]>();
@@ -75,10 +75,10 @@ export function markDuplicates(allTxs: ParsedTx[], ledgerTxs: LedgerTx[]): Dedup
     for (const tx of group) {
       const siblings = group.filter((other) => other !== tx && other.source !== tx.source);
       if (!siblings.length) continue;
-      addIssue(tx, "跨来源流水可能记录同一资金变动，请核对商户、时间和交易号后选择保留项");
+      addIssue(tx, "不同来源的流水可能是同一笔交易，请核对后只保留一笔");
       tx.matches ??= [];
       for (const sibling of siblings) tx.matches.push({ id: sibling.id, date: sibling.date, payee: sibling.payee, narration: sibling.note,
-        file: sibling.sourceFile, line: sibling.row, reason: "跨来源：同资金账户、日期、币种、方向及金额；仅建议匹配", postings: sibling.postings ?? [] });
+        file: sibling.sourceFile, line: sibling.row, reason: "另一来源有同日同金额的流水，可能是同一笔交易", postings: sibling.postings ?? [] });
     }
   }
   // Merchant history is useful even while wallet identity or transaction amount

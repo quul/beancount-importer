@@ -10,7 +10,7 @@ import { parseLedger, validateLedgerFile } from "./lib/ledger.js";
 import { markDuplicates, sourceKey } from "./lib/dedup.js";
 import { classifyLocal, classifyWithLlm, loadMemory, saveMemory, suggestRefundsFromBatch } from "./lib/classify.js";
 import { inferFundingAccount, detectAccounts } from "./lib/accounts.js";
-import { generateEntries, transactionPostings } from "./lib/generate.js";
+import { generateEntries, suggestOpens, transactionPostings } from "./lib/generate.js";
 import { isAlipay, parseAlipay } from "./parsers/alipay.js";
 import { isWechat, parseWechat } from "./parsers/wechat.js";
 import { parseYunshanfu, isYunshanfu } from "./parsers/yunshanfu.js";
@@ -39,7 +39,7 @@ function stats(batch: ImportPreview) {
     ready: batch.txs.filter((tx) => tx.status === "ready").length };
 }
 
-function draftErrors(txs: ParsedTx[], ledger: LedgerInfo): string[] {
+function draftErrors(txs: ParsedTx[], ledger: LedgerInfo, opening?: Set<string>): string[] {
   const accounts = new Map(ledger.accounts.map((account) => [account.account, account]));
   const errors: string[] = [];
   for (const tx of txs.filter((tx) => tx.status === "ready")) {
@@ -47,11 +47,14 @@ function draftErrors(txs: ParsedTx[], ledger: LedgerInfo): string[] {
       : [tx.fundingAccount, tx.fundingAccount2 ?? tx.finalAccount].map((account) => ({ account, currency: tx.currency }));
     for (const item of names) {
       const defined = accounts.get(item.account), label = `${tx.sourceFile}:${tx.row}`;
-      if (!defined) errors.push(`${label}：账户未在真实账本开户：${item.account || "未选择"}`);
-      else if ((defined.openedAt && tx.date < defined.openedAt) || (defined.closedAt && tx.date > defined.closedAt)) errors.push(`${label}：账户在交易日未生效：${item.account}`);
-      else if (defined.currencies?.length && !defined.currencies.includes(item.currency)) errors.push(`${label}：${item.account} 不支持币种 ${item.currency}`);
+      if (!defined) {
+        if (opening?.has(item.account)) continue; // the commit will write this `open`
+        errors.push(`${label}：账户 ${item.account || "未选择"} 未在账本开户`);
+      }
+      else if ((defined.openedAt && tx.date < defined.openedAt) || (defined.closedAt && tx.date > defined.closedAt)) errors.push(`${label}：账户 ${item.account} 在交易日未生效`);
+      else if (defined.currencies?.length && !defined.currencies.includes(item.currency)) errors.push(`${label}：账户 ${item.account} 不支持币种 ${item.currency}`);
     }
-    if (tx.tags?.some((tag) => !TAG_RE.test(tag))) errors.push(`${tx.sourceFile}:${tx.row}：标签含不支持的字符`);
+    if (tx.tags?.some((tag) => !TAG_RE.test(tag))) errors.push(`${tx.sourceFile}:${tx.row}：标签格式无效`);
   }
   return [...new Set(errors)];
 }
@@ -72,13 +75,13 @@ function referenceUncommittedBatches(txs: ParsedTx[], previous: StoredBatch[]) {
     const references = key ? identities.get(key) : undefined;
     if (!references?.length) continue;
     tx.status = "pending";
-    tx.issues = [...new Set([...(tx.issues ?? []), "同一来源交易已在其他未提交批次，请先恢复原批次或核对保留项"] )];
+    tx.issues = [...new Set([...(tx.issues ?? []), "这笔交易已在另一个未提交批次中，请先审阅那个批次" ] )];
     tx.matches ??= [];
     for (const reference of references) tx.matches.push({
       id: `batch:${reference.batch.batchId}:${reference.tx.id}`, date: reference.tx.date,
       payee: reference.tx.payee, narration: reference.tx.note,
       file: `未提交批次 ${reference.batch.batchId} · ${reference.tx.sourceFile}`, line: reference.tx.row,
-      reason: "其他未提交批次已有相同来源交易；尚未过账，仅作重复导入提醒",
+      reason: "未提交批次中已有这笔交易",
       postings: reference.tx.postings ?? (reference.tx.fundingAccount && reference.tx.finalAccount ? transactionPostings(reference.tx) : []),
     });
   }
@@ -105,11 +108,11 @@ export function createApp(options: { dataDir?: string; config?: AppConfig } = {}
   const getBatch = (id: string) => {
     const batch = batches.get(id);
     if (!batch) throw new ImportError(404, "批次不存在");
-    if (batch.ledgerProfile !== profile()) throw new ImportError(409, "此批次属于另一账本，请先切回原账本");
+    if (batch.ledgerProfile !== profile()) throw new ImportError(409, "此批次属于另一个账本，请先切换回去");
     return batch;
   };
   const requireRevision = (batch: StoredBatch, value: unknown) => {
-    if (!Number.isInteger(value) || value !== batch.revision) throw new ImportError(409, "批次已更新，请重新加载后操作");
+    if (!Number.isInteger(value) || value !== batch.revision) throw new ImportError(409, "批次已被更新，请重新加载");
   };
   const publicBatch = (batch: StoredBatch) => ({ ...batch, preview: undefined, ledgerProfile: undefined, parseStats: stats(batch) });
 
@@ -136,7 +139,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig } = {}
         else if (isYunshanfu(name)) result = parseYunshanfu(file.path);
         else if (name.toLowerCase().endsWith(".pdf")) result = await parsePdfBank(file.path, detectBank(name, [])?.source ?? "bank-generic");
         else { const { rows } = readSheet(file.path); const bank = detectBank(name, rows); if (bank) result = parseBank(file.path, bank); }
-        if (!result) { errors.push({ row: 0, message: `${name}：无法识别类型，请使用已解压的 CSV/XLSX/PDF` }); continue; }
+        if (!result) { errors.push({ row: 0, message: `${name}：无法识别文件类型，请使用已解压的 CSV/XLSX/PDF` }); continue; }
         sources.add(result.source);
         for (const raw of result.txs) {
           const occurrence = (instances.get(raw.id) ?? 0) + 1; instances.set(raw.id, occurrence);
@@ -166,7 +169,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig } = {}
     const batch = batches.create({ file: files.map((file) => filename(file.originalname)).join(", "), source: sources.size === 1 ? [...sources][0] : "unknown",
       txCount: txs.length, txs: deduped.txs, errors,
       accountsDetected: detectAccounts(deduped.txs).map((entry) => ({ ...entry, guess: deduped.txs.find((tx) => tx.rawAccount === entry.raw)?.fundingAccount ?? "" })),
-      ledgerProfile: uploadProfile, ledgerErrors: currentLedger.errors ?? [], dedup: { ...deduped.stats, transferPairs: paired.pairs.length } });
+      ledgerProfile: uploadProfile, ledgerErrors: currentLedger.errors ?? [], dedup: { ...deduped.stats, transferPairs: paired.pairs.length, familyCardPairs: paired.familyCardPairs } });
     res.json({ batchId: batch.batchId, revision: batch.revision, preview: { ...publicBatch(batch), txs: undefined, lowConfidence: batch.txs.filter((tx) => tx.status === "pending").length } });
   }));
   app.get("/api/batch/:id", (req, res) => res.json(publicBatch(getBatch(req.params.id))));
@@ -182,7 +185,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig } = {}
       if (decision.status !== undefined && !STATUSES.has(decision.status)) throw new ImportError(400, "无效的审阅状态");
       if (decision.account !== undefined && (typeof decision.account !== "string" || !names.has(decision.account))) throw new ImportError(400, "分类账户必须来自当前账本");
       if (decision.funding !== undefined && (typeof decision.funding !== "string" || !names.has(decision.funding) || !/^(Assets|Liabilities):/.test(decision.funding))) throw new ImportError(400, "资金账户必须来自当前账本的资产或负债账户");
-      if (decision.tags !== undefined && (!Array.isArray(decision.tags) || decision.tags.length > 40 || decision.tags.some((tag) => typeof tag !== "string" || tag.length > 64 || !TAG_RE.test(tag)))) throw new ImportError(400, "标签限英文字母、数字及 _ - / .，每个最多 64 字符");
+      if (decision.tags !== undefined && (!Array.isArray(decision.tags) || decision.tags.length > 40 || decision.tags.some((tag) => typeof tag !== "string" || tag.length > 64 || !TAG_RE.test(tag)))) throw new ImportError(400, "标签格式无效");
       if (decision.flag !== undefined && decision.flag !== "*" && decision.flag !== "!") throw new ImportError(400, "标记应为 * 或 !");
       if (decision.reviewNote !== undefined && (typeof decision.reviewNote !== "string" || decision.reviewNote.length > 2000)) throw new ImportError(400, "备注最多 2000 字符");
       if (decision.postings !== undefined && decision.postings !== null && (!Array.isArray(decision.postings) || decision.postings.length < 2 || decision.postings.length > 40 || decision.postings.some((posting) => !posting || !names.has(posting.account) || !Number.isFinite(posting.amount) || typeof posting.currency !== "string" || !/^[A-Z][A-Z0-9._'-]{0,23}$/.test(posting.currency)))) throw new ImportError(400, "拆分分录必须包含有效账本账户、金额和币种");
@@ -215,11 +218,16 @@ export function createApp(options: { dataDir?: string; config?: AppConfig } = {}
     const batch = getBatch(req.params.id); requireRevision(batch, req.body.revision);
     if (batch.committed) throw new ImportError(409, "该批次已经写入");
     const currentLedger = ledger(), result = generateEntries(batch.txs, batch.batchId);
-    const errors = [...draftErrors(batch.txs, currentLedger), ...(result.errors ?? [])];
-    if (!result.generated.length && !errors.length) errors.push("没有已确认的交易，请先审阅");
-    if (errors.length) { delete batch.preview; batches.save(batch); res.status(422).json({ error: "请先处理分录问题", errors, details: errors, revision: batch.revision }); return; }
-    batch.preview = { revision: batch.revision, result, opens: [] }; batches.save(batch);
-    res.json({ ...result, generated: result.generated.length, opens: [], revision: batch.revision, baselineErrors: currentLedger.errors ?? [] });
+    const defined = new Set(currentLedger.accounts.map((account) => account.account));
+    const opens = suggestOpens(batch.txs, defined);
+    // draftErrors rejects undefined accounts; those the opens list will create
+    // (e.g. the family-card payer's card) are fine — commit writes the opens.
+    const opening = new Set(opens.map((line) => line.split(" open ")[1]));
+    const errors = [...draftErrors(batch.txs, currentLedger, opening), ...(result.errors ?? [])];
+    if (!result.generated.length && !errors.length) errors.push("没有勾选入账的交易，请先审阅");
+    if (errors.length) { delete batch.preview; batches.save(batch); res.status(422).json({ error: "请先修正以下问题", errors, details: errors, revision: batch.revision }); return; }
+    batch.preview = { revision: batch.revision, result, opens }; batches.save(batch);
+    res.json({ ...result, generated: result.generated.length, opens, revision: batch.revision, baselineErrors: currentLedger.errors ?? [] });
   });
   app.post("/api/batch/:id/commit", (req, res) => {
     const batch = getBatch(req.params.id);

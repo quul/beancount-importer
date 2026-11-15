@@ -57,9 +57,9 @@ const RULES: Array<{ test: RegExp; account: string; direction: "in" | "out"; rea
 function refundSuggestion(tx: ParsedTx, ledger: LedgerInfo): ClassifyOutcome | null {
   const candidates = ledger.transactions.filter((t) => t.date <= tx.date && norm(t.payee || t.narration) === norm(tx.payee) && !!tx.payee && t.postings.some((p) => p.amount < 0 && p.currency === tx.currency && Math.abs(-p.amount - tx.amount) < 0.005 && (!tx.fundingAccount || p.account === tx.fundingAccount)));
   const categories = [...new Set(candidates.flatMap((t) => t.postings.filter((p) => p.account.startsWith("Expenses:") && p.amount > 0).map((p) => p.account)))].filter((a) => allowed(a, tx, ledger));
-  if (categories.length === 1) return { account: categories[0], confidence: 0.75, reason: `找到 ${candidates.length} 笔同商户同金额的历史费用，请确认退款对应关系` };
+  if (categories.length === 1) return { account: categories[0], confidence: 0.75, reason: `找到 ${candidates.length} 笔同商户同金额的历史费用，请确认退款对应哪笔` };
   const history = ledger.payeeIndex[tx.payee]?.filter((h) => allowed(h.account, tx, ledger));
-  if (history?.length === 1) return { account: history[0].account, confidence: 0.6, reason: "退款建议冲回该商户的历史费用，尚未确认原交易" };
+  if (history?.length === 1) return { account: history[0].account, confidence: 0.6, reason: "退款，建议冲回该商户的历史费用" };
   return null;
 }
 
@@ -75,7 +75,7 @@ export function classifyLocal(tx: ParsedTx, mem: MemoryStore, ledger: LedgerInfo
   const total = history.reduce((n, h) => n + h.count, 0);
   if (history[0]?.count >= 2) {
     const share = history[0].count / total;
-    return { account: history[0].account, confidence: share >= 0.9 && history[0].count >= 3 ? 0.9 : 0.7, reason: `历史同商户分类 ${history[0].count}/${total} 次` };
+    return { account: history[0].account, confidence: share >= 0.9 && history[0].count >= 3 ? 0.9 : 0.7, reason: `历史上有 ${history[0].count}/${total} 次记入此账户` };
   }
   const text = `${tx.payee} ${tx.note} ${tx.rawCategory}`;
   for (const rule of RULES) {
@@ -101,7 +101,7 @@ export function suggestRefundsFromBatch(txs: ParsedTx[], ledger: LedgerInfo): nu
     if (categories.length !== 1) continue;
     refund.suggestedAccount = refund.finalAccount = categories[0];
     refund.confidence = Math.min(0.75, ...matches.map((t) => t.confidence));
-    refund.reason = `本批次有 ${matches.length} 笔同商户同金额费用候选，请确认退款对应关系`;
+    refund.reason = `本批次有 ${matches.length} 笔同商户同金额的费用，请确认退款对应哪笔`;
     suggested++;
   }
   return suggested;
