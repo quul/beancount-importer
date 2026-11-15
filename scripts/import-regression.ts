@@ -8,12 +8,14 @@ import path from "node:path";
 import * as XLSX from "xlsx";
 import { parseAlipay } from "../src/server/parsers/alipay.js";
 import { parseWechat } from "../src/server/parsers/wechat.js";
-import { parseDate, parseCsv, readSheet, txId } from "../src/server/parsers/common.js";
+import { parseDate, parseCsv, readSheet, readTextSmart, txId } from "../src/server/parsers/common.js";
 import { markDuplicates } from "../src/server/lib/dedup.js";
 import { pairTransfers, clearTransferSuggestion } from "../src/server/lib/transfers.js";
 import { generateEntries, suggestOpens } from "../src/server/lib/generate.js";
+import { inferFundingAccount } from "../src/server/lib/accounts.js";
 import { parseLedgerText, validateLedgerText } from "../src/server/lib/ledger.js";
-import type { LedgerTx, ParsedTx } from "../src/shared/types.js";
+import { isFamilyCard } from "../src/shared/types.js";
+import type { AppConfig, LedgerTx, ParsedTx } from "../src/shared/types.js";
 
 let checks = 0;
 function check(label: string, test: () => void) { test(); checks++; console.log(`✓ ${label}`); }
@@ -102,6 +104,43 @@ try {
     assert.equal(b.matches?.[0].id, "a"); assert.equal(b.matches?.[0].postings[0].amount, -5);
     clearTransferSuggestion(b); assert.equal(b.matches?.length, 0);
   });
+  check("family-card rows are recognized and never mapped to my own wallets", () => {
+    // Alipay proxy-pay row: 亲友代付 + 亲情卡, funded by the OTHER person's card.
+    const proxy = tx({ payee: "不愧是大佬(*峰)", note: "亲情卡", rawCategory: "亲友代付", rawAccount: "浙商银行信用卡(5103)", eventType: "familyCard", status: "pending", fundingAccount: "" });
+    assert.equal(isFamilyCard(proxy), true);
+    const config: AppConfig = { ledgerRoot: ".", mainFile: "main.bean", monthlyDir: "data", assetMapping: [{ keyword: "花呗", account: "Liabilities:CreditCard:Huabei", kind: "credit" }], accounts: [], llm: { provider: "off", apiBase: "", model: "", apiKey: "" } };
+    // Their Huabei is not my Huabei: funding inference must refuse my mapping.
+    const huabei = tx({ ...proxy, rawAccount: "花呗" });
+    assert.equal(inferFundingAccount(huabei, config).account, "");
+    assert.ok(inferFundingAccount(huabei, config).issues?.[0].includes("对方"));
+    // A normal row still maps my own Huabei.
+    assert.equal(inferFundingAccount(tx({ rawAccount: "花呗" }), config).account, "Liabilities:CreditCard:Huabei");
+  });
+  check("family-card proxy pairs with the payer statement's real charge across sources", () => {
+    // My alipay says 亲友代付; the payer's alipay has the real charge next day.
+    const proxy = tx({ id: "proxy", date: "2025-10-31", payee: "某商户", note: "亲情卡", rawCategory: "亲友代付", source: "alipay", sourceFile: "mine.csv", eventType: "familyCard", status: "pending", fundingAccount: "", suggestedAccount: "", finalAccount: "", confidence: 0 });
+    const charge = tx({ id: "charge", date: "2025-11-01", payee: "某商户", note: "商品", rawCategory: "餐饮美食", rawAccount: "浙商银行信用卡(5103)", source: "alipay", sourceFile: "theirs.csv", row: 3, sourceTxId: "theirs-001", status: "pending", fundingAccount: "Liabilities:CreditCard:CZBank:5103" });
+    const result = pairTransfers([proxy, charge]);
+    assert.equal(result.familyCardPairs, 1);
+    assert.equal(proxy.status, "duplicate");
+    assert.equal(proxy.duplicateOf?.id, "charge");
+    assert.equal(charge.status, "pending"); // the real charge stays for review
+    // Refund proxy pairs with the payer's real refund row.
+    const refundProxy = tx({ id: "rproxy", date: "2025-11-02", direction: "in", amount: 5, payee: "某商户", note: "退款-亲情卡", rawCategory: "退款", source: "alipay", sourceFile: "mine.csv", eventType: "refund", status: "pending", fundingAccount: "" });
+    const refundCharge = tx({ id: "rcharge", date: "2025-11-02", direction: "in", amount: 5, payee: "某商户", note: "退款", rawCategory: "退款", source: "alipay", sourceFile: "theirs.csv", row: 4, sourceTxId: "theirs-002", status: "pending", fundingAccount: "Liabilities:CreditCard:CZBank:5103", eventType: "refund" });
+    const refundResult = pairTransfers([refundProxy, refundCharge]);
+    assert.equal(refundResult.familyCardPairs, 1);
+    assert.equal(refundProxy.status, "duplicate");
+    // Ambiguity (two same-amount charges) leaves the proxy for manual review.
+    const other = { ...charge, id: "charge2", row: 5, sourceTxId: "theirs-003" };
+    assert.equal(pairTransfers([structuredClone(proxy), charge, other]).familyCardPairs, 0);
+    assert.equal(proxy.status, "duplicate"); // unchanged from the earlier pairing in this scope
+  });
+  check("suggestOpens proposes the payer's card before its earliest transaction", () => {
+    const charge = tx({ fundingAccount: "Liabilities:CreditCard:CZBank:5103", date: "2025-10-31" });
+    const opens = suggestOpens([charge], new Set(["Expenses:Shopping"]));
+    assert.deepEqual(opens, ["2025-10-31 open Liabilities:CreditCard:CZBank:5103"]);
+  });
   check("generator preserves currency, reviewed postings, tags and provenance", () => {
     const row = tx({ currency: "HKD", flag: "!", tags: ["trip", "refund"], reviewNote: "核对完成", postings: [{ account: "Expenses:Shopping", amount: 6, currency: "HKD" }, { account: "Assets:Wallet", amount: -5, currency: "HKD" }, { account: "Equity:Coupons:Payment", amount: -1, currency: "HKD" }] });
     const result = generateEntries([row], "batch-test"); assert.deepEqual(result.errors, []); assert.equal(result.generated.length, 1);
@@ -145,8 +184,22 @@ try {
 
   const statementDir = process.argv[2] ?? process.env.STATEMENT_DIR;
   if (statementDir) {
-    const names = fs.readdirSync(statementDir), ali = names.find((name) => name.endsWith(".csv")), wx = names.find((name) => name.endsWith(".xlsx"));
-    assert.ok(ali && wx, "real regression needs the Alipay CSV and WeChat XLSX");
+    // Discovery works on upload stores too, where multer strips extensions:
+    // identify by content signature instead of file name.
+    const discover = (directory: string) => {
+      const found: { alipay?: string; wechat?: string } = {};
+      for (const name of fs.readdirSync(directory)) {
+        const bytes = fs.readFileSync(path.join(directory, name));
+        if (bytes.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) { found.wechat ??= name; continue; } // xlsx: ZIP signature
+        const text = readTextSmart(bytes); // GBK-aware, same as the parsers
+        if (text.includes("支付宝")) found.alipay ??= name;
+        if (text.includes("微信支付")) found.wechat ??= name;
+      }
+      return found;
+    };
+    const found = discover(statementDir);
+    const ali = found.alipay, wx = found.wechat;
+    assert.ok(ali && wx, "real regression needs the Alipay CSV and WeChat XLSX (by content signature)");
     const alipay = parseAlipay(path.join(statementDir, ali)), wechat = parseWechat(path.join(statementDir, wx));
     check("real source completeness: 1064 Alipay + 444 WeChat = 1508 rows", () => {
       assert.equal(alipay.txs.length, 1064); assert.equal(wechat.txs.length, 444); assert.equal(alipay.errors.length + wechat.errors.length, 0);
@@ -164,6 +217,13 @@ try {
     check("real XLSX parses identically from an upload-style extensionless path", () => {
       const uploaded = path.join(tmp, "uploaded-file"); fs.copyFileSync(path.join(statementDir, wx), uploaded);
       const parsed = parseWechat(uploaded); assert.equal(parsed.txs.length, 444); assert.deepEqual(parsed.txs.map((item) => item.id), wechat.txs.map((item) => item.id));
+    });
+    check("real family-card rows: 163 proxy purchases + 14 proxy refunds, all flagged as the payer's", () => {
+      const family = alipay.txs.filter((item) => isFamilyCard(item));
+      assert.equal(family.length, 177);
+      assert.equal(family.filter((item) => item.eventType === "familyCard" && item.direction === "out").length, 163);
+      assert.equal(family.filter((item) => /退款/.test(item.rawCategory)).length, 14);
+      assert.ok(family.every((item) => item.issues?.some((issue) => issue.includes("对方"))));
     });
     console.log(JSON.stringify({ realRows: 1508, excluded: alipay.txs.filter((item) => item.excludedReason).length, alipayRefunds: 30, wechatRefunds: wechat.txs.filter((item) => item.eventType === "refund").length }));
   }

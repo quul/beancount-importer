@@ -80,7 +80,7 @@ export function generateEntries(txs: ParsedTx[], batchId?: string): GenerateResu
     monthFiles[month] = (monthFiles[month] ?? "") + `${nextDay} balance ${tx.fundingAccount} ${amountText(tx.balanceAfter!)} ${tx.currency}\n\n`;
   }
   const sortedMonths = Object.fromEntries(Object.entries(monthFiles).sort(([a], [b]) => a.localeCompare(b)));
-  return { entries: Object.entries(sortedMonths).map(([month, body]) => `; ===== ${month} =====\n${body}`).join("\n"), monthFiles: sortedMonths, generated, errors };
+  return { entries: Object.entries(sortedMonths).map(([month, body]) => `; ===== ${month} =====\n${body}`).join("\n"), monthFiles: sortedMonths, generated, errors, opens: [] };
 }
 
 /** Open each new account no later than its earliest referenced transaction. */

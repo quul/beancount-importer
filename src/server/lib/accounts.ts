@@ -1,4 +1,5 @@
 /** Funding inference only selects defined accounts; ambiguity is a review task. */
+import { isFamilyCard } from "../../shared/types.js";
 import type { AppConfig, LedgerInfo, ParsedAccount, ParsedTx } from "../../shared/types.js";
 
 const BANKS: Array<{ code: string; aliases: string[] }> = [
@@ -64,10 +65,13 @@ export interface FundingGuess {
 
 export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo): FundingGuess {
   const unknown = (message: string): FundingGuess => ({ account: "", confidence: 0, issues: [message], reason: message });
-  if ((tx.fundingParts?.length ?? 0) > 1 || /[&＋+]|组合支付|组合付款/.test(tx.rawAccount || "")) return unknown("组合支付需要逐项确认资金分录");
+  // 亲情卡/代付: the payment method belongs to the other person. Never match it
+  // against my own wallet/card mappings (e.g. their 花呗 is not my Huabei account).
+  if (isFamilyCard(tx)) return unknown("亲情卡消费由对方付款，请在对方账单中核对实际扣款账户");
+  if ((tx.fundingParts?.length ?? 0) > 1 || /[&＋+]|组合支付|组合付款/.test(tx.rawAccount || "")) return unknown("组合支付，请手动指定资金账户");
   let raw = (tx.rawAccount || "").trim();
   if (!raw && tx.source.startsWith("bank-")) raw = tx.source.slice(5);
-  if (!raw || /^[\s/—-]+$/.test(raw)) return unknown("账单未提供可确定的资金账户");
+  if (!raw || /^[\s/—-]+$/.test(raw)) return unknown("账单未注明支付方式，请手动指定资金账户");
 
   const available = ledger?.accounts;
   const valid = (name: string) => {
@@ -79,7 +83,10 @@ export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: Le
   const suffix = cardSuffix(raw);
   const credit = /信用卡|贷记卡|花呗|白条/i.test(raw);
   const debit = /储蓄卡|借记卡/i.test(raw);
-  const mappings = config.assetMapping.filter((m) => valid(m.account));
+  // An explicitly configured mapping is the user's intent even when the account
+  // is not opened in the ledger yet (e.g. the family-card payer's new card):
+  // generation suggests the missing `open` instead of silently dropping it.
+  const mappings = config.assetMapping.filter((m) => /^(Assets|Liabilities):/.test(m.account));
   const dynamic = available ? buildAssetMapping(available, tx.date).filter((m) => valid(m.account)) : [];
   const keywords = (m: AppConfig["assetMapping"][number]) => raw.toLowerCase().includes(m.keyword.toLowerCase());
 
@@ -95,13 +102,13 @@ export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: Le
   const configured = mappings.filter(eligible);
   let matches = configured.length ? configured : dynamic.filter(eligible);
 
-  if (!matches.length) return unknown(investment ? `${investment}没有独立且有效的账本账户，请绑定后重试` : "支付方式尚未绑定到有效的账本账户");
+  if (!matches.length) return unknown(investment ? `${investment}未绑定账本账户，请先在设置中添加映射` : "支付方式未绑定账本账户，请先在设置中添加映射");
   // Prefer an explicit specific mapping (e.g. 微信账号B) over generic aliases.
   const specific = matches.filter((m) => config.assetMapping.includes(m) && m.keyword.length > 4 && raw.toLowerCase().includes(m.keyword.toLowerCase()));
   if (specific.length) matches = specific;
   const unique = [...new Set(matches.map((m) => m.account))];
-  if (unique.length !== 1) return unknown(`支付方式对应 ${unique.length} 个账户，请明确选择钱包或银行卡`);
-  return { account: unique[0], confidence: suffix || matches.some((m) => raw === m.keyword) ? 0.98 : 0.9, reason: "匹配已定义的资金账户" };
+  if (unique.length !== 1) return unknown(`支付方式对应 ${unique.length} 个账户，请手动选择`);
+  return { account: unique[0], confidence: suffix || matches.some((m) => raw === m.keyword) ? 0.98 : 0.9, reason: "匹配到已定义的资金账户" };
 }
 
 export function detectAccounts(txs: ParsedTx[]): Array<{ raw: string; guess: string; txCount: number }> {

@@ -16,7 +16,12 @@ export type SourceType =
   | "unknown";
 
 export type Direction = "in" | "out";
-export type EventType = "expense" | "income" | "refund" | "transfer" | "unknown";
+export type EventType = "expense" | "income" | "refund" | "transfer" | "unknown" | "familyCard";
+/** Someone else paid on my behalf (亲情卡/亲友代付): the funding leg is theirs, not mine. */
+export function isFamilyCard(tx: { eventType?: EventType; note?: string; rawCategory?: string }): boolean {
+  if (tx.eventType === "familyCard") return true;
+  return /亲情卡|亲属卡/.test(`${tx.note ?? ""}`) || /亲友代付|亲情代付/.test(`${tx.rawCategory ?? ""}`);
+}
 
 export interface DraftPosting {
   account: string;
@@ -169,7 +174,7 @@ export interface ImportPreview {
   written?: string[];
   parseStats?: { total: number; excluded: number; pending: number; duplicate: number; ready: number };
   ledgerErrors?: LedgerError[];
-  dedup?: { crossSourceDuplicates: number; ledgerDuplicates: number; transferPairs?: number };
+  dedup?: { crossSourceDuplicates: number; ledgerDuplicates: number; transferPairs?: number; familyCardPairs?: number };
 }
 
 export interface LlmConfig {
@@ -207,6 +212,8 @@ export interface GenerateResult {
   /** tx ids that were generated */
   generated: string[];
   errors?: string[];
+  /** suggested `open` directives for accounts referenced but not yet defined */
+  opens: string[];
 }
 
 export interface TxDecision {

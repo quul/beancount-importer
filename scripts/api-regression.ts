@@ -8,6 +8,7 @@ import { PassThrough } from "node:stream";
 import type express from "express";
 import { createApp } from "../src/server/index.js";
 import { discoverLedgerRoot, loadConfig } from "../src/server/config.js";
+import { readTextSmart } from "../src/server/parsers/common.js";
 import { discoverPython, parseLedger } from "../src/server/lib/ledger.js";
 import type { AppConfig, ImportPreview } from "../src/shared/types.js";
 
@@ -145,12 +146,68 @@ try {
   await request(base, "/api/config", { ledgerRoot: root }); assert.ok((await request(base, "/api/batches")).length >= 3);
   passed("changing ledger profiles cannot redirect an existing batch");
 
+  // Family card end-to-end: upload my proxy record and the payer's real charge
+  // together; the proxy is marked duplicate, the payer's card gets an open.
+  const familyRoot = path.join(temporary, "family-ledger"); fs.mkdirSync(familyRoot);
+  fs.writeFileSync(path.join(familyRoot, "main.bean"), definitions);
+  const familyConfig: AppConfig = { ...config, ledgerRoot: familyRoot, assetMapping: [
+    { keyword: "中国银行", cardSuffix: "1111", account: "Assets:CN:BOC:1111", kind: "debit" },
+    { keyword: "浙商银行", cardSuffix: "5103", account: "Liabilities:CreditCard:CZBank:5103", kind: "credit" },
+  ] };
+  base = await boot(familyConfig, path.join(temporary, "family-data"));
+  const mine = ["交易时间,交易分类,交易对方,商品说明,收/支,金额,收/付款方式,交易状态,交易订单号",
+    "2026-01-02 10:00:00,亲友代付,测试餐厅,亲情卡,支出,12.34,浙商银行信用卡(5103),交易成功,my-proxy-1"].join("\n");
+  const theirs = ["交易时间,交易分类,交易对方,商品说明,收/支,金额,收/付款方式,交易状态,交易订单号",
+    "2026-01-02 10:00:01,餐饮美食,测试餐厅,午餐,支出,12.34,浙商银行信用卡(5103),交易成功,their-charge-1"].join("\n");
+  const familyBody = new FormData();
+  familyBody.append("files", new Blob([mine]), "mine-alipay.csv");
+  familyBody.append("files", new Blob([theirs]), "theirs-alipay.csv");
+  const familyResponse = await transport(base, "/api/upload", { method: "POST", body: familyBody });
+  const familyUpload = await familyResponse.json(); assert.equal(familyResponse.status, 200, JSON.stringify(familyUpload));
+  const familyBatch = await request(base, `/api/batch/${familyUpload.batchId}`) as ImportPreview & { revision: number };
+  assert.equal(familyBatch.txs.length, 2);
+  assert.equal(familyBatch.dedup?.familyCardPairs, 1);
+  const proxyRow = familyBatch.txs.find((tx) => tx.rawCategory === "亲友代付")!;
+  const chargeRow = familyBatch.txs.find((tx) => tx.rawCategory !== "亲友代付")!;
+  assert.equal(proxyRow.status, "duplicate");
+  assert.equal(proxyRow.duplicateOf?.id, chargeRow.id);
+  assert.equal(proxyRow.fundingAccount, ""); // never mapped to my own wallets
+  assert.equal(chargeRow.fundingAccount, "Liabilities:CreditCard:CZBank:5103");
+  assert.equal(chargeRow.status, "pending");
+  const familyDecided = await request(base, `/api/batch/${familyBatch.batchId}/decide`, { revision: familyBatch.revision, decisions: [{ id: chargeRow.id, account: "Expenses:Food:Meals:Dine", status: "ready" }] });
+  const familyPreview = await request(base, `/api/batch/${familyBatch.batchId}/generate`, { revision: familyDecided.revision });
+  assert.deepEqual(familyPreview.opens, ["2026-01-02 open Liabilities:CreditCard:CZBank:5103"]);
+  await request(base, `/api/batch/${familyBatch.batchId}/commit`, { revision: familyDecided.revision });
+  const annualFile = fs.readFileSync(path.join(familyRoot, "years/2026/2026.bean"), "utf8");
+  assert.match(annualFile, /2026-01-02 open Liabilities:CreditCard:CZBank:5103/);
+  const familyLedger = parseLedger(familyRoot, "main.bean", python);
+  assert.equal(familyLedger.transactions.length, 1); // only the payer's charge
+  assert.match(familyLedger.transactions[0].postings.map((p) => p.account).join(","), /CZBank:5103/);
+  assert.deepEqual(familyLedger.errors, []);
+  passed("family-card proxy and payer charge pair up; payer's card opens and commits once");
+
   const statementDirectory = process.argv[2];
   if (statementDirectory) {
     const realData = path.join(temporary, "real-read-only"), realConfig = loadConfig(realData);
     const realRoot = path.resolve(realConfig.ledgerRoot), baseline = parseLedger(realRoot, realConfig.mainFile, realConfig.pythonPath);
     const realBase = await boot(realConfig, realData), body = new FormData();
-    for (const name of fs.readdirSync(statementDirectory).filter((name) => /\.(xlsx|csv)$/i.test(name))) body.append("files", new Blob([fs.readFileSync(path.join(statementDirectory, name))]), name);
+    // Upload stores keep extensionless files; pick statements by content signature
+    // and re-attach a recognizable name so the server's type detection works.
+    // An upload store may hold several copies and small synthetic test fixtures;
+    // pick the largest Alipay text and the largest WeChat XLSX by content.
+    let alipay = "", alipaySize = 0, wechat = "", wechatSize = 0;
+    for (const name of fs.readdirSync(statementDirectory)) {
+      const bytes = fs.readFileSync(path.join(statementDirectory, name));
+      if (bytes.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))) {
+        if (bytes.length > wechatSize) { wechat = name; wechatSize = bytes.length; }
+      } else if (readTextSmart(bytes).includes("支付宝") && bytes.length > alipaySize) {
+        alipay = name; alipaySize = bytes.length;
+      }
+    }
+    assert.ok(alipay && wechat, "need one Alipay text and one WeChat XLSX by content signature");
+    for (const [name, uploadName] of [[alipay, "alipay.csv"], [wechat, "wechat.xlsx"]] as const) {
+      body.append("files", new Blob([fs.readFileSync(path.join(statementDirectory, name))]), uploadName);
+    }
     const response = await transport(realBase, "/api/upload", { method: "POST", body }), uploaded = await response.json();
     assert.equal(response.status, 200, JSON.stringify(uploaded));
     const realBatch = await request(realBase, `/api/batch/${uploaded.batchId}`) as ImportPreview;
@@ -158,8 +215,11 @@ try {
     assert.equal(realBatch.txs.filter((tx) => tx.source === "alipay" && tx.eventType === "refund" && tx.direction === "in").length, 30);
     assert.ok(realBatch.txs.filter((tx) => /信用卡/.test(tx.rawAccount) && tx.fundingAccount).every((tx) => tx.fundingAccount.startsWith("Liabilities:")));
     assert.ok(realBatch.txs.filter((tx) => tx.matches?.length).length > 0);
-    assert.equal(baseline.accounts.length, 211); assert.equal(baseline.transactions.length, 5264);
+    // The real ledger evolves outside this regression; only assert the upload
+    // itself never touches it, not hardcoded account/transaction counts.
+    assert.ok(baseline.accounts.length > 0);
     const after = parseLedger(realRoot, realConfig.mainFile, realConfig.pythonPath);
+    assert.equal(after.accounts.length, baseline.accounts.length);
     assert.equal(after.transactions.length, baseline.transactions.length); assert.deepEqual(after.errors, baseline.errors);
     passed("real multipart CSV + XLSX upload accounts for all 1508 rows and references the unchanged real ledger");
   }

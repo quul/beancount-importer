@@ -238,11 +238,17 @@ export function commitBatch(batch: StoredBatch, config: AppConfig, root: string,
       written.push(relative.replace(/\\/g, "/"));
       if (config.annualLayout) {
         const annual = path.join("years", year, `${year}.bean`);
-        planned.set(annual, withInclude(content(annual), path.relative(path.dirname(annual), relative), root, annual));
+        // Suggested opens (e.g. the family-card payer's card) go into the annual
+        // file before the include chain, so every generated entry has its accounts.
+        const opensText = (batch.preview?.opens ?? []).filter((line) => line.startsWith(`${year}-`)).map((line) => `${line}\n`).join("");
+        planned.set(annual, `${opensText}${withInclude(content(annual), path.relative(path.dirname(annual), relative), root, annual)}`);
         planned.set(mainRelative, withInclude(content(mainRelative), path.relative(path.dirname(mainRelative), annual), root, mainRelative));
       } else {
         planned.set(mainRelative, withInclude(content(mainRelative), path.relative(path.dirname(mainRelative), relative), root, mainRelative));
       }
+    }
+    if (!config.annualLayout && (batch.preview?.opens ?? []).length) {
+      planned.set(mainRelative, `${(batch.preview?.opens ?? []).map((line) => `${line}\n`).join("")}${content(mainRelative)}`);
     }
     for (const [relative, after] of planned) replaceFile(inside(stage, relative), after);
     rewriteIncludes();

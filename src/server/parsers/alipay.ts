@@ -40,12 +40,16 @@ export function parseAlipay(file: string): ParseResult {
     else if (amount === 0) excludedReason ??= "零金额交易，无资金变动";
     const refund = /^退款$/.test(category) || originalDirection.includes("收入") && /退款/.test(note);
     const transfer = /信用借还|账户存取/.test(category) || /还款|提现|转入余额|余额转出/.test(`${category} ${note}`);
-    let eventType: EventType = refund ? "refund" : transfer ? "transfer" : originalDirection.includes("收入") ? "income" : originalDirection.includes("支出") ? "expense" : "unknown";
+    // 亲情卡/亲友代付: someone else's card paid for this purchase. The funding
+    // description (e.g. 浙商银行信用卡(5103)) belongs to THEM, never to my mapping.
+    const familyCard = /亲情卡|亲属卡/.test(note) || /亲友代付|亲情代付/.test(category);
+    let eventType: EventType = refund ? "refund" : transfer ? "transfer" : familyCard ? "familyCard" : originalDirection.includes("收入") ? "income" : originalDirection.includes("支出") ? "expense" : "unknown";
     let direction: "in" | "out" = refund || originalDirection.includes("收入") ? "in" : "out";
     if (!refund && /退款成功/.test(sourceStatus)) { eventType = "expense"; issues.push("原消费已退款，保留原支出并核对对应退款流水"); }
     else if (transfer) { direction = /转入|存入|充值/.test(note) && !/还款/.test(note) ? "in" : "out"; issues.push("资金转移，请确认双方账户；不应计入收入或费用"); }
     else if (eventType === "unknown") issues.push("不计收支流水，请确认经济业务与资金方向");
     if (refund) issues.push("退款应冲回原费用，请关联原交易确认分类");
+    if (familyCard) issues.push(`${payee}的${/退款/.test(category) ? "亲情卡退款" : "亲情卡消费"}，资金出自对方账户；若对方账单也导入，两笔会配对，保留对方扣款一笔`);
     const split = parseFundingParts(rawAccount); issues.push(...split.issues);
     const sourceTxId = cell("id") || undefined, date = parsed?.date ?? "";
     txs.push({ id: txId(date, Math.abs(amount ?? 0), direction, payee, `${parsed?.time ?? ""}|${note}|${rawAccount}`, "alipay", sourceTxId),

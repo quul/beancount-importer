@@ -28,7 +28,9 @@ export function parseWechat(file: string): ParseResult {
     if (!parsed || amount == null) { excludedReason = "日期或金额无法解析"; errors.push({ row: r + 1, message: excludedReason }); }
     else if (amount === 0) excludedReason ??= "零金额交易，无资金变动";
     const refund = /退款|退还/.test(rawCategory), transfer = /零钱提现|零钱充值|零钱通转出|转入零钱通|信用卡还款/.test(rawCategory) || /^转账$/.test(rawCategory);
-    const eventType: EventType = refund ? "refund" : transfer ? "transfer" : originalDirection.includes("收入") ? "income" : originalDirection.includes("支出") ? "expense" : "unknown";
+    // 亲属卡: paid with someone else's linked card; the funding leg belongs to them.
+    const familyCard = /亲属卡|亲情卡/.test(`${rawCategory} ${note} ${rawAccount}`);
+    const eventType: EventType = refund ? "refund" : transfer ? "transfer" : familyCard ? "familyCard" : originalDirection.includes("收入") ? "income" : originalDirection.includes("支出") ? "expense" : "unknown";
     let direction: "in" | "out" = refund || originalDirection.includes("收入") ? "in" : "out";
     if (transfer) {
       // Direction describes the account in 支付方式: for withdrawal this is the
@@ -39,6 +41,7 @@ export function parseWechat(file: string): ParseResult {
     }
     if (!refund && /已退款|已全额退款|对方已退还/.test(sourceStatus)) issues.push("原交易已退款或退还，保留原资金流并核对退款流水");
     if (refund) issues.push("退款应冲回原费用，请关联原交易确认分类");
+    if (familyCard) issues.push(`${payee}的亲属卡消费，资金出自对方账户；若对方账单也导入，两笔会配对，保留对方扣款一笔`);
     if (eventType === "unknown") issues.push("交易收支方向不明确，请核对原始流水");
     const split = parseFundingParts(rawAccount); issues.push(...split.issues);
     const sourceTxId = cell("id") || undefined, date = parsed?.date ?? "";
