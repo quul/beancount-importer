@@ -14,13 +14,15 @@ export function txId(
   amount: number,
   direction: string,
   payee: string,
-  row: number,
+  identity: number | string,
+  source = "unknown",
+  sourceTxId?: string,
 ): string {
   const h = crypto
     .createHash("sha1")
-    .update([date, amount.toFixed(2), direction, payee, row].join("|"))
+    .update(sourceTxId ? [source, sourceTxId].join("|") : [source, date, amount.toFixed(2), direction, payee, typeof identity === "string" ? identity : ""].join("|"))
     .digest("hex");
-  return h.slice(0, 12);
+  return h.slice(0, 24);
 }
 
 /** Read file as text trying GBK first (Chinese banks/Alipay default) then UTF-8. */
@@ -42,6 +44,9 @@ export interface SheetData {
 
 /** Parse CSV/TSV text into rows (handles quoted fields). */
 export function parseCsv(text: string): string[][] {
+  // Tabs in a comma-separated export are Excel's identifier suffixes, not columns.
+  const delimiter = text.split(/\r?\n/).find((line) => line.includes("交易时间") || line.includes("交易日期"))?.includes(",")
+    || text.split(/\r?\n/).some((line) => line.includes(",")) ? "," : "\t";
   const rows: string[][] = [];
   let cur: string[] = [];
   let field = "";
@@ -57,7 +62,7 @@ export function parseCsv(text: string): string[][] {
       } else field += c;
     } else if (c === '"') {
       inQuotes = true;
-    } else if (c === "," || c === "\t") {
+    } else if (c === delimiter) {
       cur.push(field);
       field = "";
     } else if (c === "\n" || c === "\r") {
@@ -77,9 +82,12 @@ export function parseCsv(text: string): string[][] {
 
 /** Read xlsx/xls/csv uniformly into rows of string cells. */
 export function readSheet(file: string): SheetData {
+  const buffer = fs.readFileSync(file);
   const ext = file.toLowerCase().split(".").pop();
-  if (ext === "xlsx" || ext === "xls") {
-    const wb = XLSX.read(fs.readFileSync(file), { type: "buffer" });
+  const excelSignature = buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))
+    || buffer.subarray(0, 8).equals(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+  if (ext === "xlsx" || ext === "xls" || excelSignature) {
+    const wb = XLSX.read(buffer, { type: "buffer", cellDates: false });
     const ws = wb.Sheets[wb.SheetNames[0]];
     const rows: string[][] = XLSX.utils.sheet_to_json(ws, {
       header: 1,
@@ -88,7 +96,7 @@ export function readSheet(file: string): SheetData {
     });
     return { rows: rows.map((r) => (r as unknown[]).map((c) => String(c ?? ""))) };
   }
-  const text = readTextSmart(fs.readFileSync(file));
+  const text = readTextSmart(buffer);
   return { rows: parseCsv(text) };
 }
 
@@ -110,7 +118,11 @@ export function col(
   names: string[],
 ): number {
   for (const n of names) {
-    const idx = header.findIndex((h) => h.trim() === n || h.trim().includes(n));
+    const idx = header.findIndex((h) => h.trim() === n);
+    if (idx >= 0) return idx;
+  }
+  for (const n of names) {
+    const idx = header.findIndex((h) => h.trim().includes(n));
     if (idx >= 0) return idx;
   }
   return -1;
@@ -118,13 +130,14 @@ export function col(
 
 /** Normalize amount string: strip ¥, spaces, commas, ＋, keep sign. */
 export function parseAmount(raw: string): number | null {
+  const negative = /^[（(].*[）)]$/.test(raw.trim());
   const s = raw
     .replace(/[¥￥,，\s+＋]/g, "")
     .replace(/（-/g, "-")
     .replace(/[（）()]/g, "");
   if (!s || s === "-" || s === ".") return null;
   const n = Number(s);
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(n) ? (negative ? -Math.abs(n) : n) : null;
 }
 
 /**
@@ -138,14 +151,17 @@ export function parseDate(raw: string): { date: string; time?: string } | null {
   );
   if (m) {
     const [, y, mo, d, h, mi, se] = m;
+    const date = `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`;
+    const timestamp = Date.parse(`${date}T00:00:00Z`);
+    if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString().slice(0, 10) !== date || Number(h ?? 0) > 23 || Number(mi ?? 0) > 59 || Number(se ?? 0) > 59) return null;
     return {
-      date: `${y}-${mo.padStart(2, "0")}-${d.padStart(2, "0")}`,
+      date,
       time: h ? `${h.padStart(2, "0")}:${mi}:${se ?? "00"}` : undefined,
     };
   }
   m = s.match(/^(\d{4})(\d{2})(\d{2})$/);
   if (m) {
-    return { date: `${m[1]}-${m[2]}-${m[3]}` };
+    return parseDate(`${m[1]}-${m[2]}-${m[3]}`);
   }
   // Excel serial date
   const n = Number(s);
@@ -154,6 +170,19 @@ export function parseDate(raw: string): { date: string; time?: string } | null {
     return { date: d.toISOString().slice(0, 10) };
   }
   return null;
+}
+
+/** Payment methods can contain coupons with unknown value or explicit split tender. */
+export function parseFundingParts(raw: string): { fundingParts?: RawTx["fundingParts"]; issues: string[] } {
+  if (!raw || raw === "/" || raw === "-") return { issues: [] };
+  const parts = raw.split(/\r?\n|[&＆]/).map((part) => part.trim()).filter(Boolean);
+  if (parts.length < 2) return { issues: [] };
+  const fundingParts = parts.map((part) => {
+    const explicit = part.match(/(?:付款|支付)?[¥￥]\s*([\d,.]+)/);
+    return { rawAccount: part.replace(/(?:付款|支付)?[¥￥]\s*[\d,.]+/, "").trim(), ...(explicit ? { amount: parseAmount(explicit[1]) ?? undefined } : {}) };
+  });
+  return { fundingParts, issues: fundingParts.some((part) => part.amount == null)
+    ? ["组合付款含优惠或未知分摊金额，请核对实际支付与优惠分录"] : ["混合支付，请核对各资金账户分录"] };
 }
 
 export interface ParseResult {

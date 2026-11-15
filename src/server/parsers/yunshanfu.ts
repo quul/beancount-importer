@@ -36,6 +36,7 @@ export function parseYunshanfu(file: string): ParseResult {
   const iDir = col(header, ["收支类型", "收/支", "借贷方向"]);
   const iMethod = col(header, ["支付方式", "付款方式", "卡号"]);
   const iNote = col(header, ["备注", "商品说明", "摘要"]);
+  const iTxNo = col(header, ["交易单号", "交易流水号", "订单号"]);
 
   for (let r = headerIdx + 1; r < rows.length; r++) {
     const row = rows[r];
@@ -54,7 +55,7 @@ export function parseYunshanfu(file: string): ParseResult {
     const direction: "in" | "out" = /收入|贷|转入|收入/.test(dirRaw) ? "in" : "out";
 
     txs.push({
-      id: txId(dateParsed.date, Math.abs(amount), direction, cell(iPayee), r),
+      id: txId(dateParsed.date, Math.abs(amount), direction, cell(iPayee), `${dateParsed.time ?? ""}|${cell(iNote)}|${cell(iMethod)}`, "yunshanfu", cell(iTxNo) || undefined),
       date: dateParsed.date,
       time: dateParsed.time,
       amount: Math.abs(amount),
@@ -67,6 +68,8 @@ export function parseYunshanfu(file: string): ParseResult {
       source: "yunshanfu",
       sourceFile: file,
       row: r + 1,
+      sourceTxId: cell(iTxNo) || undefined,
+      eventType: /退款/.test(cell(iType)) ? "refund" : /还款|转账|充值|提现/.test(cell(iType)) ? "transfer" : direction === "in" ? "income" : "expense",
     });
   }
 

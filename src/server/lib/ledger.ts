@@ -1,155 +1,75 @@
-/**
- * Reads the existing beancount ledger so the importer can:
- *  - learn payee → account mappings from history (better than a fresh LLM call)
- *  - avoid re-importing transactions already booked
- *  - validate that generated entries reference opened accounts
- */
-
+/** Native Beancount loading is the authority for includes, booking and validation. */
 import fs from "node:fs";
 import path from "node:path";
-import type { LedgerInfo, LedgerTx, ParsedAccount } from "../../shared/types.js";
+import { spawnSync } from "node:child_process";
+import type { LedgerError, LedgerInfo } from "../../shared/types.js";
 
-const ACCOUNT_RE =
-  /([A-Z][A-Za-z-]*):([A-Za-z0-9-]+(?::[A-Za-z0-9-]+)*)/g;
+const BRIDGE = path.resolve(import.meta.dirname, "../../../scripts/ledger_bridge.py");
 
-function accountType(root: string): ParsedAccount["type"] {
-  switch (root) {
-    case "Assets":
-      return "assets";
-    case "Liabilities":
-      return "liabilities";
-    case "Equity":
-      return "equity";
-    case "Income":
-      return "income";
-    case "Expenses":
-      return "expenses";
-    default:
-      return "expenses";
-  }
+export interface LedgerValidation {
+  ok: boolean;
+  loader: string;
+  errors: LedgerError[];
 }
 
-export function parseLedgerText(text: string) {
-  const accounts = new Map<string, ParsedAccount>();
-  const transactions: LedgerTx[] = [];
+type BridgeResult = LedgerInfo & LedgerValidation & { fatal?: string };
 
-  const lines = text.split("\n");
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-
-    // include "file.beancount"
-    const inc = line.match(/^\s*include\s+"([^"]+)"/);
-    if (inc) {
-      const [, file] = inc;
-      // resolved by caller (needs root dir); record as pending
-      pendingIncludes.push(file);
+/** Prefer the ledger's own environment, so validation uses its installed version. */
+export function discoverPython(rootDir?: string): string {
+  if (process.env.ACCOUNT_IMPORT_PYTHON) return process.env.ACCOUNT_IMPORT_PYTHON;
+  if (rootDir) {
+    for (const dir of ["venv", ".venv"]) {
+      const candidate = path.join(rootDir, dir, "bin", "python");
+      if (fs.existsSync(candidate)) return candidate;
     }
-
-    // YYYY-MM-DD open Account
-    const open = line.match(
-      /^(\d{4}-\d{2}-\d{2})\s+open\s+([A-Z][A-Za-z0-9:-]*)\s*(?:"([^"]*)")?\s*(?:([A-Z]{3,4}))?\s*$/,
-    );
-    if (open) {
-      const [, date, account, , currency] = open;
-      accounts.set(account, {
-        account,
-        type: accountType(account.split(":")[0]),
-        openedAt: date,
-        currency: currency || undefined,
-      });
-      i++;
-      continue;
-    }
-
-    // YYYY-MM-DD * "payee" / "narration"
-    const txn = line.match(
-      /^(\d{4}-\d{2}-\d{2})\s+[*!]\s*(?:"([^"]*)"\s*)?(?:"([^"]*)")?\s*$/,
-    );
-    if (txn) {
-      const [, date, payee, narration] = txn;
-      const postings: LedgerTx["postings"] = [];
-      let j = i + 1;
-      let seq = 0;
-      while (j < lines.length && /^\s+/.test(lines[j])) {
-        const pline = lines[j].trim();
-        const pm = pline.match(
-          /^([A-Z][A-Za-z0-9:-]*)\s+(-?[\d.]+)\s+([A-Z]{3,4})/,
-        );
-        if (pm) {
-          postings.push({
-            account: pm[1],
-            amount: parseFloat(pm[2]),
-            currency: pm[3],
-          });
-        } else if (/^[A-Z][A-Za-z0-9:-]*\s*$/.test(pline)) {
-          postings.push({ account: pline, amount: NaN, currency: "" });
-        }
-        j++;
-        seq++;
-      }
-      transactions.push({
-        id: `ledger-${transactions.length}`,
-        date,
-        payee: payee || "",
-        narration: narration || "",
-        postings,
-      });
-      i = j;
-      continue;
-    }
-
-    i++;
   }
-
-  return { accounts: [...accounts.values()], transactions };
+  return "python3";
 }
 
-// simple include collector (module-scoped, cleared per parse)
-const pendingIncludes: string[] = [];
-
-export function parseLedger(rootDir: string, mainFile: string): LedgerInfo {
-  const accounts = new Map<string, ParsedAccount>();
-  const transactions: LedgerTx[] = [];
-  const payeeIndex: LedgerInfo["payeeIndex"] = {};
-
-  const seen = new Set<string>();
-
-  const loadFile = (abs: string, depth: number) => {
-    if (depth > 10 || seen.has(abs)) return;
-    if (!fs.existsSync(abs)) return;
-    seen.add(abs);
-    const text = fs.readFileSync(abs, "utf-8");
-    const parsed = parseLedgerText(text);
-    for (const a of parsed.accounts) accounts.set(a.account, a);
-    transactions.push(...parsed.transactions);
-    for (const inc of pendingIncludes.splice(0)) {
-      loadFile(path.resolve(path.dirname(abs), inc), depth + 1);
-    }
-  };
-
-  loadFile(path.resolve(rootDir, mainFile), 0);
-
-  // build payee → account frequency index from history
-  for (const t of transactions) {
-    if (!t.payee) continue;
-    const expenseLeg = t.postings.find(
-      (p) =>
-        p.account.startsWith("Expenses:") || p.account.startsWith("Income:"),
-    );
-    if (!expenseLeg) continue;
-    const list = (payeeIndex[t.payee] ??= []);
-    const existing = list.find((x) => x.account === expenseLeg.account);
-    if (existing) existing.count++;
-    else list.push({ account: expenseLeg.account, count: 1 });
+function bridge(
+  request: { operation: "inspect" | "validate"; file?: string; text?: string },
+  pythonPath?: string,
+): BridgeResult {
+  const python = pythonPath || discoverPython(request.file ? path.dirname(request.file) : undefined);
+  const proc = spawnSync(python, ["-B", BRIDGE], {
+    input: JSON.stringify(request),
+    encoding: "utf-8",
+    env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
+    maxBuffer: 32 * 1024 * 1024,
+    timeout: 60_000,
+  });
+  if (proc.error) throw new Error(`无法启动 Beancount Python (${python}): ${proc.error.message}`);
+  let result: BridgeResult;
+  try {
+    result = JSON.parse(proc.stdout) as BridgeResult;
+  } catch {
+    throw new Error(`Beancount 桥接未返回有效 JSON (${python}): ${proc.stderr.trim() || `exit ${proc.status}`}`);
   }
-  for (const k of Object.keys(payeeIndex)) {
-    payeeIndex[k].sort((a, b) => b.count - a.count);
+  if (result.fatal || proc.status !== 0) {
+    throw new Error(result.fatal || `Beancount 桥接失败: ${proc.stderr.trim() || proc.status}`);
   }
+  return result;
+}
 
-  return {
-    accounts: [...accounts.values()],
-    transactions,
-    payeeIndex,
-  };
+export function parseLedger(rootDir: string, mainFile: string, pythonPath?: string): LedgerInfo {
+  const file = path.resolve(rootDir, mainFile);
+  if (!fs.existsSync(file)) throw new Error(`账本入口不存在: ${file}`);
+  const result = bridge({ operation: "inspect", file }, pythonPath || discoverPython(rootDir));
+  return { accounts: result.accounts, transactions: result.transactions, payeeIndex: result.payeeIndex, errors: result.errors, loader: result.loader };
+}
+
+/** Text parsing is native as well; no regex fallback silently drops directives. */
+export function parseLedgerText(text: string, pythonPath?: string): LedgerInfo {
+  const result = bridge({ operation: "inspect", text }, pythonPath);
+  return { accounts: result.accounts, transactions: result.transactions, payeeIndex: result.payeeIndex, errors: result.errors, loader: result.loader };
+}
+
+export function validateLedgerFile(file: string, pythonPath?: string): LedgerValidation {
+  const result = bridge({ operation: "validate", file: path.resolve(file) }, pythonPath);
+  return { ok: result.ok, loader: result.loader, errors: result.errors };
+}
+
+export function validateLedgerText(text: string, pythonPath?: string): LedgerValidation {
+  const result = bridge({ operation: "validate", text }, pythonPath);
+  return { ok: result.ok, loader: result.loader, errors: result.errors };
 }

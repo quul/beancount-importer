@@ -1,82 +1,117 @@
-/**
- * Funding-account inference: maps raw payment-method text to beancount accounts.
- * Supports multiple cards per institution (e.g. two ICBC debit cards) and
- * debit/credit distinction — credit cards map to Liabilities.
- */
+/** Funding inference only selects defined accounts; ambiguity is a review task. */
+import type { AppConfig, LedgerInfo, ParsedAccount, ParsedTx } from "../../shared/types.js";
 
-import type { AppConfig, ParsedTx } from "../../shared/types.js";
+const BANKS: Array<{ code: string; aliases: string[] }> = [
+  { code: "BOC", aliases: ["中国银行", "中行", "BOC"] },
+  { code: "ABC", aliases: ["农业银行", "农行", "ABC"] },
+  { code: "ICBC", aliases: ["工商银行", "工行", "ICBC"] },
+  { code: "CCB", aliases: ["建设银行", "建行", "CCB"] },
+  { code: "CMB", aliases: ["招商银行", "招行", "CMB"] },
+  { code: "SPDB", aliases: ["浦发银行", "浦发", "SPDB"] },
+  { code: "CITIC", aliases: ["中信银行", "中信", "CITIC"] },
+  { code: "CMBC", aliases: ["民生银行", "民生", "CMBC"] },
+  { code: "BCM", aliases: ["交通银行", "交行", "BCM"] },
+  { code: "CIB", aliases: ["兴业银行", "兴业", "CIB"] },
+  { code: "PSBC", aliases: ["邮政储蓄", "邮储", "PSBC"] },
+  { code: "PAB", aliases: ["平安银行", "平安", "PAB"] },
+  { code: "WeBank", aliases: ["微众银行", "微众", "WeBank"] },
+  { code: "WangShangBank", aliases: ["网商银行", "网商", "WangShangBank"] },
+  { code: "CZBank", aliases: ["浙商银行", "浙商", "CZBank"] },
+];
 
-/** Extract a card-number suffix like "1234" from raw text like "中国工商银行(1234)". */
+export function accountIsActive(account: ParsedAccount, date: string, currency?: string): boolean {
+  if (account.openedAt && account.openedAt > date) return false;
+  if (account.closedAt && account.closedAt < date) return false;
+  const currencies = account.currencies ?? (account.currency ? [account.currency] : []);
+  return !currency || !currencies.length || currencies.includes(currency);
+}
+
 export function cardSuffix(raw: string): string | null {
-  const m = raw.match(/[（(](\d{3,6})[）)]/);
+  const m = raw.match(/(?:[（(]|尾号\s*|末四位\s*)(\d{3,6})(?:[）)]|\b)/);
   if (m) return m[1];
-  const m2 = raw.match(/\d{4,6}$/);
-  return m2 ? m2[0] : null;
+  const last = raw.match(/\b(\d{4,6})$/);
+  return last ? last[1] : null;
 }
 
-/**
- * Decide funding account for a tx.
- * Priority:
- *  1. user-configured keyword mapping (with card suffix disambiguation)
- *  2. institution default (Assets:Bank:<Inst> or Liabilities:CC:<Inst>)
- */
-export function inferFundingAccount(
-  tx: ParsedTx,
-  config: AppConfig,
-): { account: string; confidence: number } {
-  const raw = tx.rawAccount || "";
-
-  for (const m of config.assetMapping) {
-    if (raw.toLowerCase().includes(m.keyword.toLowerCase())) {
-      const suffix = cardSuffix(raw);
-      // if multiple mappings for the same keyword differ by card suffix, use it
-      const sameKeyword = config.assetMapping.filter(
-        (x) => x.keyword.toLowerCase() === m.keyword.toLowerCase(),
-      );
-      if (sameKeyword.length > 1 && suffix) {
-        const hit = sameKeyword.find((x) => x.keyword.includes(suffix));
-        if (hit) return { account: hit.account, confidence: 0.95 };
-      }
-      return { account: m.account, confidence: 0.9 };
-    }
+/** Derive local mappings from definitions, never embed personal card data in code. */
+export function buildAssetMapping(accounts: ParsedAccount[], date = new Date().toISOString().slice(0, 10)): AppConfig["assetMapping"] {
+  const result: AppConfig["assetMapping"] = [];
+  for (const a of accounts) {
+    if (!/^(Assets|Liabilities):/.test(a.account) || !accountIsActive(a, date)) continue;
+    const parts = a.account.split(":");
+    const kind = a.account.startsWith("Liabilities:") ? "credit" : "debit";
+    const suffix = /^\d{3,6}$/.test(parts.at(-1) || "") ? parts.at(-1) : undefined;
+    let aliases: string[] = [];
+    const bank = BANKS.find((b) => parts.some((p) => p.toLowerCase() === b.code.toLowerCase()));
+    if (bank) aliases = bank.aliases;
+    else if (/:(?:Alipay|Alipay\d+)$/i.test(a.account)) aliases = ["支付宝", "alipay", "余额"];
+    else if (/:(?:WeChat|WeChat\d+)$/i.test(a.account)) aliases = ["微信", "wechat", "零钱"];
+    else if (/:(?:YuEBao|YueBao)$/i.test(a.account)) aliases = ["余额宝"];
+    else if (/:(?:LingQianTong|LQT)$/i.test(a.account)) aliases = ["零钱通"];
+    else if (/:Huabei$/i.test(a.account)) aliases = ["花呗"];
+    else if (/:Baitiao$/i.test(a.account)) aliases = ["白条"];
+    for (const keyword of aliases) result.push({ keyword, account: a.account, kind, ...(suffix ? { cardSuffix: suffix } : {}) });
   }
-
-  // institution defaults
-  const inst: Array<[RegExp, string]> = [
-    [/工商银行|工行|icbc/i, "Assets:Bank:ICBC"],
-    [/建设银行|建行|ccb/i, "Assets:Bank:CCB"],
-    [/中国银行|中行|boc/i, "Assets:Bank:BOC"],
-    [/农业银行|农行|abc/i, "Assets:Bank:ABC"],
-    [/浙商银行|czbank/i, "Assets:Bank:CZBank"],
-    [/浦发|spdb/i, "Assets:Bank:SPDB"],
-    [/招商银行|招行|cmb/i, "Assets:Bank:CMB"],
-    [/余额宝/i, "Assets:Alipay:YuEBao"],
-    [/支付宝|alipay|花呗/i, "Assets:Alipay:Cash"],
-    [/^余额$|^账户余额$|余额宝/, "Assets:Alipay:Cash"],
-    [/微信|wechat|零钱/i, "Assets:WeChat:Cash"],
-    [/云闪付|unionpay/i, "Assets:UnionPay"],
-  ];
-  for (const [re, acc] of inst) {
-    if (re.test(raw) || re.test(tx.payee)) return { account: acc, confidence: 0.7 };
-  }
-
-  if (tx.source.startsWith("bank-")) {
-    return { account: `Assets:Bank:${tx.source.replace("bank-", "").toUpperCase()}`, confidence: 0.5 };
-  }
-
-  return { account: "Assets:FixMe", confidence: 0.3 };
+  return result;
 }
 
-/** Detect distinct payment methods present in a parsed batch (multi-account UI hint). */
-export function detectAccounts(
-  txs: ParsedTx[],
-): Array<{ raw: string; guess: string; txCount: number }> {
-  const counts = new Map<string, number>();
+export interface FundingGuess {
+  account: string;
+  confidence: number;
+  issues?: string[];
+  reason?: string;
+}
+
+export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo): FundingGuess {
+  const unknown = (message: string): FundingGuess => ({ account: "", confidence: 0, issues: [message], reason: message });
+  if ((tx.fundingParts?.length ?? 0) > 1 || /[&＋+]|组合支付|组合付款/.test(tx.rawAccount || "")) return unknown("组合支付需要逐项确认资金分录");
+  let raw = (tx.rawAccount || "").trim();
+  if (!raw && tx.source.startsWith("bank-")) raw = tx.source.slice(5);
+  if (!raw || /^[\s/—-]+$/.test(raw)) return unknown("账单未提供可确定的资金账户");
+
+  const available = ledger?.accounts;
+  const valid = (name: string) => {
+    if (!/^(Assets|Liabilities):/.test(name)) return false;
+    if (!available) return true; // Explicit mappings are validated at generation too.
+    const a = available.find((entry) => entry.account === name);
+    return !!a && accountIsActive(a, tx.date, tx.currency);
+  };
+  const suffix = cardSuffix(raw);
+  const credit = /信用卡|贷记卡|花呗|白条/i.test(raw);
+  const debit = /储蓄卡|借记卡/i.test(raw);
+  const mappings = config.assetMapping.filter((m) => valid(m.account));
+  const dynamic = available ? buildAssetMapping(available, tx.date).filter((m) => valid(m.account)) : [];
+  const keywords = (m: AppConfig["assetMapping"][number]) => raw.toLowerCase().includes(m.keyword.toLowerCase());
+
+  // Wallet investment products must not fall through to the cash wallet.
+  const investment = /零钱通/.test(raw) ? "零钱通" : /余额宝/.test(raw) ? "余额宝" : undefined;
+  const eligible = (m: AppConfig["assetMapping"][number]) => keywords(m)
+    && m.account.startsWith(m.kind === "credit" ? "Liabilities:" : "Assets:")
+    && (!investment || m.keyword.includes(investment))
+    && (!credit || (m.kind === "credit" && m.account.startsWith("Liabilities:")))
+    && (!debit || (m.kind === "debit" && m.account.startsWith("Assets:")))
+    // An unrecognised card suffix is never mapped to the institution default.
+    && (!suffix || (m.cardSuffix ?? cardSuffix(m.keyword) ?? m.account.match(/:(\d{3,6})$/)?.[1]) === suffix);
+  const configured = mappings.filter(eligible);
+  let matches = configured.length ? configured : dynamic.filter(eligible);
+
+  if (!matches.length) return unknown(investment ? `${investment}没有独立且有效的账本账户，请绑定后重试` : "支付方式尚未绑定到有效的账本账户");
+  // Prefer an explicit specific mapping (e.g. 微信账号B) over generic aliases.
+  const specific = matches.filter((m) => config.assetMapping.includes(m) && m.keyword.length > 4 && raw.toLowerCase().includes(m.keyword.toLowerCase()));
+  if (specific.length) matches = specific;
+  const unique = [...new Set(matches.map((m) => m.account))];
+  if (unique.length !== 1) return unknown(`支付方式对应 ${unique.length} 个账户，请明确选择钱包或银行卡`);
+  return { account: unique[0], confidence: suffix || matches.some((m) => raw === m.keyword) ? 0.98 : 0.9, reason: "匹配已定义的资金账户" };
+}
+
+export function detectAccounts(txs: ParsedTx[]): Array<{ raw: string; guess: string; txCount: number }> {
+  const groups = new Map<string, { txCount: number; guesses: Set<string> }>();
   for (const tx of txs) {
     const raw = tx.rawAccount || "(空)";
-    counts.set(raw, (counts.get(raw) ?? 0) + 1);
+    const group = groups.get(raw) ?? { txCount: 0, guesses: new Set<string>() };
+    group.txCount++;
+    if (tx.fundingAccount) group.guesses.add(tx.fundingAccount);
+    groups.set(raw, group);
   }
-  return [...counts.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([raw, n]) => ({ raw, guess: "", txCount: n }));
+  return [...groups].sort((a, b) => b[1].txCount - a[1].txCount).map(([raw, g]) => ({ raw, guess: g.guesses.size === 1 ? [...g.guesses][0] : "", txCount: g.txCount }));
 }

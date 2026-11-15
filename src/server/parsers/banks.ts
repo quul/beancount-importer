@@ -171,6 +171,7 @@ export function parseBank(file: string, def: BankDef): ParseResult {
   const iBalance = col(header, def.balanceCols);
   const iAccount = col(header, def.accountCols);
   const iTxNo = col(header, def.txNoCols);
+  const iCurrency = col(header, ["交易币种", "币种", "currency"]);
 
   if (iDate < 0 || iAmount < 0) {
     return {
@@ -213,7 +214,7 @@ export function parseBank(file: string, def: BankDef): ParseResult {
       direction = "out";
     }
 
-    if (amount == null || amount === 0) {
+    if (amount == null) {
       if (row.some((c) => c.trim() !== "")) {
         errors.push({ row: r + 1, message: `无法解析金额: ${cell(iAmount)}` });
       }
@@ -224,20 +225,19 @@ export function parseBank(file: string, def: BankDef): ParseResult {
       const dirText = cell(iDirCol);
       if (/收入|贷|存入/.test(dirText)) direction = "in";
       else if (/支出|借|取出/.test(dirText)) direction = "out";
-      else if (def.signedAmount) direction = amount < 0 ? "in" : "out";
-      else direction = amount < 0 ? "in" : "out";
+      else direction = amount < 0 ? "out" : "in";
     }
 
     const balance = iBalance >= 0 ? parseAmount(cell(iBalance)) : null;
     const payee = cell(iPayee);
 
     txs.push({
-      id: txId(dateParsed.date, Math.abs(amount), direction, payee, r),
+      id: txId(dateParsed.date, Math.abs(amount), direction, payee, `${dateParsed.time ?? ""}|${cell(iNote)}|${cell(iAccount)}|${balance ?? ""}`, def.source, cell(iTxNo) || undefined),
       date: dateParsed.date,
       time: dateParsed.time,
       amount: Math.abs(amount),
       direction,
-      currency: "CNY",
+      currency: /人民币|RMB/.test(cell(iCurrency)) ? "CNY" : cell(iCurrency) || "CNY",
       payee,
       note: cell(iNote),
       rawCategory: cell(iNote).slice(0, 40),
@@ -247,6 +247,9 @@ export function parseBank(file: string, def: BankDef): ParseResult {
       source: def.source,
       sourceFile: file,
       row: r + 1,
+      eventType: /还款|转账|转入|转出|充值|提现/.test(cell(iNote)) ? "transfer" : direction === "in" ? "income" : "expense",
+      excludedReason: amount === 0 ? "零金额交易，无资金变动" : undefined,
+      issues: iDirCol < 0 && inAmt == null && outAmt == null ? ["按金额正负推断方向，请核对银行导出符号约定"] : [],
     });
   }
 

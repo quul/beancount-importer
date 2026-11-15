@@ -6,11 +6,14 @@
   "description": "Web UI for importing Alipay/WeChat/bank/YunShanFu statements into beancount",
   "scripts": {
     "dev": "concurrently -n server,web -c blue,green \"npm:dev:server\" \"npm:dev:web\"",
-    "dev:server": "tsx watch src/server/index.ts",
+    "dev:server": "node --import tsx --watch src/server/index.ts",
     "dev:web": "vite",
-    "build": "vite build",
-    "start": "tsx src/server/index.ts",
-    "smoke": "tsx scripts/smoke.ts"
+    "typecheck": "tsc --noEmit",
+    "build": "pnpm typecheck && vite build",
+    "start": "node --import tsx src/server/index.ts",
+    "smoke": "node --import tsx scripts/smoke.ts",
+    "test": "pnpm typecheck && pnpm smoke && node --import tsx scripts/ledger-regression.ts && node --import tsx scripts/commit-regression.ts && node --import tsx scripts/api-regression.ts && node --import tsx scripts/web-regression.ts",
+    "test:statements": "node --import tsx scripts/api-regression.ts"
   },
   "dependencies": {
     "@types/multer": "^2.3.0",

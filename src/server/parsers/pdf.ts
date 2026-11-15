@@ -136,7 +136,7 @@ export async function parsePdfBank(file: string, source: ParseResult["source"]):
       firstAmtIdx > 0 ? afterDate.slice(0, firstAmtIdx).trim() : "";
 
     txs.push({
-      id: txId(d.date, Math.abs(amount), direction, payee, txs.length),
+      id: txId(d.date, Math.abs(amount), direction, payee, `${d.time ?? ""}|${d.text}`, source),
       date: d.date,
       time: d.time,
       amount: Math.abs(amount),
@@ -150,6 +150,8 @@ export async function parsePdfBank(file: string, source: ParseResult["source"]):
       source,
       sourceFile: file,
       row: txs.length + 1,
+      eventType: /还款|转账|充值|提现/.test(d.text) ? "transfer" : direction === "in" ? "income" : "expense",
+      issues: ["通用PDF解析结果，请逐笔核对金额、方向、账户与原始行；余额未经日终认证"],
     });
   }
 

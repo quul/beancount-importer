@@ -5,7 +5,7 @@ import path from "node:path";
 export default defineConfig({
   root: "web",
   plugins: [react()],
-  build: { outDir: path.resolve(__dirname, "web-dist") },
+  build: { outDir: path.resolve(__dirname, "web-dist"), emptyOutDir: true },
   server: {
     proxy: {
       "/api": "http://localhost:8787",
