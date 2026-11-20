@@ -1,6 +1,9 @@
 /** Funding inference only selects defined accounts; ambiguity is a review task. */
 import { isFamilyCard } from "../../shared/types.js";
-import type { AppConfig, LedgerInfo, ParsedAccount, ParsedTx } from "../../shared/types.js";
+import type { AppConfig, LedgerInfo, ParsedAccount, ParsedTx, SourceType } from "../../shared/types.js";
+import { accountIsActive, isCombinedPayment, normalizePaymentMethod, singlePaymentMethod } from "../../shared/funding.js";
+
+export { accountIsActive, isMissingPaymentMethod, normalizePaymentMethod, singlePaymentMethod } from "../../shared/funding.js";
 
 const BANKS: Array<{ code: string; aliases: string[] }> = [
   { code: "BOC", aliases: ["中国银行", "中行", "BOC"] },
@@ -19,13 +22,6 @@ const BANKS: Array<{ code: string; aliases: string[] }> = [
   { code: "WangShangBank", aliases: ["网商银行", "网商", "WangShangBank"] },
   { code: "CZBank", aliases: ["浙商银行", "浙商", "CZBank"] },
 ];
-
-export function accountIsActive(account: ParsedAccount, date: string, currency?: string): boolean {
-  if (account.openedAt && account.openedAt > date) return false;
-  if (account.closedAt && account.closedAt < date) return false;
-  const currencies = account.currencies ?? (account.currency ? [account.currency] : []);
-  return !currency || !currencies.length || currencies.includes(currency);
-}
 
 export function cardSuffix(raw: string): string | null {
   const m = raw.match(/(?:[（(]|尾号\s*|末四位\s*)(\d{3,6})(?:[）)]|\b)/);
@@ -63,15 +59,32 @@ export interface FundingGuess {
   reason?: string;
 }
 
+export function setExactFundingMapping(mappings: AppConfig["assetMapping"], source: SourceType, keyword: string, account: string): AppConfig["assetMapping"] {
+  const key = normalizePaymentMethod(keyword);
+  return [...mappings.filter((item) => !item.exact || item.source !== source || normalizePaymentMethod(item.keyword) !== key),
+    { keyword, source, exact: true, account, kind: account.startsWith("Liabilities:") ? "credit" : "debit" }];
+}
+
+export function confirmFundingAccount(tx: ParsedTx, account: string): void {
+  if (tx.postings && tx.fundingAccount !== account) {
+    tx.postings = tx.postings.map((posting) => posting.account === tx.fundingAccount ? { ...posting, account } : posting);
+  }
+  tx.fundingAccount = account;
+  tx.fundingConfidence = 1;
+  delete tx.fundingReason;
+}
+
+export const fundingMappingIssue = (issue: string) => issue === "账户未映射" || issue === "账户映射冲突"
+  || issue === "支付方式缺失" || /未绑定账本账户|^支付方式对应 \d+ 个账户|^账单未注明支付方式/.test(issue);
+
 export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo): FundingGuess {
   const unknown = (message: string): FundingGuess => ({ account: "", confidence: 0, issues: [message], reason: message });
   // 亲情卡/代付: the payment method belongs to the other person. Never match it
   // against my own wallet/card mappings (e.g. their 花呗 is not my Huabei account).
-  if (isFamilyCard(tx)) return unknown("亲情卡消费由对方付款，请在对方账单中核对实际扣款账户");
-  if ((tx.fundingParts?.length ?? 0) > 1 || /[&＋+]|组合支付|组合付款/.test(tx.rawAccount || "")) return unknown("组合支付，请手动指定资金账户");
-  let raw = (tx.rawAccount || "").trim();
-  if (!raw && tx.source.startsWith("bank-")) raw = tx.source.slice(5);
-  if (!raw || /^[\s/—-]+$/.test(raw)) return unknown("账单未注明支付方式，请手动指定资金账户");
+  if (isFamilyCard(tx)) return unknown("对方付款");
+  if (isCombinedPayment(tx)) return unknown("组合支付");
+  const raw = singlePaymentMethod(tx) || (!tx.rawAccount?.trim() && tx.source.startsWith("bank-") ? tx.source.slice(5) : "");
+  if (!raw) return unknown("支付方式缺失");
 
   const available = ledger?.accounts;
   const valid = (name: string) => {
@@ -86,7 +99,28 @@ export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: Le
   // An explicitly configured mapping is the user's intent even when the account
   // is not opened in the ledger yet (e.g. the family-card payer's new card):
   // generation suggests the missing `open` instead of silently dropping it.
-  const mappings = config.assetMapping.filter((m) => /^(Assets|Liabilities):/.test(m.account));
+  const normalized = normalizePaymentMethod(raw);
+  const exact = config.assetMapping.filter((m) => m.exact && (!m.source || m.source === tx.source)
+    && normalizePaymentMethod(m.keyword) === normalized);
+  if (exact.length) {
+    const scoped = exact.filter((m) => m.source === tx.source);
+    const choices = scoped.length ? scoped : exact;
+    const accounts = [...new Set(choices.map((m) => m.account))];
+    if (accounts.length > 1) return unknown("账户映射冲突");
+    return valid(accounts[0])
+      ? { account: accounts[0], confidence: 1, reason: `完整匹配已保存的付款方式「${choices[0].keyword}」` }
+      : unknown("账户未映射");
+  }
+  // A statement with the full bank and credit card label can reuse a matching payment mapping.
+  const statementCard = tx.source.startsWith("bank-") && /^.+信用卡(?:\([0-9]{4}\))?$/.test(normalized);
+  if (statementCard && !suffix) return unknown("账单未识别出卡尾号");
+  if (statementCard && suffix) {
+    const cardAccounts = [...new Set(config.assetMapping.filter((m) => m.exact && m.kind === "credit"
+      && normalizePaymentMethod(m.keyword) === normalized && valid(m.account) && m.account.startsWith("Liabilities:")).map((m) => m.account))];
+    if (cardAccounts.length > 1) return unknown("账户映射冲突");
+    if (cardAccounts.length === 1) return { account: cardAccounts[0], confidence: 0.98, reason: `卡尾号 ${suffix} 与已保存的信用卡映射一致` };
+  }
+  const mappings = config.assetMapping.filter((m) => !m.exact && /^(Assets|Liabilities):/.test(m.account));
   const dynamic = available ? buildAssetMapping(available, tx.date).filter((m) => valid(m.account)) : [];
   const keywords = (m: AppConfig["assetMapping"][number]) => raw.toLowerCase().includes(m.keyword.toLowerCase());
 
@@ -102,19 +136,23 @@ export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: Le
   const configured = mappings.filter(eligible);
   let matches = configured.length ? configured : dynamic.filter(eligible);
 
-  if (!matches.length) return unknown(investment ? `${investment}未绑定账本账户，请先在设置中添加映射` : "支付方式未绑定账本账户，请先在设置中添加映射");
+  if (!matches.length) return unknown("账户未映射");
   // Prefer an explicit specific mapping (e.g. 微信账号B) over generic aliases.
   const specific = matches.filter((m) => config.assetMapping.includes(m) && m.keyword.length > 4 && raw.toLowerCase().includes(m.keyword.toLowerCase()));
   if (specific.length) matches = specific;
   const unique = [...new Set(matches.map((m) => m.account))];
-  if (unique.length !== 1) return unknown(`支付方式对应 ${unique.length} 个账户，请手动选择`);
-  return { account: unique[0], confidence: suffix || matches.some((m) => raw === m.keyword) ? 0.98 : 0.9, reason: "匹配到已定义的资金账户" };
+  if (unique.length !== 1) return unknown("账户映射冲突");
+  const fullMatch = matches.find((m) => raw === m.keyword);
+  const keyword = (fullMatch ?? matches[0]).keyword;
+  const reason = suffix ? `关键词「${keyword}」和卡尾号 ${suffix} 匹配`
+    : fullMatch ? `完整匹配付款方式「${keyword}」` : `关键词「${keyword}」匹配`;
+  return { account: unique[0], confidence: suffix || fullMatch ? 0.98 : 0.9, reason };
 }
 
 export function detectAccounts(txs: ParsedTx[]): Array<{ raw: string; guess: string; txCount: number }> {
   const groups = new Map<string, { txCount: number; guesses: Set<string> }>();
   for (const tx of txs) {
-    const raw = tx.rawAccount || "(空)";
+    const raw = tx.recognition?.fundingMethod || tx.rawAccount || "(空)";
     const group = groups.get(raw) ?? { txCount: 0, guesses: new Set<string>() };
     group.txCount++;
     if (tx.fundingAccount) group.guesses.add(tx.fundingAccount);

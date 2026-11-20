@@ -10,10 +10,12 @@ import { parseAlipay } from "../src/server/parsers/alipay.js";
 import { parseWechat } from "../src/server/parsers/wechat.js";
 import { parseDate, parseCsv, readSheet, readTextSmart, txId } from "../src/server/parsers/common.js";
 import { markDuplicates } from "../src/server/lib/dedup.js";
+import { matchWechatRefunds } from "../src/server/lib/refunds.js";
 import { pairTransfers, clearTransferSuggestion } from "../src/server/lib/transfers.js";
 import { generateEntries, suggestOpens } from "../src/server/lib/generate.js";
 import { inferFundingAccount } from "../src/server/lib/accounts.js";
 import { parseLedgerText, validateLedgerText } from "../src/server/lib/ledger.js";
+import { readStoredConfig } from "../src/server/config.js";
 import { isFamilyCard } from "../src/shared/types.js";
 import type { AppConfig, LedgerTx, ParsedTx } from "../src/shared/types.js";
 
@@ -56,6 +58,66 @@ try {
     const file = path.join(tmp, "wechat.csv");
     fs.writeFileSync(file, "交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号\n2025-01-01 12:00:00,其他,平台,说明,收入,10,零钱,新状态,wx-unknown");
     const parsed = parseWechat(file); assert.equal(parsed.txs.length, 1); assert.ok(parsed.txs[0].issues?.some((issue) => issue.includes("未识别交易状态")));
+  });
+  check("WeChat rules detect paid activity rewards with missing payment methods", () => {
+    const file = path.join(tmp, "wechat-activity.csv");
+    fs.writeFileSync(file, [
+      "交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号,备注",
+      "2026-08-29 23:45:16,其他,活动奖励_01_测试,/,收入,¥0.38,/,已到账,reward,活动奖励_01_测试",
+      "2026-08-29 23:46:16,其他,活动奖励_01_测试,/,收入,0.38,／,已到账,reward-wide,活动奖励_01_测试",
+      "2026-08-29 23:47:16,其他,活动奖励_01_测试,/,收入,0.38,银行卡,已到账,explicit",
+      "2026-08-29 23:48:16,其他,普通收款,/,收入,0.38,/,已到账,ordinary,活动奖励_01_测试",
+      "2026-08-29 23:49:16,其他,活动奖励_01_测试,/,收入,0.38,/,等待到账,waiting",
+      "2026-08-29 23:50:16,其他,活动奖励_01_测试,/,支出,0.38,/,已到账,expense",
+      "2026-08-29 23:51:16,商户消费,活动奖励_01_测试,/,收入,0.38,/,已到账,different-category",
+    ].join("\n"));
+    const parsed = parseWechat(file);
+    assert.deepEqual(parsed.errors, []);
+    assert.deepEqual(parsed.txs.filter((item) => item.recognition).map((item) => item.sourceTxId), ["reward", "reward-wide"]);
+    const reward = parsed.txs[0];
+    assert.deepEqual(reward.recognition, { label: "活动奖励", fundingMethod: "零钱" });
+    assert.equal(reward.eventType, "income");
+    assert.equal(reward.rawCategory, "其他");
+    assert.equal(reward.rawAccount, "/");
+    assert.equal(parseWechat(file, []).txs[0].recognition, undefined);
+  });
+  check("WeChat wallet and Lingqiantong moves are excluded in both directions", () => {
+    const file = path.join(tmp, "wechat-internal-transfers.csv");
+    fs.writeFileSync(file, [
+      "交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号",
+      "2026-08-29 12:00:00,转入零钱通-来自零钱,/,/,/,10,零钱,支付成功,to-investment",
+      "2026-08-29 13:00:00,零钱通转出-到零钱,/,/,/,10,/,已到账,to-wallet",
+      "2026-08-29 14:00:00,转入零钱通,/,/,/,20,中国银行储蓄卡(1111),支付成功,from-bank",
+      "2026-08-29 15:00:00,零钱通转出-到银行卡,/,/,/,30,中国银行储蓄卡(1111),已到账,to-bank",
+      "2026-08-29 16:00:00,商户消费,测试商户,午餐,支出,5,零钱通,支付成功,purchase",
+      "2026-08-29 17:00:00,转入零钱通-来自零钱,/,/,/,10,零钱,支付失败,failed",
+    ].join("\n"));
+    const parsed = parseWechat(file);
+    assert.deepEqual(parsed.errors, []);
+    assert.deepEqual(parsed.txs.map((item) => item.excludedReason), [
+      "零钱与零钱通互转", "零钱与零钱通互转", undefined, undefined, undefined, "交易未完成：支付失败",
+    ]);
+    assert.ok(parsed.txs.slice(0, 2).every((item) => item.eventType === "transfer"));
+    assert.equal(parsed.txs[4].eventType, "expense");
+    assert.equal(parseWechat(file, []).txs[0].excludedReason, undefined);
+  });
+  check("WeChat refund links require a uniquely matching reported amount, merchant, card and time", () => {
+    const purchase = tx({ id: "purchase", sourceTxId: "pay-1", source: "wechat", amount: 100, time: "14:36:31",
+      sourceStatus: "已退款（￥79.35）", rawAccount: "中信银行信用卡(1778)" });
+    const refund = tx({ ...purchase, id: "refund", sourceTxId: "refund-1", amount: 79.35, time: "17:06:42",
+      eventType: "refund", direction: "in", sourceStatus: "已退款¥79.35", rawAccount: "中信银行信用卡（1778）" });
+    const expected = new Map([["purchase", "refund"], ["refund", "purchase"]]);
+    assert.deepEqual(matchWechatRefunds([refund, purchase]), expected);
+    assert.deepEqual(matchWechatRefunds([purchase, { ...purchase, id: "duplicate-copy", status: "duplicate" }, refund]), expected);
+    assert.deepEqual(matchWechatRefunds([{ ...purchase, sourceStatus: "已全额退款" }, { ...refund, amount: 100 }]), expected);
+    for (const unrelated of [
+      { ...refund, amount: 79.36 }, { ...refund, payee: "别的商户" }, { ...refund, rawAccount: "中信银行信用卡(2222)" },
+      { ...refund, time: "14:35:00" }, { ...refund, source: "alipay" as const }, { ...refund, excludedReason: "交易未完成" },
+    ]) {
+      assert.equal(matchWechatRefunds([purchase, unrelated]).size, 0);
+    }
+    assert.equal(matchWechatRefunds([purchase, { ...purchase, id: "other-purchase", sourceTxId: "pay-2" }, refund]).size, 0);
+    assert.equal(matchWechatRefunds([purchase, refund, { ...refund, id: "other-refund", sourceTxId: "refund-2" }]).size, 0);
   });
   const ledger: LedgerTx[] = [{ id: "booked-1", date: "2025-10-31", payee: "商户甲", narration: "人工账本", file: "history.bean", line: 10, postings: [{ account: "Liabilities:CreditCard:ABC:9065", amount: -5, currency: "CNY" }, { account: "Expenses:Shopping", amount: 5, currency: "CNY" }] }];
   check("two same-value purchases do not disappear against one historical posting", () => {
@@ -161,9 +223,38 @@ try {
     const pending = tx({ id: "pending", fundingAccount: row.fundingAccount, status: "pending" });
     assert.ok(!generateEntries([{ ...row, balanceIsDayEnd: true }, pending]).entries.includes(" balance "));
   });
-  const configFile = path.resolve(import.meta.dirname, "../server-data/config.json");
-  const nativePython = process.env.ACCOUNT_IMPORT_PYTHON || (fs.existsSync(configFile) ? JSON.parse(fs.readFileSync(configFile, "utf8")).pythonPath as string | undefined : undefined);
+  const configDirectory = process.env.BEAN_IMPORT_DATA_DIR ?? path.resolve(import.meta.dirname, "../server-data");
+  const nativePython = process.env.ACCOUNT_IMPORT_PYTHON || readStoredConfig(configDirectory).pythonPath;
   if (nativePython) {
+    check("only a native rounded funding leg with an exact reconstructed amount suggests a duplicate", () => {
+      const card = "Liabilities:CreditCard:ABC:9065";
+      const example = [
+        "2025-10-01 open Expenses:Property CNY", "2025-10-01 open Assets:Wallet CNY", `2025-10-01 open ${card} CNY`,
+        '2025-10-31 * "Property"', "  Expenses:Property  100.13 CNY", "  Assets:Wallet  109.0 CNY", "  Assets:Wallet  109.0 CNY",
+      ].join("\n");
+      const automatic = parseLedgerText(`${example}\n  ${card}\n`, nativePython);
+      assert.deepEqual(automatic.errors, []);
+      const [booked] = automatic.transactions;
+      assert.equal(booked.postings.at(-1)?.amount, -318.1);
+      assert.deepEqual(booked.unroundedFunding, { account: card, amount: -318.13, currency: "CNY" });
+      const row = tx({ amount: 318.13 });
+      assert.equal(markDuplicates([row], [booked]).stats.ledgerDuplicates, 0);
+      assert.equal(row.status, "pending");
+      assert.match(row.matches?.[0].reason ?? "", /自动补全时发生舍入.*318\.13 CNY/);
+      for (const different of [
+        tx({ amount: 318.12 }), tx({ amount: 318.13, direction: "in" }),
+        tx({ amount: 318.13, currency: "HKD" }), tx({ amount: 318.13, fundingAccount: "Liabilities:Card:Other" }),
+      ]) {
+        markDuplicates([different], [booked]);
+        assert.equal(different.status, "ready");
+      }
+      const explicit = parseLedgerText(`${example}\n  ${card}  -318.10 CNY\n`, nativePython);
+      assert.deepEqual(explicit.errors, []);
+      assert.equal(explicit.transactions[0].unroundedFunding, undefined);
+      const explicitRow = tx({ amount: 318.13 });
+      markDuplicates([explicitRow], explicit.transactions);
+      assert.equal(explicitRow.status, "ready");
+    });
     check("native Beancount validates generated metadata, tags, currencies and next-day balance", () => {
       const row = tx({ source: "bank-icbc", fundingAccount: "Assets:Bank:ICBC", balanceAfter: 100, balanceIsDayEnd: true, tags: ["reviewed", "trip.one"], flag: "!", sourceFile: 'source "quoted".csv', note: "商品\\备注\n第二行" });
       const output = generateEntries([row], "native-test"); assert.deepEqual(output.errors, []);
@@ -204,7 +295,8 @@ try {
     check("real source completeness: 1064 Alipay + 444 WeChat = 1508 rows", () => {
       assert.equal(alipay.txs.length, 1064); assert.equal(wechat.txs.length, 444); assert.equal(alipay.errors.length + wechat.errors.length, 0);
       assert.equal(alipay.txs.filter((item) => item.excludedReason).length, 38);
-      assert.equal(wechat.txs.filter((item) => item.excludedReason).length, 0);
+      const walletMoves = wechat.txs.filter((item) => ["转入零钱通-来自零钱", "零钱通转出-到零钱"].includes(item.rawCategory));
+      assert.deepEqual(wechat.txs.filter((item) => item.excludedReason), walletMoves);
       assert.ok(wechat.txs.filter((item) => ["已到账", "已全额退款", "对方已退还", "资金已到账", "充值完成"].includes(item.sourceStatus ?? "")).length >= 89);
     });
     check("real 30 refund inflows, 31 refunded originals and split amounts survive", () => {

@@ -1,4 +1,7 @@
-import type { AppConfig, ImportPreview, LedgerError, ParsedAccount, TxDecision } from "../../src/shared/types.js";
+import type { AppConfig, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerError, ParsedAccount, ParsedTx, TxDecision } from "../../src/shared/types.js";
+
+export type ConfigResponse = AppConfig & { nativePathPicker?: boolean };
+export type PathField = "ledgerRoot" | "pythonPath";
 
 export interface BatchSummary {
   batchId: string;
@@ -12,7 +15,7 @@ export interface BatchSummary {
 export interface UploadSummary {
   batchId: string;
   revision?: number;
-  preview: Omit<ImportPreview, "txs">;
+  preview: Omit<ImportPreview, "txs"> & Pick<BatchSummary, "createdAt" | "revision" | "committed">;
 }
 
 export interface LedgerSummary {
@@ -26,60 +29,100 @@ export interface LedgerSummary {
 export interface GeneratedPreview {
   entries: string;
   monthFiles: Record<string, string>;
+  targetFiles?: string[];
   generated: number;
   opens: string[];
   revision: number;
   errors?: string[];
 }
 
+export interface MergeDraft {
+  date?: string;
+  payee: string;
+  narration: string;
+}
+
+export interface PdfPreview {
+  file: string;
+  screenshots: Array<{ page: number; image: string }>;
+}
+
+interface SavedDecisions {
+  ok: boolean;
+  revision: number;
+  ready: number;
+  batch?: ImportPreview;
+  changes?: { txs: ParsedTx[]; parseStats: NonNullable<ImportPreview["parseStats"]> };
+}
+
 export class ApiError extends Error {
-  constructor(public status: number, message: string) { super(message); }
+  constructor(public status: number, message: string, public temporary = false) { super(message); }
 }
 
 async function json<T>(response: Response): Promise<T> {
-  if (!response.ok) {
-    const body = await response.text();
-    let message = body;
-    try {
-      const parsed = JSON.parse(body) as { error?: unknown; details?: unknown; errors?: unknown };
-      const describe = (detail: unknown): string => {
-        if (typeof detail === "string") return detail;
-        if (!detail || typeof detail !== "object") return "";
-        const item = detail as { file?: unknown; line?: unknown; message?: unknown };
-        if (typeof item.message !== "string") return "";
-        const location = typeof item.file === "string" ? `${item.file}${typeof item.line === "number" ? `:${item.line}` : ""}` : "";
-        return [location, item.message].filter(Boolean).join("：");
-      };
-      const reasons = [...new Set([
-        typeof parsed.error === "string" ? parsed.error : "",
-        ...(Array.isArray(parsed.details) ? parsed.details.map(describe) : [describe(parsed.details)]),
-        ...(Array.isArray(parsed.errors) ? parsed.errors.map(describe) : [describe(parsed.errors)]),
-      ].filter(Boolean))];
-      message = reasons.length ? reasons.join("\n") : body;
-    } catch { /* plain text response */ }
-    throw new ApiError(response.status, message || `请求失败 (${response.status})`);
+  const body: unknown = await response.json().catch(() => undefined);
+  if (response.ok && body !== undefined) return body as T;
+  if (!response.ok && body && typeof body === "object") {
+    const parsed = body as { error?: unknown; details?: unknown; errors?: unknown };
+    const describe = (detail: unknown): string => {
+      if (typeof detail === "string") return detail;
+      if (!detail || typeof detail !== "object") return "";
+      const item = detail as { file?: unknown; line?: unknown; message?: unknown };
+      if (typeof item.message !== "string") return "";
+      const location = typeof item.file === "string" ? `${item.file}${typeof item.line === "number" ? `:${item.line}` : ""}` : "";
+      return [location, item.message].filter(Boolean).join("：");
+    };
+    const reasons = [...new Set([
+      typeof parsed.error === "string" ? parsed.error : "",
+      ...(Array.isArray(parsed.details) ? parsed.details.map(describe) : [describe(parsed.details)]),
+      ...(Array.isArray(parsed.errors) ? parsed.errors.map(describe) : [describe(parsed.errors)]),
+    ].filter(Boolean))];
+    if (reasons.length) throw new ApiError(response.status, reasons.join("\n"));
   }
-  return response.json() as Promise<T>;
+  const temporary = response.ok || response.status >= 500;
+  throw new ApiError(response.status, temporary ? "服务暂时不可用，请重试" : "请求未能完成，请刷新页面后重试", temporary);
+}
+
+function send<T>(url: string, init?: RequestInit): Promise<T> {
+  return fetch(url, init).catch(() => { throw new ApiError(0, "服务连接中断，请重试", true); }).then(json<T>);
 }
 
 function post<T>(url: string, body: unknown): Promise<T> {
-  return fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }).then(json<T>);
+  return send<T>(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 }
 
 export const api = {
   upload(files: File[]) {
     const body = new FormData();
     for (const file of files) body.append("files", file);
-    return fetch("/api/upload", { method: "POST", body }).then(json<UploadSummary>);
+    return send<UploadSummary>("/api/upload", { method: "POST", body });
   },
-  batches: () => fetch("/api/batches").then(json<BatchSummary[]>),
-  batch: (id: string) => fetch(`/api/batch/${encodeURIComponent(id)}`).then(json<ImportPreview>),
-  decide: (id: string, revision: number, decisions: TxDecision[]) => post<{ ok: boolean; revision: number; ready: number }>(`/api/batch/${encodeURIComponent(id)}/decide`, { revision, decisions }),
+  batches: () => send<BatchSummary[]>("/api/batches"),
+  batch: (id: string) => send<ImportPreview>(`/api/batch/${encodeURIComponent(id)}`),
+  pdfPreview: (id: string, txId: string, signal?: AbortSignal) =>
+    send<PdfPreview>(`/api/batch/${encodeURIComponent(id)}/pdf-preview/${encodeURIComponent(txId)}`, { signal }),
+  recheckLedger: (id: string, revision: number) => post<{ batch: ImportPreview; suspected: number }>(`/api/batch/${encodeURIComponent(id)}/recheck-ledger`, { revision }),
+  excludeSuspected: (id: string, revision: number) => post<{ batch: ImportPreview; excluded: number }>(`/api/batch/${encodeURIComponent(id)}/exclude-suspected`, { revision }),
+  funding: (id: string, revision: number, mappings?: FundingMappingChoice[]) => post<{ groups: FundingMappingGroup[]; batch?: ImportPreview; config?: ConfigResponse }>(`/api/batch/${encodeURIComponent(id)}/funding`, { revision, mappings }),
+  saveFundingMapping: (batchId: string, revision: number, id: string, account: string) =>
+    post<{ batch: ImportPreview; config: ConfigResponse; updated: number }>(
+      `/api/batch/${encodeURIComponent(batchId)}/funding-mapping`, { revision, id, account },
+    ),
+  deleteBatch: (id: string, revision: number) => send<{ ok: true }>(`/api/batch/${encodeURIComponent(id)}`, {
+    method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision }),
+  }),
+  decide: (id: string, revision: number, decisions: TxDecision[], changesOnly = false) => post<SavedDecisions>(
+    `/api/batch/${encodeURIComponent(id)}/decide`, { revision, decisions, changesOnly: changesOnly || undefined }),
+  merge: (id: string, revision: number, ids: string[], draft: MergeDraft) => post<{ batch: ImportPreview; mergedId: string }>(
+    `/api/batch/${encodeURIComponent(id)}/merge`, { revision, ids, ...draft }),
+  undoMerge: (id: string, revision: number, mergedId: string) => post<{ batch: ImportPreview }>(
+    `/api/batch/${encodeURIComponent(id)}/undo-merge`, { revision, id: mergedId }),
   generate: (id: string, revision: number) => post<GeneratedPreview>(`/api/batch/${encodeURIComponent(id)}/generate`, { revision }),
   commit: (id: string, revision: number) => post<{ ok: boolean; written: string[]; opens?: string[]; alreadyCommitted?: boolean; validation?: unknown }>(`/api/batch/${encodeURIComponent(id)}/commit`, { revision }),
-  ledger: () => fetch("/api/ledger").then(json<LedgerSummary>),
-  validate: () => fetch("/api/validate").then(json<{ available: boolean; ok: boolean; output: string }>),
+  ledger: () => send<LedgerSummary>("/api/ledger"),
+  validate: () => send<{ available: boolean; ok: boolean; output: string }>("/api/validate"),
   fava: () => post<{ running: boolean; port: number; alreadyRunning?: boolean; error?: string }>("/api/fava", {}),
-  config: () => fetch("/api/config").then(json<AppConfig>),
-  saveConfig: (config: Partial<AppConfig>) => post<AppConfig>("/api/config", config),
+  config: () => send<ConfigResponse>("/api/config"),
+  saveConfig: (config: Partial<AppConfig>) => post<ConfigResponse>("/api/config", config),
+  pickPath: (kind: PathField, current: string, ledgerDirectory: string) => post<{ path: string | null }>("/api/config/pick-path", { kind, current, ledgerDirectory }),
 };

@@ -3,9 +3,13 @@ import sys
 
 sys.dont_write_bytecode = True
 
+import glob
 import hashlib
 import json
+import os
+import time
 from collections import Counter, defaultdict
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
@@ -17,10 +21,70 @@ def metadata(values):
     }
 
 
+def unrounded_funding(entry, interpolate):
+    postings = entry.postings
+    inferred = [posting for posting in postings if (posting.meta or {}).get(interpolate.AUTOMATIC_META)]
+    if len(postings) < 2 or len(inferred) != 1:
+        return None
+    funding = inferred[0]
+    if funding.units is None or not funding.account.startswith(("Assets:", "Liabilities:")):
+        return None
+    currency = funding.units.currency
+    if any(
+        posting.cost is not None or posting.price is not None
+        or posting.units is None or posting.units.currency != currency
+        or not isinstance(posting.units.number, Decimal) or not posting.units.number.is_finite()
+        for posting in postings
+    ):
+        return None
+    exact = -sum(posting.units.number for posting in postings if posting is not funding)
+    booked = funding.units.number
+    tolerances = entry.meta.get("__tolerances__") or {}
+    tolerance = tolerances.get(currency)
+    if not tolerance or exact == booked or exact * booked <= 0 or abs(exact - booked) > tolerance:
+        return None
+    try:
+        rounded = interpolate.quantize_with_tolerance(tolerances, currency, exact)
+    except InvalidOperation:
+        return None
+    if rounded != booked:
+        return None
+    return {"account": funding.account, "amount": float(exact), "currency": currency}
+
+
+def account_sources(filename, options, load_started):
+    from beancount.parser import parser
+
+    filenames = {os.path.normcase(os.path.normpath(name)): name for name in options.get("include", [])}
+    if os.path.normcase(os.path.normpath(filename)) not in filenames or options.get("plugin"):
+        return None
+
+    sources = []
+    for name in filenames.values():
+        file = Path(name)
+        try:
+            content = file.read_bytes()
+            stat = file.stat()
+        except OSError:
+            return None
+        if max(stat.st_mtime_ns, stat.st_ctime_ns) > load_started:
+            return None
+        # A cached chart must account for every include. Glob matches and plugins can change independently.
+        _, diagnostics, parsed_options = parser.parse_string(content, report_filename=name)
+        if diagnostics or parsed_options.get("plugin"):
+            return None
+        for pattern in parsed_options.get("include", []):
+            included = os.path.normpath(os.path.join(os.path.dirname(name), pattern))
+            if glob.has_magic(included) or os.path.normcase(included) not in filenames:
+                return None
+        sources.append({"file": name, "sha256": hashlib.sha256(content).hexdigest()})
+    return sources
+
+
 def run(request):
     try:
         from beancount import loader
-        from beancount.core import data
+        from beancount.core import data, interpolate
     except ImportError as exc:
         raise RuntimeError("所选 Python 未安装 Beancount，请选择账本的 venv/bin/python") from exc
 
@@ -32,7 +96,8 @@ def run(request):
         filename = str(Path(request["file"]).expanduser().resolve(strict=True))
         # initialize(False) deletes existing caches. Call the uncached loader
         # directly instead, bypassing both cache reads and cache writes.
-        entries, errors, _ = loader._uncached_load_file(filename, None, None, None)
+        load_started = time.time_ns()
+        entries, errors, options = loader._uncached_load_file(filename, None, None, None)
     else:
         entries, errors, _ = loader.load_string(request["text"])
 
@@ -43,6 +108,10 @@ def run(request):
     result = {"ok": not diagnostics, "loader": "beancount-native", "errors": diagnostics}
     if request["operation"] == "validate":
         return result
+    if "file" in request and request.get("trackAccountSources") and not errors:
+        sources = account_sources(filename, options, load_started)
+        if sources:
+            result["accountSources"] = sources
 
     accounts = {}
     closed = {entry.account: str(entry.date) for entry in entries if isinstance(entry, data.Close)}
@@ -74,6 +143,9 @@ def run(request):
                 ],
                 "file": file, "line": line, "flag": entry.flag, "tags": sorted(entry.tags), "links": sorted(entry.links), "metadata": meta,
             }
+            unrounded = unrounded_funding(entry, interpolate)
+            if unrounded:
+                tx["unroundedFunding"] = unrounded
             for target, keys in {"time": ("time",), "source": ("source", "import-source"), "sourceTxId": ("source-tx-id", "import-id", "source_tx_id", "sourceTxId")}.items():
                 for key in keys:
                     if key in meta:

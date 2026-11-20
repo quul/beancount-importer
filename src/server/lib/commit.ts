@@ -3,9 +3,11 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import type { AppConfig, LedgerError } from "../../shared/types.js";
+import { activeTransactions } from "../../shared/transactionMerge.js";
 import { atomicJson, profileId, type StoredBatch } from "./batches.js";
 import { discoverPython, parseLedger } from "./ledger.js";
 import { generateEntries } from "./generate.js";
+import { importDirectoryError } from "./import-paths.js";
 import { markDuplicates } from "./dedup.js";
 
 export class ImportError extends Error {
@@ -28,12 +30,13 @@ const read = (file: string) => fs.existsSync(file) ? fs.readFileSync(file, "utf8
 
 function inside(root: string, relative: string): string {
   const result = path.resolve(root, relative);
-  if (result === root || !result.startsWith(`${root}${path.sep}`)) {
+  const fromRoot = path.relative(root, result);
+  if (!fromRoot || fromRoot === ".." || fromRoot.startsWith(`..${path.sep}`) || path.isAbsolute(fromRoot)) {
     throw new ImportError(400, "账本文件路径必须位于账本目录内");
   }
   // Existing symlink parents could otherwise redirect writes outside the ledger.
   let current = root;
-  for (const part of path.relative(root, result).split(path.sep)) {
+  for (const part of fromRoot.split(path.sep)) {
     current = path.join(current, part);
     if (fs.lstatSync(current, { throwIfNoEntry: false })?.isSymbolicLink()) {
       throw new ImportError(400, "写入路径不能包含符号链接");
@@ -77,7 +80,7 @@ function includeRelative(root: string, parent: string, include: string): string 
 
 function withInclude(text: string, relative: string, root: string, parent: string): string {
   const escaped = relative.replace(/\\/g, "/");
-  const target = includeRelative(root, parent, relative);
+  const target = includeRelative(root, parent, escaped);
   const present = text.split(/\r?\n/).some((line) => {
     const include = line.match(/^[ \t]*include[ \t]+"([^"]+)"/)?.[1];
     return include !== undefined && includeRelative(root, parent, include) === target;
@@ -90,18 +93,35 @@ function errorKey(error: LedgerError, staged: string, root: string): string {
   return JSON.stringify([normalize(error.file ?? ""), error.line, normalize(error.message), error.type]);
 }
 
-function acquire(file: string): () => void {
+export function acquireWriteLock(file: string, busyMessage: string): () => void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  if (fs.existsSync(file)) {
-    const lock = JSON.parse(fs.readFileSync(file, "utf8")) as { pid: number };
+  let lock: { pid: number } | undefined;
+  try {
+    lock = JSON.parse(fs.readFileSync(file, "utf8")) as { pid: number };
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new ImportError(409, busyMessage);
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (lock) {
     let alive = true;
     try { process.kill(lock.pid, 0); } catch (error) { alive = (error as NodeJS.ErrnoException).code !== "ESRCH"; }
-    if (alive) throw new ImportError(409, "另一个批次正在写入该账本，请稍后重试");
-    fs.rmSync(file);
+    if (alive) throw new ImportError(409, busyMessage);
+    fs.rmSync(file, { force: true });
   }
   try { fs.writeFileSync(file, JSON.stringify({ pid: process.pid }), { flag: "wx", mode: 0o600 }); }
-  catch { throw new ImportError(409, "账本正在写入，请稍后重试"); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    throw new ImportError(409, busyMessage);
+  }
   return () => fs.rmSync(file, { force: true });
+}
+
+export function assertBatchDeletable(batch: StoredBatch, dataDir: string): void {
+  if (batch.committed) throw new ImportError(409, "已过账的批次不能删除");
+  const journal = read(path.join(dataDir, "commits", `${batch.batchId}.json`));
+  if (journal && (JSON.parse(journal) as Journal).status !== "rolled-back") {
+    throw new ImportError(409, "此批次有待核对的过账记录，请先确认过账状态");
+  }
 }
 
 /** Complete or roll back an interrupted commit without appending the batch again. */
@@ -130,7 +150,7 @@ export function commitBatch(batch: StoredBatch, config: AppConfig, root: string,
   root = fs.realpathSync(path.resolve(root));
   const profile = profileId(root, config.mainFile);
   if (batch.ledgerProfile !== profile) throw new ImportError(409, "账本配置已改变，请切回此批次的账本再操作");
-  const release = acquire(path.join(dataDir, "locks", `${profile}.json`));
+  const release = acquireWriteLock(path.join(dataDir, "locks", `${profile}.json`), "另一个批次正在写入该账本，请稍后重试");
   const journalFile = path.join(dataDir, "commits", `${batch.batchId}.json`);
   let stage: string | undefined;
   try {
@@ -155,10 +175,16 @@ export function commitBatch(batch: StoredBatch, config: AppConfig, root: string,
     if (!batch.preview || batch.preview.revision !== batch.revision) throw new ImportError(409, "请先生成当前审阅版本的预览");
 
     const python = config.pythonPath || discoverPython(root);
-    const generated = generateEntries(batch.txs, batch.batchId);
+    const directoryError = importDirectoryError(config.monthlyDir);
+    if (directoryError) throw new ImportError(400, directoryError);
+    const generated = generateEntries(batch.txs, batch.batchId, config);
     if (generated.errors?.length) throw new ImportError(422, "分录校验未通过", generated.errors);
     if (!generated.generated.length) throw new ImportError(422, "没有已确认的交易可写入");
-    if (JSON.stringify(generated.monthFiles) !== JSON.stringify(batch.preview.result.monthFiles)) {
+    const previousFiles = batch.preview.result.files;
+    const hasNewVariables = /\{(?:month|source|account)\}/.test(config.monthlyDir) || (!config.annualLayout && config.monthlyDir.includes("{year}"));
+    if (previousFiles
+      ? JSON.stringify(generated.files) !== JSON.stringify(previousFiles)
+      : hasNewVariables || JSON.stringify(generated.monthFiles) !== JSON.stringify(batch.preview.result.monthFiles)) {
       throw new ImportError(409, "预览与当前批次不一致，请重新生成");
     }
 
@@ -211,7 +237,7 @@ export function commitBatch(batch: StoredBatch, config: AppConfig, root: string,
     // Both baseline and duplicate identity come from the same byte snapshot that
     // is later checked against the original tree. No pre-snapshot race window.
     const ledger = parseLedger(stage, mainRelative, python);
-    const ready = structuredClone(batch.txs.filter((tx) => tx.status === "ready"));
+    const ready = structuredClone(activeTransactions(batch.txs).filter((tx) => tx.status === "ready"));
     const rechecked = markDuplicates(ready, ledger.transactions);
     if (rechecked.txs.some((tx) => tx.status === "duplicate")) {
       throw new ImportError(409, "账本已包含此批次的部分交易，请重新导入对账后再提交");
@@ -226,29 +252,28 @@ export function commitBatch(batch: StoredBatch, config: AppConfig, root: string,
       return originalText.get(relative) ?? "";
     };
     const written: string[] = [];
-    for (const [month, body] of Object.entries(generated.monthFiles).sort(([a], [b]) => a.localeCompare(b))) {
-      if (!/^\d{6}$/.test(month)) throw new ImportError(400, "无效月份");
-      const year = month.slice(0, 4);
-      const directory = config.annualLayout
-        ? config.monthlyDir.replaceAll("{year}", year)
-        : config.monthlyDir;
-      const relative = path.join(directory, config.annualLayout ? `${year}-${month.slice(4)}.bean` : `${month}.beancount`);
+    const annualFiles = new Map<string, string>();
+    for (const [target, { year, body }] of Object.entries(generated.files)) {
+      const relative = path.normalize(target);
       inside(root, relative);
       planned.set(relative, `${content(relative).trimEnd()}\n\n; import-batch: ${batch.batchId}\n${body.trimEnd()}\n`);
-      written.push(relative.replace(/\\/g, "/"));
+      written.push(target);
       if (config.annualLayout) {
         const annual = path.join("years", year, `${year}.bean`);
-        // Suggested opens (e.g. the family-card payer's card) go into the annual
-        // file before the include chain, so every generated entry has its accounts.
-        const opensText = (batch.preview?.opens ?? []).filter((line) => line.startsWith(`${year}-`)).map((line) => `${line}\n`).join("");
-        planned.set(annual, `${opensText}${withInclude(content(annual), path.relative(path.dirname(annual), relative), root, annual)}`);
-        planned.set(mainRelative, withInclude(content(mainRelative), path.relative(path.dirname(mainRelative), annual), root, mainRelative));
+        annualFiles.set(year, annual);
+        planned.set(annual, withInclude(content(annual), path.relative(path.dirname(annual), relative), root, annual));
       } else {
         planned.set(mainRelative, withInclude(content(mainRelative), path.relative(path.dirname(mainRelative), relative), root, mainRelative));
       }
     }
-    if (!config.annualLayout && (batch.preview?.opens ?? []).length) {
-      planned.set(mainRelative, `${(batch.preview?.opens ?? []).map((line) => `${line}\n`).join("")}${content(mainRelative)}`);
+    const opens = batch.preview.opens;
+    for (const [year, annual] of annualFiles) {
+      const opensText = opens.filter((line) => line.startsWith(`${year}-`)).map((line) => `${line}\n`).join("");
+      planned.set(annual, opensText + content(annual));
+      planned.set(mainRelative, withInclude(content(mainRelative), path.relative(path.dirname(mainRelative), annual), root, mainRelative));
+    }
+    if (!config.annualLayout && opens.length) {
+      planned.set(mainRelative, `${opens.join("\n")}\n${content(mainRelative)}`);
     }
     for (const [relative, after] of planned) replaceFile(inside(stage, relative), after);
     rewriteIncludes();

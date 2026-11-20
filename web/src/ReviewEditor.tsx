@@ -1,4 +1,6 @@
 import type { DraftPosting, ParsedAccount, ParsedTx, TxDecision } from "../../src/shared/types.js";
+import AccountSelect from "./AccountSelect";
+import TransactionFlag from "./TransactionFlag";
 
 export interface ReviewDraft {
   tags: string;
@@ -29,24 +31,22 @@ export function makeDraft(tx: ParsedTx): ReviewDraft {
 }
 
 export function draftDecision(tx: ParsedTx, draft: ReviewDraft): TxDecision {
-  return {
-    id: tx.id, tags: parseTags(draft.tags), flag: draft.flag, reviewNote: draft.reviewNote,
-    postings: draft.split ? draft.postings.map((posting) => ({ ...posting, amount: Number(posting.amount), currency: posting.currency.trim().toUpperCase() })) : null,
-  };
+  const decision: TxDecision = { id: tx.id, tags: parseTags(draft.tags), flag: draft.flag, reviewNote: draft.reviewNote };
+  if (draft.split) {
+    const postings = draft.postings.map((posting) => ({ ...posting, amount: Number(posting.amount), currency: posting.currency.trim().toUpperCase() }));
+    const previous = tx.postings;
+    if (!previous || postings.length !== previous.length || postings.some((posting, index) => (
+      posting.account !== previous[index].account || posting.amount !== previous[index].amount || posting.currency !== previous[index].currency
+    ))) decision.postings = postings;
+  } else if (tx.postings) {
+    decision.postings = null;
+  }
+  return decision;
 }
 
-export function AccountSelect({ value, accounts, onChange, disabled, funding = false, label }: {
-  value: string; accounts: ParsedAccount[]; onChange: (value: string) => void; disabled?: boolean; funding?: boolean; label: string;
-}) {
-  const candidates = accounts.filter((account) => !funding || /^(Assets|Liabilities):/.test(account.account));
-  return <select className="account-select" aria-label={label} value={value} onChange={(event) => onChange(event.target.value)} disabled={disabled}>
-    {!candidates.some((account) => account.account === value) && <option value={value} disabled>{value ? `${value}（未在账本定义）` : "请选择账本账户"}</option>}
-    {candidates.map((account) => <option value={account.account} key={account.account}>{account.account}{account.closedAt ? `（关闭于 ${account.closedAt}）` : ""}</option>)}
-  </select>;
-}
-
-export default function ReviewEditor({ tx, draft, dirty, accounts, disabled, onChange, onSave, onDiscard }: {
+export default function ReviewEditor({ tx, refundCounterpartSourceId, draft, dirty, accounts, disabled, editFlag, onChange, onSave, onDiscard }: {
   tx: ParsedTx; draft: ReviewDraft; dirty: boolean; accounts: ParsedAccount[]; disabled: boolean;
+  refundCounterpartSourceId?: string; editFlag?: boolean;
   onChange: (draft: ReviewDraft) => void; onSave: () => void; onDiscard: () => void;
 }) {
   const totals = new Map<string, number>();
@@ -58,31 +58,44 @@ export default function ReviewEditor({ tx, draft, dirty, accounts, disabled, onC
     totals.set(currency, (totals.get(currency) ?? 0) + amount);
   }
   const imbalances = [...totals].filter(([, amount]) => Math.abs(amount) > 0.000001);
-  const splitError = draft.split && (invalid || draft.postings.length < 2 || imbalances.length > 0);
+  const splitError = !tx.merge && draft.split && (invalid || draft.postings.length < 2 || imbalances.length > 0);
   const badTags = invalidTags(draft.tags);
   const setPosting = (index: number, patch: Partial<ReviewDraft["postings"][number]>) => onChange({ ...draft, postings: draft.postings.map((posting, i) => i === index ? { ...posting, ...patch } : posting) });
 
   return <div className="review-editor">
     <fieldset disabled={disabled}>
       <div className="editor-grid">
-        <label>标签<input value={draft.tags} placeholder="trip2026 reimbursement" onChange={(event) => onChange({ ...draft, tags: event.target.value })} /><small>空格分隔；中文写审阅备注。</small>{badTags.length > 0 && <small className="error-line">标签格式无效：{badTags.join("、")}</small>}</label>
-        <label>账本标记<select value={draft.flag} onChange={(event) => onChange({ ...draft, flag: event.target.value as "*" | "!" })}><option value="*">* 正常</option><option value="!">! 待核实</option></select></label>
-        <label className="wide">审阅备注<textarea rows={2} value={draft.reviewNote} onChange={(event) => onChange({ ...draft, reviewNote: event.target.value })} placeholder="记录优惠、代付或需要核实的原因" /></label>
+        <label className="wide">审批备注<textarea rows={3} maxLength={2000} value={draft.reviewNote} onChange={(event) => onChange({ ...draft, reviewNote: event.target.value })} /></label>
+        <label>标签<input value={draft.tags} placeholder="trip2026 reimbursement" onChange={(event) => onChange({ ...draft, tags: event.target.value })} /><small>英文标签，空格分隔。</small>{badTags.length > 0 && <small className="error-line">标签格式无效：{badTags.join("、")}</small>}</label>
+        {editFlag && <div className="editor-flag"><span>账本标记</span>
+          <TransactionFlag label="单笔账本标记" value={draft.flag} onChange={(flag) => onChange({ ...draft, flag })} />
+        </div>}
       </div>
-      <label className="check-label"><input type="checkbox" checked={draft.split} onChange={(event) => onChange({ ...draft, split: event.target.checked })} />手动编辑多条 posting（拆分优惠、代付、混合支付）</label>
-      {draft.split && <div className="posting-editor">
-        <p className="muted">金额带正负号，每个币种合计为 0。</p>
+      {!tx.merge && <label className="check-label"><input type="checkbox" checked={draft.split} onChange={(event) => onChange({ ...draft, split: event.target.checked })} />拆分分录</label>}
+      {!tx.merge && draft.split && <div className="posting-editor">
+        <p className="muted">每种币种合计须为 0。</p>
         {draft.postings.map((posting, index) => <div className="posting-row" key={index}>
-          <AccountSelect value={posting.account} accounts={accounts} label={`第 ${index + 1} 条 posting 账户`} onChange={(account) => setPosting(index, { account })} />
+          <AccountSelect value={posting.account} accounts={accounts} label={`第 ${index + 1} 条分录的账户`} onChange={(account) => setPosting(index, { account })} />
           <input inputMode="decimal" aria-label={`第 ${index + 1} 条 posting 金额`} value={posting.amount} onChange={(event) => setPosting(index, { amount: event.target.value })} placeholder="带正负号的金额" />
           <input aria-label={`第 ${index + 1} 条 posting 币种`} value={posting.currency} onChange={(event) => setPosting(index, { currency: event.target.value })} placeholder="CNY" />
           <button className="btn small" onClick={() => onChange({ ...draft, postings: draft.postings.filter((_, i) => i !== index) })}>移除</button>
         </div>)}
-        <button className="btn small" onClick={() => onChange({ ...draft, postings: [...draft.postings, { account: "", amount: "0", currency: tx.currency }] })}>＋ 添加 posting</button>
-        {splitError && <p className="error-line" role="alert">{invalid ? "请补全账户、金额和币种。" : draft.postings.length < 2 ? "至少保留两条 posting。" : `尚未平衡：${imbalances.map(([currency, amount]) => `${amount.toFixed(2)} ${currency}`).join("；")}`}</p>}
+        <button className="btn small" onClick={() => onChange({ ...draft, postings: [...draft.postings, { account: "", amount: "0", currency: tx.currency }] })}>＋ 添加分录</button>
+        {splitError && <p className="error-line" role="alert">{invalid ? "请补全账户、金额和币种。" : draft.postings.length < 2 ? "至少两条分录。" : `尚未平衡：${imbalances.map(([currency, amount]) => `${amount.toFixed(2)} ${currency}`).join("；")}`}</p>}
       </div>}
-      <div className="toolbar editor-actions"><button className="btn primary small" disabled={!dirty || Boolean(splitError) || badTags.length > 0} onClick={onSave}>保存此笔编辑</button><button className="btn small" disabled={!dirty} onClick={onDiscard}>放弃这些改动</button>{dirty && <span className="muted">未保存，预览已失效。</span>}</div>
+      <div className="toolbar editor-actions"><button className="btn primary small" disabled={!dirty || Boolean(splitError) || badTags.length > 0} onClick={onSave}>保存编辑</button><button className="btn small" disabled={!dirty} onClick={onDiscard}>放弃编辑</button>{dirty && <span className="muted">未保存</span>}</div>
     </fieldset>
-    <div className="source-details"><b>原始来源</b> {tx.sourceFile} · 第 {tx.row} 行 · {tx.source}<br />支付方式：{tx.rawAccount || "未提供"} · 状态：{tx.sourceStatus || "未提供"} · 原始收支：{tx.originalDirection || tx.direction}{tx.sourceTxId && <><br />交易号：<code>{tx.sourceTxId}</code></>}{tx.excludedReason && <p className="error-line">排除原因：{tx.excludedReason}</p>}{tx.issues?.map((issue, index) => <p className="error-line" key={index}>{issue}</p>)}</div>
+    {!tx.merge && <dl className="tx-meta source-details">
+      <div><dt>原始来源</dt><dd>{tx.sourceFile} · 第 {tx.row} 行 · {tx.source}</dd></div>
+      {tx.note && <div><dt>账单备注</dt><dd>{tx.note}</dd></div>}
+      {tx.rawAccount && <div><dt>支付方式</dt><dd>{tx.rawAccount}</dd></div>}
+      {tx.recognition && <div><dt>推断资金方式</dt><dd>{tx.recognition.fundingMethod}</dd></div>}
+      {tx.originalDirection && <div><dt>原始收支</dt><dd>{tx.originalDirection}</dd></div>}
+      {tx.sourceTxId && <div><dt>交易号</dt><dd><code>{tx.sourceTxId}</code></dd></div>}
+      {refundCounterpartSourceId && <div><dt>{tx.eventType === "refund" ? "原消费单号" : "退款单号"}</dt><dd><code>{refundCounterpartSourceId}</code></dd></div>}
+      {tx.duplicateOf && <div><dt>重复依据</dt><dd>{tx.duplicateOf.label}<br />{tx.duplicateOf.where} · <code>{tx.duplicateOf.id}</code></dd></div>}
+      {tx.refundReviewMode === "follow-purchase" ? <div><dt>分类依据</dt><dd>沿用原消费分类</dd></div>
+        : (tx.suggestedAccount || tx.reason) && <div><dt>分类依据</dt><dd>置信度 {Math.round(tx.confidence * 100)}%{tx.reason && <><br />{tx.reason}</>}</dd></div>}
+    </dl>}
   </div>;
 }

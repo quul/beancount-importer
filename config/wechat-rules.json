@@ -1,0 +1,27 @@
+[
+  {
+    "label": "活动奖励",
+    "when": {
+      "category": "其他",
+      "direction": "in",
+      "status": "已到账",
+      "payeePrefix": "活动奖励_"
+    },
+    "fundingMethod": "零钱"
+  },
+  {
+    "label": "转账",
+    "when": {
+      "category": "转账",
+      "direction": "in",
+      "status": "已存入零钱"
+    },
+    "fundingMethod": "零钱"
+  },
+  {
+    "when": {
+      "category": ["转入零钱通-来自零钱", "零钱通转出-到零钱"]
+    },
+    "exclude": "零钱与零钱通互转"
+  }
+]

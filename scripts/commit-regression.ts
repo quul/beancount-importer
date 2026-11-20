@@ -51,7 +51,7 @@ try {
     const f = fixture("absolute");
     fs.mkdirSync(path.join(f.root, "years", "2025"), { recursive: true });
     fs.renameSync(path.join(f.root, "accounts.bean"), path.join(f.root, "accounts.txt"));
-    const aliasRoot = path.join(requestedTmp, "absolute", "ledger");
+    const aliasRoot = path.join(requestedTmp, "absolute", "ledger").replaceAll("\\", "/");
     fs.writeFileSync(path.join(f.root, "years", "2025", "2025.bean"), "; annual\n");
     fs.writeFileSync(path.join(f.root, "main.bean"), `include "${aliasRoot}/accounts.txt"\ninclude "${aliasRoot}/years/2025/2025.bean"\n`);
     const input = batch(f.root);
@@ -66,7 +66,7 @@ try {
     const f = fixture("outside");
     const external = path.join(tmp, "outside", "external.bean");
     fs.writeFileSync(external, "; external\n");
-    fs.appendFileSync(path.join(f.root, "main.bean"), `include "${external}"\n`);
+    fs.appendFileSync(path.join(f.root, "main.bean"), `include "${external.replaceAll("\\", "/")}"\n`);
     const before = fs.readFileSync(path.join(f.root, "main.bean"), "utf8");
     expectError(() => commitBatch(batch(f.root), f.config, f.root, f.data), 422, /include 超出/);
     assert.equal(fs.readFileSync(path.join(f.root, "main.bean"), "utf8"), before);
@@ -74,8 +74,11 @@ try {
   });
   check("symlink includes reject explicitly", () => {
     const f = fixture("symlink");
-    fs.symlinkSync(path.join(f.root, "accounts.bean"), path.join(f.root, "linked.bean"));
-    fs.writeFileSync(path.join(f.root, "main.bean"), 'include "linked.bean"\n');
+    const destination = path.join(f.root, "definitions");
+    fs.mkdirSync(destination);
+    fs.renameSync(path.join(f.root, "accounts.bean"), path.join(destination, "accounts.bean"));
+    fs.symlinkSync(destination, path.join(f.root, "linked"), "junction");
+    fs.writeFileSync(path.join(f.root, "main.bean"), 'include "linked/accounts.bean"\n');
     expectError(() => commitBatch(batch(f.root), f.config, f.root, f.data), 400, /符号链接/);
   });
   check("a partial older batch is rolled back before a different batch commits", () => {
@@ -110,6 +113,40 @@ try {
     expectError(() => commitBatch(input, f.config, f.root, f.data), 422, /新增校验错误/);
     assert.equal(fs.readFileSync(path.join(f.root, "main.bean"), "utf8"), before);
     assert.equal(fs.existsSync(path.join(f.root, "years")), false);
+  });
+  check("template routes each reviewed transaction and includes each account open only once", () => {
+    const f = fixture("routed");
+    f.config.monthlyDir = "years/{year}/{month}/{source}/{account}";
+    const input = batch(f.root, { finalAccount: "Expenses:New" });
+    input.txs.push(...batch(f.root, { source: "wechat", finalAccount: "Expenses:New", postings: [
+      { account: "Assets:Other", amount: -6, currency: "CNY" },
+      { account: "Expenses:New", amount: 6, currency: "CNY" },
+    ] }).txs);
+    const preview = generateEntries(input.txs, input.batchId, f.config);
+    input.preview = { revision: 1, result: preview, opens: ["2025-02-01 open Assets:Other CNY", "2025-02-01 open Expenses:New"] };
+    const files = ["years/2025/02/alipay/Assets_Test/2025-02.bean", "years/2025/02/wechat/Assets_Other/2025-02.bean"];
+    assert.deepEqual(Object.keys(preview.files), files);
+    expectError(() => commitBatch(input, { ...f.config, monthlyDir: "elsewhere" }, f.root, f.data), 409, /预览与当前批次不一致/);
+    assert.deepEqual(commitBatch(input, f.config, f.root, f.data).written, files);
+    for (const [index, file] of files.entries()) {
+      const contents = fs.readFileSync(path.join(f.root, file), "utf8");
+      assert.ok(contents.includes(input.txs[index].id));
+      assert.ok(!contents.includes(input.txs[1 - index].id));
+    }
+    const actual = parseLedger(f.root, "main.bean", python);
+    assert.deepEqual(actual.errors, []);
+    assert.equal(actual.transactions.length, 2);
+  });
+  check("flat-layout templates also route month-end balances by their directive date", () => {
+    const f = fixture("balance");
+    f.config.annualLayout = false;
+    f.config.monthlyDir = "months/{year}\\{month}/{source}/{account}";
+    const input = batch(f.root, { source: "bank-boc", date: "2025-02-28", amount: 12.34, balanceIsDayEnd: true, balanceAfter: -12.34 });
+    input.preview!.result = generateEntries(input.txs, input.batchId, f.config);
+    const result = commitBatch(input, f.config, f.root, f.data);
+    assert.deepEqual(result.written, ["months/2025/02/bank-boc/Assets_Test/202502.beancount", "months/2025/03/bank-boc/Assets_Test/202503.beancount"]);
+    assert.match(fs.readFileSync(path.join(f.root, result.written[1]), "utf8"), /2025-03-01 balance Assets:Test/);
+    assert.deepEqual(parseLedger(f.root, "main.bean", python).errors, []);
   });
   console.log(`${checks} isolated commit regressions passed`);
 } finally { fs.rmSync(tmp, { recursive: true, force: true }); }

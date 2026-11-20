@@ -248,8 +248,8 @@ export function parseBank(file: string, def: BankDef): ParseResult {
       sourceFile: file,
       row: r + 1,
       eventType: /还款|转账|转入|转出|充值|提现/.test(cell(iNote)) ? "transfer" : direction === "in" ? "income" : "expense",
-      excludedReason: amount === 0 ? "零金额交易，无资金变动" : undefined,
-      issues: iDirCol < 0 && inAmt == null && outAmt == null ? ["按金额正负推断方向，请核对银行导出符号约定"] : [],
+      excludedReason: amount === 0 ? "零金额" : undefined,
+      issues: iDirCol < 0 && inAmt == null && outAmt == null ? ["收支待确认"] : [],
     });
   }
 

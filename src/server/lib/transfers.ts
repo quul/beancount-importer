@@ -2,6 +2,8 @@
 import { isFamilyCard } from "../../shared/types.js";
 import type { ParsedTx } from "../../shared/types.js";
 const TRANSFER_RE = /还款|转账|转出|转入|充值|提现|取现|存现|余额宝|零钱通/i;
+const TRANSFER_PAIR_ISSUE = "疑似转账配对";
+export const transferPairIssue = (issue: string) => issue === TRANSFER_PAIR_ISSUE || issue.startsWith("这可能是同一笔转账的两条流水");
 export interface PairResult { pairs: Array<{ from: ParsedTx; to: ParsedTx }>; absorbed: Set<string>; familyCardPairs: number }
 const dateDiff = (a: string, b: string) => Math.abs(Date.parse(a) - Date.parse(b)) / 86400000;
 const transfer = (tx: ParsedTx) => tx.eventType === "transfer" || TRANSFER_RE.test(`${tx.payee} ${tx.note} ${tx.rawCategory}`);
@@ -24,10 +26,10 @@ export function pairTransfers(txs: ParsedTx[]): PairResult {
     const postings = [{ account: from.fundingAccount, amount: -from.amount, currency: from.currency }, { account: to.fundingAccount, amount: to.amount, currency: to.currency }];
     for (const [tx, counterpart] of [[from, to], [to, from]]) {
       tx.status = "pending";
-      tx.issues = [...new Set([...(tx.issues ?? []), "这可能是同一笔转账的两条流水，采用后请排除另一条"] )];
+      tx.issues = [...new Set([...(tx.issues ?? []), TRANSFER_PAIR_ISSUE])];
       tx.matches ??= [];
       tx.matches.push({ id: counterpart.id, date: counterpart.date, payee: counterpart.payee, narration: counterpart.note,
-        file: counterpart.sourceFile, line: counterpart.row, reason: "转账配对建议：可能是同一笔转账", postings });
+        file: counterpart.sourceFile, line: counterpart.row, reason: "转账配对建议", postings });
     }
     pairs.push({ from, to });
   }
@@ -64,7 +66,7 @@ function pairFamilyCards(txs: ParsedTx[]): number {
     const charge = candidates[0];
     used.add(charge.id);
     proxy.status = "duplicate";
-    proxy.duplicateOf = { id: charge.id, where: charge.sourceFile, label: "亲情卡消费已由对方账单扣款，保留对方一笔" };
+    proxy.duplicateOf = { id: charge.id, where: charge.sourceFile, label: "保留对方扣款" };
     proxy.matches = [{ id: charge.id, date: charge.date, payee: charge.payee, narration: charge.note,
       file: charge.sourceFile, line: charge.row, reason: "对方账单中的实际扣款", postings: charge.postings ?? [] }];
     paired++;
@@ -75,6 +77,6 @@ function pairFamilyCards(txs: ParsedTx[]): number {
 /** Clear only pairing suggestions; user-entered accounting fields are preserved. */
 export function clearTransferSuggestion(tx: ParsedTx): void {
   tx.matches = tx.matches?.filter((match) => !match.reason.startsWith("转账配对建议"));
-  tx.issues = tx.issues?.filter((issue) => !issue.startsWith("这可能是同一笔转账的两条流水"));
+  tx.issues = tx.issues?.filter((issue) => !transferPairIssue(issue));
   delete tx.fundingAccount2;
 }

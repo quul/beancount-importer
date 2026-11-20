@@ -122,18 +122,31 @@ try {
       assert.ok(actual.transactions.length > 0);
       assert.equal(fs.existsSync(cache) ? fs.statSync(cache).mtimeMs : null, before);
     });
-    const cfgRoot = path.join(tmp, "config");
-    fs.mkdirSync(cfgRoot);
-    fs.writeFileSync(path.join(cfgRoot, "config.json"), JSON.stringify({ ledgerRoot: "../beancount-import-auto", mainFile: "main.beancount", monthlyDir: "data", assetMapping: [{ keyword: "微信", account: "Assets:WeChat:Cash", kind: "debit" }], accounts: ["Expenses:Other"] }));
-    const migrated = loadConfig(cfgRoot);
-    check("legacy demo profiles migrate locally to the discovered real ledger", () => {
-      assert.equal(migrated.ledgerRoot, realRoot);
-      assert.equal(migrated.mainFile, "main.bean");
-      assert.equal(migrated.annualLayout, true);
-      assert.equal(migrated.monthlyDir, "years/{year}/imported");
-      assert.equal(migrated.llm.provider, "off");
-      assert.ok(migrated.assetMapping.every((m) => actual.accounts.some((a) => a.account === m.account)));
-    });
   }
+  check("legacy settings move into the verified ledger and reload without a project config", () => {
+    const cfgRoot = path.join(tmp, "config"), oldFile = path.join(cfgRoot, "config.json");
+    fs.mkdirSync(cfgRoot);
+    const mapping = [{ keyword: "测试卡", account: "Assets:CN:Bank:BOC:5678", kind: "debit", cardSuffix: "5678" }];
+    fs.writeFileSync(oldFile, JSON.stringify({
+      ledgerRoot: tmp, mainFile: "main.bean", monthlyDir: "fixture/{year}", annualLayout: false, pythonPath: python,
+      assetMapping: mapping, llm: { apiKey: "fixture-secret", model: "fixture-model" }, futurePreference: ["fixture"],
+    }));
+    const originalEnvironment = process.env.ACCOUNT_IMPORT_LEDGER_ROOT;
+    try {
+      process.env.ACCOUNT_IMPORT_LEDGER_ROOT = tmp;
+      const migrated = loadConfig(cfgRoot);
+      assert.equal(migrated.ledgerRoot, tmp);
+      assert.deepEqual(migrated.assetMapping, mapping);
+      assert.equal(fs.existsSync(oldFile), false);
+      const saved = JSON.parse(fs.readFileSync(path.join(tmp, ".beancount-importer.json"), "utf8"));
+      assert.deepEqual(saved.futurePreference, ["fixture"]);
+      assert.equal(saved.llm.apiKey, "fixture-secret");
+      assert.equal(loadConfig(cfgRoot).monthlyDir, "fixture/{year}");
+      assert.equal(fs.existsSync(oldFile), false);
+    } finally {
+      if (originalEnvironment === undefined) delete process.env.ACCOUNT_IMPORT_LEDGER_ROOT;
+      else process.env.ACCOUNT_IMPORT_LEDGER_ROOT = originalEnvironment;
+    }
+  });
   console.log(`${checks} ledger/profile regressions passed`);
 } finally { fs.rmSync(tmp, { recursive: true, force: true }); }

@@ -10,8 +10,12 @@ export interface StoredBatch extends ImportPreview {
   committed: boolean;
   /** Never allow an old batch to follow a change to the configured ledger. */
   ledgerProfile: string;
+  /** Storage names of the original PDFs, keyed by their upload digest. */
+  pdfUploads?: Record<string, string>;
   preview?: { revision: number; result: GenerateResult; opens: string[] };
 }
+
+export const isBatchId = (id: string) => /^b\d+-[a-f0-9]{12}$/.test(id);
 
 export function profileId(root: string, main: string): string {
   const absoluteRoot = path.resolve(root);
@@ -38,7 +42,7 @@ export class BatchStore {
   }
 
   private file(id: string): string {
-    if (!/^b\d+-[a-f0-9]{12}$/.test(id)) throw new Error("无效的批次 ID");
+    if (!isBatchId(id)) throw new Error("无效的批次 ID");
     return path.join(this.directory, `${id}.json`);
   }
 
@@ -55,9 +59,20 @@ export class BatchStore {
   }
 
   get(id: string): StoredBatch | undefined {
-    const file = this.file(id);
-    if (!fs.existsSync(file)) return undefined;
-    return JSON.parse(fs.readFileSync(file, "utf8")) as StoredBatch;
+    try {
+      return JSON.parse(fs.readFileSync(this.file(id), "utf8")) as StoredBatch;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+      throw error;
+    }
+  }
+
+  has(id: string): boolean {
+    return isBatchId(id) && fs.existsSync(this.file(id));
+  }
+
+  remove(id: string): void {
+    fs.unlinkSync(this.file(id));
   }
 
   save(batch: StoredBatch): void {

@@ -182,7 +182,7 @@ export function parseFundingParts(raw: string): { fundingParts?: RawTx["fundingP
     return { rawAccount: part.replace(/(?:付款|支付)?[¥￥]\s*[\d,.]+/, "").trim(), ...(explicit ? { amount: parseAmount(explicit[1]) ?? undefined } : {}) };
   });
   return { fundingParts, issues: fundingParts.some((part) => part.amount == null)
-    ? ["组合付款含优惠或未知分摊金额，请核对实际支付与优惠分录"] : ["混合支付，请核对各资金账户分录"] };
+    ? ["组合支付，分摊待确认"] : ["组合支付，核对分录"] };
 }
 
 export interface ParseResult {

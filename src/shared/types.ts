@@ -6,13 +6,8 @@ export type SourceType =
   | "alipay"
   | "wechat"
   | "yunshanfu"
-  | "bank-boc"
-  | "bank-abc"
-  | "bank-czbank"
-  | "bank-spdb"
-  | "bank-icbc"
-  | "bank-ccb"
-  | "bank-generic"
+  | `bank-${string}`
+  | "merged"
   | "unknown";
 
 export type Direction = "in" | "out";
@@ -29,6 +24,11 @@ export interface DraftPosting {
   currency: string;
 }
 
+export interface CategoryAllocation {
+  account: string;
+  amount: string;
+}
+
 export interface LedgerMatch {
   id: string;
   date: string;
@@ -38,6 +38,18 @@ export interface LedgerMatch {
   line?: number;
   reason: string;
   postings: DraftPosting[];
+}
+
+export interface PdfRegion {
+  page: number;
+  /** Left, bottom, right and top in PDF page coordinates. */
+  bounds: [number, number, number, number];
+}
+
+export const PDF_REVIEW_ISSUE = "请核对 PDF 原文";
+
+export function hasPdfSource(tx: Pick<RawTx, "sourceFile" | "sourceFileHash">): boolean {
+  return /\.pdf$/i.test(tx.sourceFile) && /^[a-f0-9]{64}$/.test(tx.sourceFileHash ?? "");
 }
 
 /** One normalized transaction parsed from a statement file. */
@@ -57,6 +69,8 @@ export interface RawTx {
   rawCategory: string;
   /** raw payment-method / card description, e.g. "中国工商银行(1234)" */
   rawAccount: string;
+  /** Rule-derived type and payment label, kept separate from statement fields. */
+  recognition?: { label: string; fundingMethod: string };
   /** statement-provided running balance, gold data for balance assertions */
   balanceAfter?: number;
   /** Explicit proof of complete daily coverage is required for a balance assertion. */
@@ -67,12 +81,14 @@ export interface RawTx {
   sourceFile: string;
   /** Hash of original uploaded bytes; enables safe replay checks for files without transaction IDs. */
   sourceFileHash?: string;
+  /** The source row and any wrapped description on later pages. */
+  pdfRegions?: PdfRegion[];
   /** row number in the original file, for troubleshooting */
   row: number;
   eventType?: EventType;
   sourceStatus?: string;
   originalDirection?: string;
-  /** Retain unsuccessful/closed source rows for a complete reconciliation. */
+  /** Reason to retain this source row for reference and exclude it from posting. */
   excludedReason?: string;
   issues?: string[];
   fundingParts?: Array<{ rawAccount: string; amount?: number }>;
@@ -83,6 +99,18 @@ export type TxStatus =
   | "ready" // user confirmed / auto-accepted
   | "duplicate" // dedup engine flagged it
   | "excluded"; // user manually unchecked
+
+export type MergedSource = Pick<RawTx, "id" | "source" | "sourceTxId" | "sourceFile" | "sourceFileHash" | "row" | "date" | "time" | "amount" | "currency" | "direction">;
+
+export interface TransactionMerge {
+  originals: MergedSource[];
+  totals: { currency: string; amount: number }[];
+}
+
+export const LEDGER_DUPLICATE_ISSUE = "疑似重复入账";
+export const CROSS_SOURCE_ISSUE = "跨来源疑似重复";
+export const ledgerDuplicateReviewIssue = (issue: string) => issue === LEDGER_DUPLICATE_ISSUE || issue.startsWith("可能和账本中的");
+export const duplicateReviewIssue = (issue: string) => ledgerDuplicateReviewIssue(issue) || issue === CROSS_SOURCE_ISSUE || issue.startsWith("不同来源的流水可能是");
 
 export interface ParsedTx extends RawTx {
   status: TxStatus;
@@ -108,12 +136,42 @@ export interface ParsedTx extends RawTx {
   /** multi-leg info: e.g. alipay paid with ICBC card → alipay is a pass-through */
   passThrough?: string;
   fundingConfidence?: number;
+  fundingReason?: string;
   tags?: string[];
   flag?: "*" | "!";
   reviewNote?: string;
+  /** Custom Beancount narration set during review. */
+  narration?: string;
   /** Optional manually reviewed multi-leg transaction, signed amounts. */
   postings?: DraftPosting[];
   matches?: LedgerMatch[];
+  /** Related purchase or refund row in the review view of this batch. */
+  refundCounterpartId?: string;
+  /** Whether a refund follows the reviewed purchase or has its own review decision. */
+  refundReviewMode?: "follow-purchase" | "manual";
+  merge?: TransactionMerge;
+}
+
+export const MAX_NARRATION_LENGTH = 2000;
+
+export function defaultNarration(tx: Pick<RawTx, "note" | "rawCategory">): string {
+  return [...new Set([tx.note, tx.rawCategory].filter(Boolean))].join(" · ");
+}
+
+export function isSuspectedDuplicate(tx: ParsedTx): boolean {
+  return tx.status !== "duplicate" && Boolean(tx.issues?.some(duplicateReviewIssue));
+}
+
+export function canFollowPurchaseRefund(refund: ParsedTx): boolean {
+  if (refund.source !== "wechat" || refund.eventType !== "refund" || refund.excludedReason
+    || refund.status === "excluded" || refund.status === "duplicate"
+    || refund.postings || refund.fundingAccount2 || refund.refundReviewMode === "manual") return false;
+  return refund.refundReviewMode === "follow-purchase"
+    || (refund.status === "pending" && (!refund.finalAccount || refund.finalAccount === refund.suggestedAccount));
+}
+
+export function canExcludeSuspectedDuplicate(tx: ParsedTx): boolean {
+  return (tx.status === "pending" || tx.status === "ready") && isSuspectedDuplicate(tx);
 }
 
 export interface LedgerTx {
@@ -122,6 +180,8 @@ export interface LedgerTx {
   payee: string;
   narration: string;
   postings: Array<{ account: string; amount: number; currency: string }>;
+  /** Exact single-currency funding amount before Beancount rounding, for matching. */
+  unroundedFunding?: DraftPosting;
   file?: string;
   line?: number;
   time?: string;
@@ -156,6 +216,8 @@ export interface LedgerInfo {
   payeeIndex: Record<string, { account: string; count: number }[]>;
   errors?: LedgerError[];
   loader?: string;
+  /** Explicit native ledger inputs for reusing a verified account list. */
+  accountSources?: { file: string; sha256: string }[];
 }
 
 export interface ImportPreview {
@@ -201,6 +263,9 @@ export interface AppConfig {
     /** debit card → Assets, credit card → Liabilities */
     kind: "debit" | "credit";
     cardSuffix?: string;
+    /** Whole payment label, optionally scoped to a statement source. */
+    exact?: boolean;
+    source?: SourceType;
   }>;
   accounts: string[];
   llm: LlmConfig;
@@ -209,11 +274,27 @@ export interface AppConfig {
 export interface GenerateResult {
   entries: string;
   monthFiles: Record<string, string>;
+  /** Rendered destination files. Older previews only stored monthFiles. */
+  files?: Record<string, { year: string; body: string }>;
   /** tx ids that were generated */
   generated: string[];
   errors?: string[];
   /** suggested `open` directives for accounts referenced but not yet defined */
   opens: string[];
+}
+
+export interface FundingMappingGroup {
+  id: string;
+  label: string;
+  source: SourceType;
+  count: number;
+  accounts: string[];
+  statementOnly?: boolean;
+}
+
+export interface FundingMappingChoice {
+  id: string;
+  account: string;
 }
 
 export interface TxDecision {
@@ -224,5 +305,7 @@ export interface TxDecision {
   tags?: string[];
   flag?: "*" | "!";
   reviewNote?: string;
+  narration?: string | null;
   postings?: DraftPosting[] | null;
+  categoryAllocations?: CategoryAllocation[];
 }
