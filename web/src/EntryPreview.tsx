@@ -1,19 +1,25 @@
-import { formatTransactionEntry, formatTransactionHeader, transactionPostings, validateTransaction } from "../../src/shared/postings.js";
+import { useState } from "react";
+import { formatPosting, formatTransactionEntry, formatTransactionHeader, transactionPostings, validateTransaction } from "../../src/shared/postings.js";
 import type { ParsedTx } from "../../src/shared/types.js";
 import BeancountCode from "./BeancountCode";
 
 function PreviewEntry({ tx, batchId }: { tx: ParsedTx; batchId: string }) {
+  const [showFull, setShowFull] = useState(false);
   if (tx.excludedReason || tx.status === "excluded") return <p className="muted">{tx.excludedReason || "这笔交易已排除"}</p>;
   if (tx.status === "duplicate") return <p className="muted">这笔交易已标为重复</p>;
 
   const reviewed = tx.status === "pending" && !tx.finalAccount && tx.suggestedAccount ? { ...tx, finalAccount: tx.suggestedAccount } : tx;
   const postings = transactionPostings(reviewed);
   const errors = validateTransaction(reviewed, postings);
-  const entry = errors.length ? formatTransactionHeader(reviewed) : formatTransactionEntry(reviewed, postings, batchId);
+  const summary = [formatTransactionHeader(reviewed), ...(errors.length ? [] : postings.map(formatPosting))].join("\n");
   return <>
-    <BeancountCode className="entry-code" text={entry} />
+    <BeancountCode className="entry-code entry-summary" text={summary} />
     {errors.length > 0 && <p className="muted">{postings.some(({ account }) => !account)
       ? "补齐分录账户后可预览完整分录" : errors.join(" · ")}</p>}
+    {!errors.length && <details className="entry-full" onToggle={(event) => setShowFull(event.currentTarget.open)}>
+      <summary>完整分录</summary>
+      {showFull && <BeancountCode className="entry-code" text={formatTransactionEntry(reviewed, postings, batchId)} />}
+    </details>}
   </>;
 }
 

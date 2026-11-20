@@ -43,6 +43,10 @@ export function formatTransactionHeader(tx: ParsedTx): string {
   return `${tx.date} ${tx.flag ?? "*"} ${quote(tx.payee || "未知交易方")} ${quote(narration)}${tags}`;
 }
 
+export function formatPosting(posting: DraftPosting): string {
+  return `  ${posting.account}  ${amountText(posting.amount)} ${posting.currency}`;
+}
+
 export function formatTransactionEntry(tx: ParsedTx, postings: readonly DraftPosting[], batchId?: string): string {
   const lines = [formatTransactionHeader(tx)];
   const metadata: Record<string, string> = {
@@ -56,6 +60,6 @@ export function formatTransactionEntry(tx: ParsedTx, postings: readonly DraftPos
   };
   for (const [key, value] of Object.entries(metadata)) lines.push(`  ${key}: ${quote(value)}`);
   lines.push(`  source-row: ${tx.row}`);
-  for (const posting of postings) lines.push(`  ${posting.account}  ${amountText(posting.amount)} ${posting.currency}`);
+  for (const posting of postings) lines.push(formatPosting(posting));
   return lines.join("\n");
 }

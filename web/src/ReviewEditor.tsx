@@ -1,4 +1,5 @@
 import type { DraftPosting, ParsedAccount, ParsedTx, TxDecision } from "../../src/shared/types.js";
+import { amountText } from "../../src/shared/postings.js";
 import AccountSelect from "./AccountSelect";
 import TransactionFlag from "./TransactionFlag";
 
@@ -44,9 +45,9 @@ export function draftDecision(tx: ParsedTx, draft: ReviewDraft): TxDecision {
   return decision;
 }
 
-export default function ReviewEditor({ tx, refundCounterpartSourceId, draft, dirty, accounts, disabled, editFlag, onChange, onSave, onDiscard }: {
+export default function ReviewEditor({ tx, draft, dirty, accounts, disabled, editFlag, onChange, onSave, onDiscard }: {
   tx: ParsedTx; draft: ReviewDraft; dirty: boolean; accounts: ParsedAccount[]; disabled: boolean;
-  refundCounterpartSourceId?: string; editFlag?: boolean;
+  editFlag?: boolean;
   onChange: (draft: ReviewDraft) => void; onSave: () => void; onDiscard: () => void;
 }) {
   const totals = new Map<string, number>();
@@ -85,17 +86,24 @@ export default function ReviewEditor({ tx, refundCounterpartSourceId, draft, dir
       </div>}
       <div className="toolbar editor-actions"><button className="btn primary small" disabled={!dirty || Boolean(splitError) || badTags.length > 0} onClick={onSave}>保存编辑</button><button className="btn small" disabled={!dirty} onClick={onDiscard}>放弃编辑</button>{dirty && <span className="muted">未保存</span>}</div>
     </fieldset>
-    {!tx.merge && <dl className="tx-meta source-details">
-      <div><dt>原始来源</dt><dd>{tx.sourceFile} · 第 {tx.row} 行 · {tx.source}</dd></div>
-      {tx.note && <div><dt>账单备注</dt><dd>{tx.note}</dd></div>}
-      {tx.rawAccount && <div><dt>支付方式</dt><dd>{tx.rawAccount}</dd></div>}
-      {tx.recognition && <div><dt>推断资金方式</dt><dd>{tx.recognition.fundingMethod}</dd></div>}
-      {tx.originalDirection && <div><dt>原始收支</dt><dd>{tx.originalDirection}</dd></div>}
-      {tx.sourceTxId && <div><dt>交易号</dt><dd><code>{tx.sourceTxId}</code></dd></div>}
-      {refundCounterpartSourceId && <div><dt>{tx.eventType === "refund" ? "原消费单号" : "退款单号"}</dt><dd><code>{refundCounterpartSourceId}</code></dd></div>}
-      {tx.duplicateOf && <div><dt>重复依据</dt><dd>{tx.duplicateOf.label}<br />{tx.duplicateOf.where} · <code>{tx.duplicateOf.id}</code></dd></div>}
-      {tx.refundReviewMode === "follow-purchase" ? <div><dt>分类依据</dt><dd>沿用原消费分类</dd></div>
-        : (tx.suggestedAccount || tx.reason) && <div><dt>分类依据</dt><dd>置信度 {Math.round(tx.confidence * 100)}%{tx.reason && <><br />{tx.reason}</>}</dd></div>}
-    </dl>}
   </div>;
+}
+
+export function TransactionSourceDetails({ tx, counterpart }: { tx: ParsedTx; counterpart?: ParsedTx }) {
+  return <dl className="tx-meta source-details">
+    <div><dt>原始来源</dt><dd>{tx.sourceFile} · 第 {tx.row} 行 · {tx.source}</dd></div>
+    {tx.sourceStatus && <div><dt>账单状态</dt><dd>{tx.sourceStatus}</dd></div>}
+    {tx.note && <div><dt>账单备注</dt><dd>{tx.note}</dd></div>}
+    {tx.rawAccount && <div><dt>支付方式</dt><dd>{tx.rawAccount}</dd></div>}
+    {tx.recognition?.fundingMethod && <div><dt>推断资金方式</dt><dd>{tx.recognition.fundingMethod}</dd></div>}
+    {tx.originalDirection && <div><dt>原始收支</dt><dd>{tx.originalDirection}</dd></div>}
+    {tx.sourceTxId && <div><dt>交易号</dt><dd><code>{tx.sourceTxId}</code></dd></div>}
+    {counterpart && <div><dt>{tx.eventType === "refund" ? "原消费" : "对应退款"}</dt>
+      <dd>{amountText(counterpart.amount)} {counterpart.currency} · {counterpart.date}{counterpart.time && ` ${counterpart.time}`}
+        {counterpart.sourceTxId && <><br /><code>{counterpart.sourceTxId}</code></>}
+      </dd></div>}
+    {tx.duplicateOf && <div><dt>重复依据</dt><dd>{tx.duplicateOf.label}<br />{tx.duplicateOf.where} · <code>{tx.duplicateOf.id}</code></dd></div>}
+    {tx.refundReviewMode === "follow-purchase" ? <div><dt>分类依据</dt><dd>沿用原消费分类</dd></div>
+      : (tx.suggestedAccount || tx.reason) && <div><dt>分类依据</dt><dd>置信度 {Math.round(tx.confidence * 100)}%{tx.reason && <><br />{tx.reason}</>}</dd></div>}
+  </dl>;
 }
