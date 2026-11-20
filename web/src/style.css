@@ -260,6 +260,8 @@ select {
 .merge-fields label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
 .merge-fields label:last-child { grid-column: 1 / -1; }
 .merge-fields input { width: 100%; color: var(--text); }
+.merge-payee-field { display: grid; align-content: start; gap: 4px; min-width: 0; }
+.merge-payee-label { display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 0 8px; }
 .merge-actions { justify-content: flex-end; }
 
 .tabs { display: flex; flex-wrap: wrap; gap: 3px; max-width: 100%; }
@@ -444,7 +446,7 @@ table.tx td.tx-select-cell { padding-inline: 5px; }
 .account-select.funding-unverified :is(input, .account-selected-value), .account-select.funding-unverified input::placeholder { color: var(--warning); }
 .account-select::after { content: ""; pointer-events: none; position: absolute; top: 14px; right: 11px; width: 6px; height: 6px; border: solid var(--muted); border-width: 0 1.5px 1.5px 0; transform: rotate(45deg); }
 .account-value-hint { margin-top: 3px; color: var(--warning); }
-.account-options {
+.account-options, .merge-payee-options {
   position: fixed;
   z-index: 5;
   overflow: auto;
@@ -457,10 +459,13 @@ table.tx td.tx-select-cell { padding-inline: 5px; }
   background: var(--surface);
   box-shadow: var(--shadow-overlay);
 }
-.account-option { display: flex; align-items: baseline; flex-wrap: wrap; gap: 3px 8px; padding: 8px; border-radius: 5px; cursor: pointer; overflow-wrap: anywhere; }
+.account-option, .merge-payee-option { padding: 8px; border-radius: 5px; cursor: pointer; overflow-wrap: anywhere; }
+.account-option { display: flex; align-items: baseline; flex-wrap: wrap; gap: 3px 8px; }
 .account-option span { min-width: 0; font-family: var(--font-mono); font-size: 13px; }
+.merge-payee-option { display: grid; grid-template-columns: minmax(0, 1fr) 1em; gap: 8px; font-size: 13px; }
 .account-option[aria-selected="true"] { color: var(--accent-hover); font-weight: 600; }
-.account-option:hover, .account-option.active { background: var(--accent-soft); }
+.merge-payee-option[aria-selected="true"] { color: var(--accent-hover); }
+.account-option:hover, .account-option.active, .merge-payee-option:hover, .merge-payee-option[aria-selected="true"] { background: var(--accent-soft); }
 .account-empty { padding: 8px; font-size: 13px; color: var(--muted); }
 
 .tag-list { display: flex; align-items: center; gap: 4px; min-width: 0; }

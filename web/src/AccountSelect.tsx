@@ -1,5 +1,6 @@
 import { useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import type { ParsedAccount } from "../../src/shared/types.js";
+import useAnchoredOptions from "./useAnchoredOptions";
 
 type AccountOption = Pick<ParsedAccount, "account" | "closedAt">;
 
@@ -35,42 +36,7 @@ export default function AccountSelect({ value, accounts, onChange, disabled, fun
   const activeOption = matches[activeIndex];
   const activeId = activeOption ? `${listId}-${activeIndex}` : undefined;
 
-  useLayoutEffect(() => {
-    if (!open) return;
-    const field = input.current!;
-    const menu = list.current!;
-    const viewport = window.visualViewport;
-    const place = (event?: Event) => {
-      if (event?.target === menu) return;
-      const bounds = field.getBoundingClientRect();
-      const screenTop = viewport?.offsetTop ?? 0;
-      const screenBottom = screenTop + (viewport?.height ?? window.innerHeight);
-      const above = bounds.top - screenTop - 10;
-      const boundaryTop = optionsBottomBoundary?.current?.getBoundingClientRect().top ?? screenBottom;
-      const below = Math.min(screenBottom, boundaryTop) - bounds.bottom - 10;
-      const flip = below < 220 && above > below;
-      const width = Math.min(Math.max(bounds.width, 280), document.documentElement.clientWidth - 16);
-      menu.style.width = `${width}px`;
-      menu.style.left = `${Math.max(8, Math.min(bounds.left, document.documentElement.clientWidth - width - 8))}px`;
-      menu.style.maxHeight = `${Math.max(0, Math.min(264, flip ? above : below))}px`;
-      menu.style.top = flip ? "auto" : `${bounds.bottom + 4}px`;
-      menu.style.bottom = flip ? `${window.innerHeight - bounds.top + 4}px` : "auto";
-    };
-    place();
-    window.addEventListener("resize", place);
-    window.addEventListener("scroll", place, true);
-    viewport?.addEventListener("resize", place);
-    viewport?.addEventListener("scroll", place);
-    const observer = new IntersectionObserver(([entry]) => { menu.style.visibility = entry.isIntersecting ? "" : "hidden"; });
-    observer.observe(field);
-    return () => {
-      window.removeEventListener("resize", place);
-      window.removeEventListener("scroll", place, true);
-      viewport?.removeEventListener("resize", place);
-      viewport?.removeEventListener("scroll", place);
-      observer.disconnect();
-    };
-  }, [open, optionsBottomBoundary]);
+  useAnchoredOptions(open, input, list, optionsBottomBoundary);
 
   useLayoutEffect(() => {
     if (activeId) document.getElementById(activeId)?.scrollIntoView({ block: "nearest" });
