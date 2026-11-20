@@ -7,6 +7,7 @@ import { IncomingMessage, ServerResponse } from "node:http";
 import { PassThrough } from "node:stream";
 import type express from "express";
 import { PDFDict, PDFDocument, PDFName, StandardFonts } from "pdf-lib";
+import * as XLSX from "xlsx";
 import { createApp } from "../src/server/index.js";
 import { discoverLedgerRoot, loadConfig } from "../src/server/config.js";
 import { readTextSmart } from "../src/server/parsers/common.js";
@@ -95,9 +96,13 @@ function csv(id = "api-source-1", suffix = "1111", date = "2026-01-02") {
     `${date} 11:00:00,日用百货,测试商店,取消,支出,5,中国银行储蓄卡(${suffix}),交易关闭,${id}-closed`,
   ].join("\n");
 }
+function postStatements(base: string, files: ReadonlyArray<readonly [filename: string, data: string | Uint8Array]>) {
+  const body = new FormData();
+  for (const [file, data] of files) body.append("files", new Blob([typeof data === "string" ? data : new Uint8Array(data)]), file);
+  return transport(base, "/api/upload", { method: "POST", body });
+}
 async function upload(base: string, data: string | Uint8Array, file = "alipay.csv") {
-  const body = new FormData(); body.append("files", new Blob([typeof data === "string" ? data : new Uint8Array(data)]), file);
-  const response = await transport(base, "/api/upload", { method: "POST", body });
+  const response = await postStatements(base, [[file, data]]);
   const result = await response.json(); assert.equal(response.status, 200, JSON.stringify(result));
   return await request(base, `/api/batch/${result.batchId}`) as ImportPreview & { batchId: string; revision: number };
 }
@@ -134,6 +139,60 @@ try {
   assert.equal(batch.txs.length, 2); assert.equal(batch.parseStats?.excluded, 1); assert.ok(batch.txs.every((tx) => tx.sourceFileHash?.length === 64));
   assert.equal(batch.txs[0].fundingAccount, "Assets:CN:BOC:1111"); passed("multipart upload retains source rows, exclusion reasons and funding identity");
   assert.match(batch.txs[0].fundingReason!, /关键词.*卡尾号 1111/);
+  {
+    const failureData = path.join(temporary, "failed-imports");
+    const importBase = await boot(config, failureData);
+    const store = new BatchStore(path.join(failureData, "batches"));
+    const uploadDirectory = path.join(failureData, "uploads");
+    const header = csv().split("\n")[0];
+    const unreadable = "2026-01-03 10:00:00,日用百货,测试商店,商品,支出,错误金额,中国银行储蓄卡(1111),交易成功,unreadable-row";
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, XLSX.utils.aoa_to_sheet([["交易时间", "交易对方", "金额(元)"]]), "账单");
+    const failedFiles = [
+      ["支付宝-空账单.csv", header],
+      ["支付宝-金额错误.csv", `${header}\n${unreadable}`],
+      ["微信支付-空账单.xlsx", new Uint8Array(XLSX.write(workbook, { type: "buffer", bookType: "xlsx" }))],
+      ["微信支付-空账单.xls", new Uint8Array(XLSX.write(workbook, { type: "buffer", bookType: "xls" }))],
+      ["未解压.zip", "unsupported input"],
+    ] as const;
+    const rejected = await postStatements(importBase, failedFiles);
+    const failure = await rejected.json();
+    assert.equal(rejected.status, 422);
+    assert.equal(failure.error, "未导入任何账单。");
+    assert.equal(failure.batchId, undefined);
+    assert.equal(failure.details.length, failedFiles.length);
+    for (const [file] of failedFiles) assert.ok(failure.details.some((message: string) => message.startsWith(`${file}：`)));
+    assert.deepEqual(await request(importBase, "/api/batches"), []);
+    assert.deepEqual(store.list(), []);
+    assert.deepEqual(fs.readdirSync(uploadDirectory), []);
+
+    const good = "支付宝-部分交易.csv";
+    const mixed = await postStatements(importBase, [
+      failedFiles[1], [good, `${csv("partial-import")}\n${unreadable}`], failedFiles[2],
+    ]);
+    const result = await mixed.json();
+    assert.equal(mixed.status, 200);
+    const imported = store.get(result.batchId)!;
+    assert.equal(imported.file, good);
+    assert.equal(result.preview.file, good);
+    assert.equal(imported.source, "alipay");
+    assert.equal(imported.txs.length, 3);
+    assert.ok(imported.txs.every((tx) => tx.sourceFile === good));
+    assert.equal(imported.errors.filter(({ row }) => row === 0).length, 2);
+    assert.equal(imported.errors.filter(({ row }) => row > 0).length, 1);
+    assert.equal(fs.readdirSync(uploadDirectory).length, 1);
+
+    const malformed = { ...imported.txs[2], sourceFile: failedFiles[1][0] };
+    const hidden = store.create({ ...imported, file: malformed.sourceFile, txCount: 1, txs: [malformed] });
+    const legacyMixed = store.create({ ...imported, file: `${malformed.sourceFile}, ${good}`, txCount: 2, txs: [malformed, imported.txs[0]] });
+    const listed = await request(importBase, "/api/batches");
+    assert.equal(listed.length, 2);
+    assert.ok(listed.every(({ file }: { file: string }) => file === good));
+    assert.ok(listed.some(({ batchId }: { batchId: string }) => batchId === legacyMixed.batchId));
+    assert.ok(store.get(hidden.batchId));
+    assert.equal((await request(importBase, `/api/batch/${legacyMixed.batchId}`)).file, good);
+    passed("empty and unreadable tabular files create no batches; mixed uploads keep only imported files and their row diagnostics");
+  }
   {
     const pdfRoot = path.join(temporary, "pdf-statements");
     const credit = "Liabilities:CreditCard:CMB";
@@ -253,9 +312,14 @@ try {
     await request(otherLedger, previewOf(creditSample.batchId, continued.id), undefined, 409);
     passed("source screenshots crop the selected transaction across pages, recover older batches and honor ledger boundaries");
 
-    const broken = await upload(pdfBase, Buffer.from("%PDF-1.7\ntruncated PDF"), "损坏.pdf");
-    assert.equal(broken.txs.length, 0);
-    assert.deepEqual(broken.errors, [{ row: 0, message: "损坏.pdf：这份 PDF 无法打开。请重新下载原账单后上传。" }]);
+    const beforeBroken = await request(pdfBase, "/api/batches");
+    const pdfUploadsDirectory = path.join(temporary, "pdf-data", "uploads");
+    const beforeUploads = fs.readdirSync(pdfUploadsDirectory);
+    const broken = await postStatements(pdfBase, [["损坏.pdf", Buffer.from("%PDF-1.7\ntruncated PDF")]]);
+    assert.equal(broken.status, 422);
+    assert.deepEqual(await broken.json(), { error: "未导入任何账单。", details: ["损坏.pdf：这份 PDF 无法打开。请重新下载原账单后上传。"] });
+    assert.deepEqual(await request(pdfBase, "/api/batches"), beforeBroken);
+    assert.deepEqual(fs.readdirSync(pdfUploadsDirectory), beforeUploads);
     const old = pdfStore.create({ file: "old.pdf", source: "bank-generic", txs: [], txCount: 0, accountsDetected: [],
       ledgerProfile: profileId(pdfRoot, "main.bean"), errors: [
         { row: 0, message: "old.pdf：PDF 解析失败：Promise.withResolvers is not a function" },
@@ -265,6 +329,7 @@ try {
     assert.match(resumed.errors[0].message, /^old\.pdf：暂时无法读取 PDF/);
     assert.doesNotMatch(resumed.errors[0].message, /Promise\.withResolvers|is not a function/);
     assert.deepEqual(resumed.errors[1], old.errors[1]);
+    assert.deepEqual(await request(pdfBase, "/api/batches"), beforeBroken);
 
     const originalLog = console.error;
     const log: unknown[][] = [];

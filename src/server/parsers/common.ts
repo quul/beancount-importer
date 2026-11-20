@@ -8,6 +8,13 @@ import iconv from "iconv-lite";
 import * as XLSX from "xlsx";
 import crypto from "node:crypto";
 import type { RawTx, SourceType } from "../../shared/types.js";
+import { validDate } from "../../shared/postings.js";
+
+export const UNREADABLE_TRANSACTION = "日期或金额无法解析";
+
+export function isParsedStatementRow({ date, amount, excludedReason }: RawTx): boolean {
+  return validDate(date) && Number.isFinite(amount) && excludedReason !== UNREADABLE_TRANSACTION;
+}
 
 export function txId(
   date: string,

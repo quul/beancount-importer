@@ -1079,7 +1079,7 @@ export default function App() {
         </div>
         {batch.committedAt && <p className="muted review-diagnostic">提交于 {batchTime(Date.parse(batch.committedAt))}</p>}
         {(fileErrors.length > 0 || emptyImportFailed) && <div className="review-import-alert review-diagnostic" role="alert">
-          <strong>{emptyImportFailed ? "未读取到账单交易" : "部分账单需要重新上传"}</strong>
+          <strong>{emptyImportFailed ? "未读取到账单交易" : "部分账单未导入"}</strong>
           {fileErrors.length > 0 && <ul>{fileErrors.map(({ message }, index) => <li key={index}>{message}</li>)}</ul>}
           {emptyImportFailed && <button className="btn small" disabled={busy} onClick={() => fileInput.current?.click()}>重新上传</button>}
         </div>}

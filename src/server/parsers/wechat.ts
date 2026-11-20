@@ -1,6 +1,6 @@
 /** WeChat Pay CSV/XLSX exports, with source states preserved for reconciliation. */
 import type { EventType, RawTx } from "../../shared/types.js";
-import { col, findHeader, parseAmount, parseDate, readSheet, txId, parseFundingParts, type ParseResult } from "./common.js";
+import { col, findHeader, parseAmount, parseDate, readSheet, txId, parseFundingParts, UNREADABLE_TRANSACTION, type ParseResult } from "./common.js";
 import { loadWechatRules, recognizeWechatTransaction, wechatExclusionReason } from "./wechat-rules.js";
 
 export function isWechat(name: string): boolean { return /微信|wechat|weixin/i.test(name); }
@@ -26,7 +26,7 @@ export function parseWechat(file: string, rules = loadWechatRules()): ParseResul
     if (/关闭|失败|取消/.test(sourceStatus)) excludedReason = `交易未完成：${sourceStatus}`;
     else if (/待收|等待|处理中/.test(sourceStatus)) excludedReason = `交易未完成：${sourceStatus}`;
     else if (sourceStatus && !/成功|已收钱|已转账|已存入|已退款|提现已到账|已到账|已全额退款|对方已退还|资金已到账|充值完成/.test(sourceStatus)) issues.push(`未识别交易状态：${sourceStatus}`);
-    if (!parsed || amount == null) { excludedReason = "日期或金额无法解析"; errors.push({ row: r + 1, message: excludedReason }); }
+    if (!parsed || amount == null) { excludedReason = UNREADABLE_TRANSACTION; errors.push({ row: r + 1, message: excludedReason }); }
     else if (amount === 0) excludedReason ??= "零金额";
     const refund = /退款|退还/.test(rawCategory), transfer = /零钱提现|零钱充值|零钱通转出|转入零钱通|信用卡还款/.test(rawCategory) || /^转账$/.test(rawCategory);
     // 亲属卡: paid with someone else's linked card; the funding leg belongs to them.

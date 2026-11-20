@@ -1,7 +1,7 @@
 /** Alipay export: retain every source transaction, including excluded rows. */
 import fs from "node:fs";
 import type { EventType, RawTx } from "../../shared/types.js";
-import { col, findHeader, parseAmount, parseDate, readTextSmart, parseCsv, txId, parseFundingParts, type ParseResult } from "./common.js";
+import { col, findHeader, parseAmount, parseDate, readTextSmart, parseCsv, txId, parseFundingParts, UNREADABLE_TRANSACTION, type ParseResult } from "./common.js";
 
 export function isAlipay(file: string, name: string): boolean {
   if (/支付宝|alipay|ali-pay|zhifubao/i.test(name)) return true;
@@ -36,7 +36,7 @@ export function parseAlipay(file: string): ParseResult {
     if (/关闭|失败|取消/.test(sourceStatus)) excludedReason = `交易未完成：${sourceStatus}`;
     else if (/等待|处理中|待支付|待付款/.test(sourceStatus)) excludedReason = `交易未完成：${sourceStatus}`;
     else if (sourceStatus && !/成功|已收|已转|已完成/.test(sourceStatus)) issues.push(`未识别交易状态：${sourceStatus}`);
-    if (!parsed || amount == null) { excludedReason = "日期或金额无法解析"; errors.push({ row: r + 1, message: excludedReason }); }
+    if (!parsed || amount == null) { excludedReason = UNREADABLE_TRANSACTION; errors.push({ row: r + 1, message: excludedReason }); }
     else if (amount === 0) excludedReason ??= "零金额";
     const refund = /^退款$/.test(category) || originalDirection.includes("收入") && /退款/.test(note);
     const transfer = /信用借还|账户存取/.test(category) || /还款|提现|转入余额|余额转出/.test(`${category} ${note}`);

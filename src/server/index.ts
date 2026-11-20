@@ -26,7 +26,7 @@ import { parseYunshanfu, isYunshanfu } from "./parsers/yunshanfu.js";
 import { detectBank, parseBank } from "./parsers/banks.js";
 import { parsePdfBank, PDF_RETRY_HINT } from "./parsers/pdf.js";
 import { pairTransfers, transferPairIssue } from "./lib/transfers.js";
-import { readSheet } from "./parsers/common.js";
+import { isParsedStatementRow, readSheet } from "./parsers/common.js";
 import { BatchStore, isBatchId, profileId, type StoredBatch } from "./lib/batches.js";
 import { acquireWriteLock, assertBatchDeletable, commitBatch, ImportError } from "./lib/commit.js";
 import { importDirectoryError } from "./lib/import-paths.js";
@@ -56,6 +56,13 @@ function publicParseErrors(errors: ImportPreview["errors"]): ImportPreview["erro
     const [, file, pdf] = legacy;
     return { ...issue, message: (file ? `${file}：` : "") + (pdf ? PDF_RETRY_HINT : STATEMENT_RETRY_HINT) };
   });
+}
+
+function batchFileLabel(batch: StoredBatch): string {
+  if (!batch.errors.length) return batch.file;
+  // Older batches included failed filenames in the label.
+  const files = new Set(batch.txs.filter((tx) => !tx.merge && isParsedStatementRow(tx)).map((tx) => tx.sourceFile).filter(Boolean));
+  return files.size ? [...files].join(", ") : batch.file;
 }
 
 function stats(batch: ImportPreview) {
@@ -223,7 +230,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       const refundCounterpartId = counterparts.get(tx.id);
       return refundCounterpartId ? { ...tx, refundCounterpartId } : tx;
     }) : batch.txs;
-    return { ...batch, txs, errors: publicParseErrors(batch.errors), preview: undefined, pdfUploads: undefined, ledgerProfile: undefined, parseStats: stats(batch) };
+    return { ...batch, file: batchFileLabel(batch), txs, errors: publicParseErrors(batch.errors), preview: undefined, pdfUploads: undefined, ledgerProfile: undefined, parseStats: stats(batch) };
   };
   const publicReviewBatch = (batch: StoredBatch) => {
     const existence = new Map<string, boolean>();
@@ -258,74 +265,102 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   app.get("/api/batches", (_req, res) => {
     if (!config.ledgerRoot) { res.json([]); return; }
     const currentProfile = profile();
-    res.json(batches.list().filter((batch) => batch.ledgerProfile === currentProfile).map((batch) => ({
-      batchId: batch.batchId, file: batch.file, createdAt: batch.createdAt, revision: batch.revision, committed: batch.committed,
+    res.json(batches.list().filter((batch) => batch.ledgerProfile === currentProfile && batch.txs.some(isParsedStatementRow)).map((batch) => ({
+      batchId: batch.batchId, file: batchFileLabel(batch), createdAt: batch.createdAt, revision: batch.revision, committed: batch.committed,
       txCount: batch.txCount ?? batch.txs.filter((tx) => !tx.merge).length,
     })));
   });
   app.post("/api/upload", upload.array("files"), asyncRoute(async (req, res) => {
     const files = (req.files as Express.Multer.File[]) ?? [];
     if (!files.length) throw new ImportError(400, "请选择账单文件");
-    const uploadConfig = structuredClone(config), uploadRoot = ledgerRoot();
-    const uploadProfile = profileId(uploadRoot, uploadConfig.mainFile);
-    const currentLedger = parseLedger(uploadRoot, uploadConfig.mainFile, uploadConfig.pythonPath);
-    const memory = loadMemory(path.join(dataDir, "profiles", uploadProfile, "memory.json"));
-    const txs: ParsedTx[] = [], errors: ImportPreview["errors"] = [];
-    const pdfUploads: Record<string, string> = {};
-    const instances = new Map<string, number>(), sources = new Set<ImportPreview["source"]>();
-    let wechatRules: ReturnType<typeof loadWechatRules> | undefined;
-    for (const file of files) {
-      const name = filename(file.originalname);
-      try {
-        const bytes = fs.readFileSync(file.path);
-        const sourceFileHash = crypto.createHash("sha256").update(bytes).digest("hex");
-        let result;
-        if (name.toLowerCase().endsWith(".pdf")) {
-          result = await parsePdfBank(file.path, detectBank(name, [])?.source ?? "bank-generic", undefined, bytes);
-          if (result.txs.length) pdfUploads[sourceFileHash] = file.filename;
+    const importedFiles = new Map<string, string>();
+    let batchSaved = false;
+    try {
+      const uploadConfig = structuredClone(config), uploadRoot = ledgerRoot();
+      const uploadProfile = profileId(uploadRoot, uploadConfig.mainFile);
+      const currentLedger = parseLedger(uploadRoot, uploadConfig.mainFile, uploadConfig.pythonPath);
+      const memory = loadMemory(path.join(dataDir, "profiles", uploadProfile, "memory.json"));
+      const txs: ParsedTx[] = [], errors: ImportPreview["errors"] = [];
+      const pdfUploads: Record<string, string> = {};
+      const instances = new Map<string, number>(), sources = new Set<ImportPreview["source"]>();
+      let wechatRules: ReturnType<typeof loadWechatRules> | undefined;
+      for (const file of files) {
+        const name = filename(file.originalname);
+        try {
+          const bytes = fs.readFileSync(file.path);
+          const sourceFileHash = crypto.createHash("sha256").update(bytes).digest("hex");
+          const pdf = name.toLowerCase().endsWith(".pdf");
+          let result;
+          if (pdf) result = await parsePdfBank(file.path, detectBank(name, [])?.source ?? "bank-generic", undefined, bytes);
+          else if (isAlipay(file.path, name)) result = parseAlipay(file.path);
+          else if (isWechat(name)) result = parseWechat(file.path, wechatRules ??= loadWechatRules());
+          else if (isYunshanfu(name)) result = parseYunshanfu(file.path);
+          else { const { rows } = readSheet(file.path); const bank = detectBank(name, rows); if (bank) result = parseBank(file.path, bank); }
+          if (!result) {
+            errors.push({ row: 0, message: `${name}：无法识别文件类型，请使用已解压的 CSV/XLSX/PDF` });
+            continue;
+          }
+          const failure = result.errors.find(({ row }) => row === 0);
+          if (failure || !result.txs.some(isParsedStatementRow)) {
+            const reason = failure?.message ?? (result.errors.length
+              ? "未读取到有效交易。请核对账单内容后重新上传。" : "未找到交易明细。请选择包含交易记录的原始账单。");
+            errors.push({ row: 0, message: `${name}：${reason}` });
+            continue;
+          }
+          const imported = result.txs.map((raw): ParsedTx => {
+            const tx: ParsedTx = { ...raw, sourceFile: name, sourceFileHash,
+              status: raw.excludedReason ? "excluded" : "pending", fundingAccount: "", suggestedAccount: "", confidence: 0, finalAccount: "", tags: [], flag: "*" };
+            const funding = inferFundingAccount(tx, uploadConfig, currentLedger);
+            tx.fundingAccount = funding.account; tx.fundingConfidence = funding.confidence; tx.fundingReason = funding.reason;
+            // Unmapped rows are matched against the current rules during funding preflight.
+            if (!funding.account) delete tx.recognition;
+            tx.issues = [...new Set([...(raw.issues ?? []), ...(funding.issues ?? [])])];
+            const local = classifyLocal(tx, memory, currentLedger);
+            if (local) { tx.suggestedAccount = local.account; tx.confidence = local.confidence; tx.reason = local.reason; }
+            return tx;
+          });
+          for (const tx of imported) {
+            const occurrence = (instances.get(tx.id) ?? 0) + 1;
+            instances.set(tx.id, occurrence);
+            if (occurrence > 1) tx.id = `${tx.id}:${occurrence}`;
+            txs.push(tx);
+          }
+          for (const error of result.errors) errors.push({ ...error, message: `${name}：${error.message}` });
+          if (pdf) pdfUploads[sourceFileHash] = file.filename;
+          importedFiles.set(file.path, name);
+          sources.add(result.source);
+        } catch (error) {
+          console.error(`Could not import statement ${name}`, error);
+          errors.push({ row: 0, message: `${name}：${STATEMENT_RETRY_HINT}` });
         }
-        else if (isAlipay(file.path, name)) result = parseAlipay(file.path);
-        else if (isWechat(name)) result = parseWechat(file.path, wechatRules ??= loadWechatRules());
-        else if (isYunshanfu(name)) result = parseYunshanfu(file.path);
-        else { const { rows } = readSheet(file.path); const bank = detectBank(name, rows); if (bank) result = parseBank(file.path, bank); }
-        if (!result) { errors.push({ row: 0, message: `${name}：无法识别文件类型，请使用已解压的 CSV/XLSX/PDF` }); continue; }
-        sources.add(result.source);
-        for (const raw of result.txs) {
-          const occurrence = (instances.get(raw.id) ?? 0) + 1; instances.set(raw.id, occurrence);
-          const tx: ParsedTx = { ...raw, id: occurrence === 1 ? raw.id : `${raw.id}:${occurrence}`, sourceFile: name, sourceFileHash,
-            status: raw.excludedReason ? "excluded" : "pending", fundingAccount: "", suggestedAccount: "", confidence: 0, finalAccount: "", tags: [], flag: "*" };
-          const funding = inferFundingAccount(tx, uploadConfig, currentLedger);
-          tx.fundingAccount = funding.account; tx.fundingConfidence = funding.confidence; tx.fundingReason = funding.reason;
-          // Unmapped rows are matched against the current rules during funding preflight.
-          if (!funding.account) delete tx.recognition;
-          tx.issues = [...new Set([...(raw.issues ?? []), ...(funding.issues ?? [])])];
-          const local = classifyLocal(tx, memory, currentLedger);
-          if (local) { tx.suggestedAccount = local.account; tx.confidence = local.confidence; tx.reason = local.reason; }
-          txs.push(tx);
-        }
-        errors.push(...result.errors.map((error) => ({ ...error, message: `${name}：${error.message}` })));
-      } catch (error) {
-        console.error(`Could not import statement ${name}`, error);
-        errors.push({ row: 0, message: `${name}：${STATEMENT_RETRY_HINT}` });
+      }
+      if (!importedFiles.size) throw new ImportError(422, "未导入任何账单。", errors.map(({ message }) => message));
+
+      const llm = await classifyWithLlm(txs.filter((tx) => tx.status !== "excluded" && tx.confidence < 0.7), uploadConfig, currentLedger);
+      for (const tx of txs) {
+        const hit = llm.get(tx.id);
+        if (hit && hit.confidence > tx.confidence) { tx.suggestedAccount = hit.account; tx.confidence = hit.confidence; tx.reason = hit.reason; }
+        tx.finalAccount = tx.suggestedAccount;
+        if (tx.status === "pending" && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 0) >= 0.9 && !tx.issues?.length) tx.status = "ready";
+      }
+      suggestRefundsFromBatch(txs, currentLedger);
+      const deduped = markDuplicates(txs, currentLedger.transactions), paired = pairTransfers(deduped.txs);
+      if (profile() !== uploadProfile) throw new ImportError(409, "上传期间账本配置已切换，请在目标账本重新上传");
+      referenceUncommittedBatches(deduped.txs, batches.list().filter((previous) => previous.ledgerProfile === uploadProfile));
+      const batch = batches.create({ file: [...importedFiles.values()].join(", "), source: sources.size === 1 ? [...sources][0] : "unknown",
+        txCount: txs.length, txs: deduped.txs, errors,
+        accountsDetected: detectAccounts(deduped.txs),
+        ...(Object.keys(pdfUploads).length ? { pdfUploads } : {}),
+        ledgerProfile: uploadProfile, ledgerErrors: currentLedger.errors ?? [], dedup: { ...deduped.stats, transferPairs: paired.pairs.length, familyCardPairs: paired.familyCardPairs } });
+      batchSaved = true;
+      res.json({ batchId: batch.batchId, revision: batch.revision, preview: { ...publicBatch(batch), txs: undefined, lowConfidence: batch.txs.filter((tx) => tx.status === "pending").length } });
+    } finally {
+      for (const file of files) {
+        if (batchSaved && importedFiles.has(file.path)) continue;
+        try { fs.rmSync(file.path, { force: true }); }
+        catch (error) { console.error("Could not remove unused statement upload", error); }
       }
     }
-    const llm = await classifyWithLlm(txs.filter((tx) => tx.status !== "excluded" && tx.confidence < 0.7), uploadConfig, currentLedger);
-    for (const tx of txs) {
-      const hit = llm.get(tx.id);
-      if (hit && hit.confidence > tx.confidence) { tx.suggestedAccount = hit.account; tx.confidence = hit.confidence; tx.reason = hit.reason; }
-      tx.finalAccount = tx.suggestedAccount;
-      if (tx.status === "pending" && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 0) >= 0.9 && !tx.issues?.length) tx.status = "ready";
-    }
-    suggestRefundsFromBatch(txs, currentLedger);
-    const deduped = markDuplicates(txs, currentLedger.transactions), paired = pairTransfers(deduped.txs);
-    if (profile() !== uploadProfile) throw new ImportError(409, "上传期间账本配置已切换，请在目标账本重新上传");
-    referenceUncommittedBatches(deduped.txs, batches.list().filter((previous) => previous.ledgerProfile === uploadProfile));
-    const batch = batches.create({ file: files.map((file) => filename(file.originalname)).join(", "), source: sources.size === 1 ? [...sources][0] : "unknown",
-      txCount: txs.length, txs: deduped.txs, errors,
-      accountsDetected: detectAccounts(deduped.txs),
-      ...(Object.keys(pdfUploads).length ? { pdfUploads } : {}),
-      ledgerProfile: uploadProfile, ledgerErrors: currentLedger.errors ?? [], dedup: { ...deduped.stats, transferPairs: paired.pairs.length, familyCardPairs: paired.familyCardPairs } });
-    res.json({ batchId: batch.batchId, revision: batch.revision, preview: { ...publicBatch(batch), txs: undefined, lowConfidence: batch.txs.filter((tx) => tx.status === "pending").length } });
   }));
   app.get("/api/batch/:id", (req, res) => {
     res.json(publicReviewBatch(getBatch(req.params.id)));
