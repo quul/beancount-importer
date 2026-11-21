@@ -3,11 +3,11 @@ import { api, ApiError, IncompleteReviewError } from "../web/src/api.js";
 import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, validatePostingDraft } from "../web/src/ReviewEditor.js";
 import { calculatePostingAmount } from "../web/src/postingCalculator.js";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
-import { buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch } from "../web/src/reviewRows.js";
+import { buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch } from "../web/src/reviewRows.js";
 import { LEDGER_DUPLICATE_ISSUE } from "../src/shared/types.js";
 import { planCategoryAllocations, savedCategoryAllocations } from "../src/shared/categoryAllocations.js";
 import { planTransactionMerge } from "../src/shared/transactionMerge.js";
-import type { ParsedTx } from "../src/shared/types.js";
+import type { ParsedAccount, ParsedTx } from "../src/shared/types.js";
 
 const originalFetch = globalThis.fetch;
 const requests: Array<{ url: string; init?: RequestInit }> = [];
@@ -189,6 +189,37 @@ try {
   assert.deepEqual(buildBulkPostingPlan(needsRefundReview, accounts).reviewTargets, [{ id: pendingRefund.id }]);
   console.log("✓ bulk decisions honor the scope, keep paired refunds automatic, and leave unresolved rows for review");
 
+  const fundAccount = { account: "Income:Investment:Fund-基金收益", type: "income", openedAt: "2026-01-01", currencies: ["CNY"] } satisfies ParsedAccount;
+  const foodAccount = { account: "Expenses:Food", type: "expenses" } satisfies ParsedAccount;
+  const walletAccount = { account: "Assets:Wallet", type: "assets" } satisfies ParsedAccount;
+  const fund = { ...pendingPurchase, id: "fund", eventType: "income", direction: "in", payee: "余额宝收益",
+    refundCounterpartId: undefined, finalAccount: "", suggestedAccount: "" } satisfies ParsedTx;
+  const unpaidFund = { ...fund, id: "unfunded-income", fundingAccount: "", amount: 6 };
+  const unselectedFund = { ...fund, id: "unselected-income" };
+  const transferRow = { ...fund, id: "internal-transfer", eventType: "transfer" } satisfies ParsedTx;
+  const manualRow = { ...fund, id: "manual-income", postings: [
+    { account: walletAccount.account, amount: 100, currency: fund.currency },
+    { account: fundAccount.account, amount: -100, currency: fund.currency },
+  ] };
+  const categoryRows = buildReviewRows([fund, unpaidFund, unselectedFund, transferRow, manualRow, duplicate]);
+  const categoryOptions = [fundAccount, foodAccount, walletAccount,
+    { ...fundAccount, account: "Income:Future", openedAt: "2026-12-01" }, { ...fundAccount, account: "Income:USD", currencies: ["USD"] }];
+  const categoryPlan = buildBulkCategoryPlan(categoryRows, categoryOptions, new Set([fund.id, unpaidFund.id, transferRow.id, manualRow.id, duplicate.id]));
+  assert.deepEqual(categoryPlan.eligible.map(({ tx }) => tx.id), [fund.id, unpaidFund.id]);
+  assert.deepEqual(categoryPlan.options, [fundAccount, foodAccount]);
+  assert.equal(categoryPlan.skipped, 3);
+  assert.deepEqual(buildBulkCategoryPlan(categoryRows, categoryOptions).eligible.map(({ tx }) => tx.id), [fund.id, unpaidFund.id, unselectedFund.id]);
+  const categorized = applyPendingReviewPatches([fund, unpaidFund, unselectedFund], [
+    reviewPatches(categoryPlan.eligible.map(({ tx }) => ({ id: tx.id, account: fundAccount.account }))),
+  ]);
+  assert.deepEqual(categorized.map(({ finalAccount, fundingAccount, status: reviewStatus }) => [finalAccount, fundingAccount, reviewStatus]), [
+    [fundAccount.account, fund.fundingAccount, "ready"], [fundAccount.account, "", "pending"], ["", unselectedFund.fundingAccount, "pending"],
+  ]);
+  const refundableExpense = buildBulkCategoryPlan(bulkRows, [foodAccount, fundAccount, { ...foodAccount, account: "Expenses:Old", closedAt: "2026-09-30" }],
+    new Set([pendingPurchase.id, pendingRefund.id]));
+  assert.deepEqual(refundableExpense.options, [foodAccount]);
+  console.log("✓ bulk classification honors selection, ledger dates and currency, excludes special rows, and preserves funding");
+
   status = 422;
   const reviewReminder = "请将待确认内容处理完毕后，再点击「生成预览」。";
   const reviewProblems = [{ id: "transfer", field: "category", message: "请选择转账对方账户" }];
@@ -216,5 +247,5 @@ try {
   await assert.rejects(() => api.upload([]), (error: unknown) => error instanceof ApiError && error.temporary
     && error.message === "服务连接中断，请重试");
   console.log("✓ empty responses, proxy pages and network exceptions get friendly retry messages");
-  console.log("Web contract regression passed (11 groups).");
+  console.log("Web contract regression passed (12 groups).");
 } finally { globalThis.fetch = originalFetch; }

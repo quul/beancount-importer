@@ -343,6 +343,11 @@ select {
 .pagination { flex: none; margin-inline-start: auto; gap: 4px; }
 .bulk-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; font-size: 12px; }
 .bulk-bar .bulk-scope { width: 164px; min-height: 32px; padding-block: 5px; }
+.bulk-category { display: flex; align-items: center; gap: 5px; }
+.bulk-category .account-select { width: 174px; }
+.bulk-category .account-select input { min-height: 32px; padding-block: 5px; }
+.bulk-category .account-select::after { top: 12px; }
+.bulk-category-hint { color: var(--muted); white-space: nowrap; }
 .btn.bulk-review-hint { color: var(--warning); white-space: nowrap; text-decoration: underline; text-underline-offset: 2px; }
 .btn.bulk-review-hint:hover { background: var(--warning-soft); color: var(--warning); }
 .bulk-edit-menu { display: grid; width: 224px; max-width: 100%; gap: 6px; padding: 4px; }

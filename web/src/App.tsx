@@ -26,8 +26,8 @@ import StatementSources from "./StatementSources";
 import TransactionFlag from "./TransactionFlag";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "./reviewChanges";
 import {
-  buildBulkPostingPlan, buildReviewRows, EMPTY_REVIEW_DATE_RANGE, isEditablePostingStatus, matchesReviewDateRange,
-  matchesReviewFilter, matchesReviewSearch, remainingReviewProblems, type ReviewFilter, type ReviewRow, type ReviewTarget,
+  buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, EMPTY_REVIEW_DATE_RANGE, isEditablePostingStatus, matchesReviewDateRange,
+  matchesReviewFilter, matchesReviewSearch, refundFollowsCategory, remainingReviewProblems, type ReviewFilter, type ReviewRow, type ReviewTarget,
 } from "./reviewRows";
 
 const STATUS_TABS: Array<{ key: ReviewFilter; label: string }> = [
@@ -274,6 +274,7 @@ export default function App() {
   const [detailSaveAttempt, setDetailSaveAttempt] = useState<{ id: string }>();
   const [narrationDrafts, setNarrationDrafts] = useState<Record<string, string>>({});
   const [bulkTags, setBulkTags] = useState("");
+  const [bulkCategoryAccount, setBulkCategoryAccount] = useState("");
   const [bulkScope, setBulkScope] = useState<"selected" | "filtered">("selected");
   const [mergeIds, setMergeIds] = useState<string[] | null>(null);
   const [pdfPreviewTx, setPdfPreviewTx] = useState<ParsedTx | null>(null);
@@ -496,13 +497,22 @@ export default function App() {
     const accountNames = new Set(accounts.map(({ account }) => account));
     return bulkScope === "filtered" ? buildBulkPostingPlan(visible, accountNames) : buildBulkPostingPlan(reviewRows, accountNames, selected);
   }, [accounts, bulkScope, readOnly, reviewRows, selected, selectedRows, visible]);
+  const bulkCategory = useMemo(() => {
+    if (readOnly || !selectedRows || (bulkScope === "filtered" ? selectableRows : selectedRows) < 2) return null;
+    return bulkScope === "filtered" ? buildBulkCategoryPlan(visible, accounts) : buildBulkCategoryPlan(reviewRows, accounts, selected);
+  }, [accounts, bulkScope, readOnly, reviewRows, selectableRows, selected, selectedRows, visible]);
   const bulkTagErrors = invalidTags(bulkTags);
   const bulkEditDisabled = editingDisabled || detailDraftIds.length > 0 || !targets.length;
   const bulkTagDisabled = bulkEditDisabled || !parseTags(bulkTags).length || Boolean(bulkTagErrors.length);
+  const canApplyBulkCategory = !bulkEditDisabled && !reviewIsSaving && bulkCategory?.options.some(({ account }) => account === bulkCategoryAccount);
   const pendingHigh = active.filter((tx) => tx.status === "pending" && !tx.reviewConflictId && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 1) >= 0.9
     && !tx.issues?.length && tx.suggestedAccount && !missingPostingAccount({ ...tx, finalAccount: tx.suggestedAccount }));
   const readyCount = active.filter((tx) => tx.status === "ready").length;
   const showDecisionStatus = statusFilter === "all";
+
+  useEffect(() => {
+    setBulkCategoryAccount("");
+  }, [batchId, bulkScope, dateRange, filter, selected, statusFilter]);
 
   const closeDetails = useCallback(() => {
     detailDialog.current?.close();
@@ -962,6 +972,17 @@ export default function App() {
     } else if (!decisions.length || saveReviewDecisions(decisions)) discard();
   };
 
+  const applyBulkCategory = () => {
+    if (!bulkCategory || !canApplyBulkCategory) return;
+    const account = bulkCategoryAccount;
+    const decisions = bulkCategory.eligible.map(({ tx }) => ({ id: tx.id, account }));
+    const followedRefundIds = bulkCategory.eligible.flatMap(({ refund }) => refundFollowsCategory(refund, account) ? [refund.id] : []);
+    savePostingDecisions(decisions, {
+      followedRefundIds,
+      onSaved: () => setBulkCategoryAccount((current) => current === account ? "" : current),
+    });
+  };
+
   const bulkFlag = (flag: "*" | "!") => saveFlags(targets, flag);
   const applyTags = (mode: "add" | "remove") => {
     const tags = parseTags(bulkTags);
@@ -1184,9 +1205,8 @@ export default function App() {
               onChange={(account) => {
                 const decision = { id: tx.id, account, status: isEditablePostingStatus(tx) ? undefined : tx.status };
                 if (decision.status || missingPostingAccount({ ...tx, finalAccount: account })) { saveReviewDecisions([decision]); return; }
-                const follows = refund && account.startsWith("Expenses:") && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund);
                 savePostingDecisions([decision], {
-                  followedRefundIds: follows ? [refund.id] : [], advanceAfter: tx.status === "pending" ? tx.id : undefined,
+                  followedRefundIds: refundFollowsCategory(refund, account) ? [refund.id] : [], advanceAfter: tx.status === "pending" ? tx.id : undefined,
                 });
               }} />
           }
@@ -1773,6 +1793,15 @@ export default function App() {
               <option value="selected">已选 {selectedRows} 笔{hiddenSelection > 0 ? `（筛选外 ${hiddenSelection}）` : ""}</option>
               <option value="filtered">全部可选结果 · {selectableRows} 笔</option>
             </select>
+            {bulkCategory && <div className="bulk-category" role="group" aria-label="批量设置分类">
+              <AccountSelect value={bulkCategoryAccount} accounts={bulkCategory.options} label="批量分类账户" placeholder="设置分类" autoHighlight
+                disabled={bulkEditDisabled || !bulkCategory.options.length} onChange={setBulkCategoryAccount} />
+              <button type="button" className="btn small" disabled={!canApplyBulkCategory} onClick={applyBulkCategory}>
+                {bulkCategory.eligible.length ? `应用到 ${bulkCategory.eligible.length} 笔` : "应用"}
+              </button>
+              {bulkCategory.skipped > 0 && <span className="bulk-category-hint">{bulkCategory.skipped} 笔需逐笔处理</span>}
+              {bulkCategory.eligible.length > 0 && !bulkCategory.options.length && <span className="bulk-category-hint">无共同可用分类</span>}
+            </div>}
             <button type="button" className="btn primary small" disabled={bulkEditDisabled || !bulkPosting.approvals.length}
               aria-describedby={bulkPosting.reviewTargets.length ? "bulk-review-hint" : undefined}
               onClick={() => savePostingDecisions(bulkPosting.approvals, { followedRefundIds: bulkPosting.followedRefundIds })}>标记 {bulkPosting.approvalCount} 笔入账</button>

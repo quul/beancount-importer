@@ -1,7 +1,7 @@
-import { isFundingAccount } from "../../src/shared/funding.js";
+import { accountIsActive, isFundingAccount } from "../../src/shared/funding.js";
 import { fundingPostingSign, transactionPostings, transactionReviewProblems } from "../../src/shared/postings.js";
 import { activeTransactions } from "../../src/shared/transactionMerge.js";
-import { canFollowPurchaseRefund, isSuspectedDuplicate, type ParsedTx, type ReviewProblem, type TxDecision, type TxStatus } from "../../src/shared/types.js";
+import { canFollowPurchaseRefund, isSuspectedDuplicate, type ParsedAccount, type ParsedTx, type ReviewProblem, type TxDecision, type TxStatus } from "../../src/shared/types.js";
 
 export type ReviewFilter = "all" | "suspectedDuplicate" | TxStatus;
 export type ReviewTarget = Pick<ReviewProblem, "id" | "field">;
@@ -56,6 +56,22 @@ export function buildReviewRows(txs: readonly ParsedTx[]): ReviewRow[] {
 
 export function isEditablePostingStatus(tx: ParsedTx): boolean {
   return !tx.reviewConflictId && (tx.status === "ready" || tx.status === "pending");
+}
+
+export function refundFollowsCategory(refund: ParsedTx | undefined, account: string): refund is ParsedTx {
+  return Boolean(refund && account.startsWith("Expenses:") && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund));
+}
+
+export function buildBulkCategoryPlan(rows: readonly ReviewRow[], accounts: ParsedAccount[], selected?: ReadonlySet<string>) {
+  const scoped = selected ? rows.filter(({ entries }) => entries.some(({ id }) => selected.has(id))) : rows;
+  const eligible = scoped.filter(({ tx, refund }) => (!selected || selected.has(tx.id))
+    && isEditablePostingStatus(tx) && !tx.excludedReason && !tx.merge && !tx.postings && !refund?.postings
+    && tx.eventType !== "transfer" && !tx.fundingAccount2);
+  const options = eligible.length ? accounts.filter((option) => eligible.every(({ tx, refund }) =>
+    option.account !== tx.fundingAccount && accountIsActive(option, tx.date, tx.currency)
+    && ((!refund && tx.eventType !== "refund") || option.account.startsWith("Expenses:"))
+    && (!refund || !canFollowPurchaseRefund(refund) || accountIsActive(option, refund.date, refund.currency)))) : [];
+  return { eligible, options, skipped: scoped.length - eligible.length };
 }
 
 function planApproval(tx: ParsedTx, accounts: ReadonlySet<string>): { decision: TxDecision } | { target: ReviewTarget } {
