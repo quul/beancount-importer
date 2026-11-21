@@ -14,13 +14,15 @@ export function reviewPatches(decisions: readonly TxDecision[]): Map<string, Rev
       ...(reviewNote !== undefined && { reviewNote }),
     };
     return [id, (tx) => {
-      const edited = { ...tx, ...fields };
+      const updated = { ...fields };
+      if (account !== undefined && tx.fundingAccount2 && !tx.postings) updated.fundingAccount2 = account;
+      const edited = { ...tx, ...updated };
       const nextStatus = status === "ready" && missingPostingAccount(edited) ? undefined
         : status ?? (account === undefined ? undefined : statusAfterCategorization(edited));
       const manualRefund = tx.eventType === "refund"
         && (account !== undefined || status !== undefined);
       return {
-        ...fields,
+        ...updated,
         ...(nextStatus !== undefined && { status: nextStatus }),
         ...(nextStatus !== undefined && nextStatus !== "duplicate" && { duplicateOf: undefined }),
         ...(manualRefund && { refundReviewMode: "manual" }),

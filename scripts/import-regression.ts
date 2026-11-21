@@ -272,10 +272,12 @@ try {
     assert.match(result.entries, /Equity:Coupons:Payment  -1\.00 HKD/); assert.ok(!result.entries.includes(" CNY"));
     assert.ok(suggestOpens([row], new Set()).every((line) => line.startsWith("2025-10-31 open")));
   });
-  check("unbalanced, incomplete split and income-classified refunds are rejected", () => {
+  check("invalid splits are rejected and a refund can use an income account", () => {
     assert.ok(generateEntries([tx({ postings: [{ account: "Assets:A", amount: 5, currency: "CNY" }, { account: "Expenses:Other", amount: -4, currency: "CNY" }] })]).errors?.length);
     assert.ok(generateEntries([tx({ fundingParts: [{ rawAccount: "银行卡" }, { rawAccount: "红包" }] })]).errors?.length);
-    assert.ok(generateEntries([tx({ eventType: "refund", direction: "in", finalAccount: "Income:Refund" })]).errors?.length);
+    const refund = generateEntries([tx({ eventType: "refund", direction: "in", finalAccount: "Income:Refund" })]);
+    assert.deepEqual(refund.errors, []);
+    assert.match(refund.entries, /Income:Refund  -5\.00 CNY/);
   });
   check("only certified day-end balance becomes a next-day standalone directive", () => {
     const row = tx({ source: "bank-icbc", fundingAccount: "Assets:Bank:ICBC", balanceAfter: 100 });

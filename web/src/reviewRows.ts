@@ -59,17 +59,24 @@ export function isEditablePostingStatus(tx: ParsedTx): boolean {
 }
 
 export function refundFollowsCategory(refund: ParsedTx | undefined, account: string): refund is ParsedTx {
-  return Boolean(refund && account.startsWith("Expenses:") && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund));
+  return Boolean(refund && account && account !== refund.fundingAccount && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund));
+}
+
+export function reviewCategoryOptions(tx: ParsedTx, accounts: ParsedAccount[]): ParsedAccount[] {
+  if (tx.direction !== "in") return accounts;
+  const income: ParsedAccount[] = [], other: ParsedAccount[] = [];
+  for (const option of accounts) {
+    (option.account.startsWith("Income:") && accountIsActive(option, tx.date, tx.currency) ? income : other).push(option);
+  }
+  return [...income, ...other];
 }
 
 export function buildBulkCategoryPlan(rows: readonly ReviewRow[], accounts: ParsedAccount[], selected?: ReadonlySet<string>) {
   const scoped = selected ? rows.filter(({ entries }) => entries.some(({ id }) => selected.has(id))) : rows;
   const eligible = scoped.filter(({ tx, refund }) => (!selected || selected.has(tx.id))
-    && isEditablePostingStatus(tx) && !tx.excludedReason && !tx.merge && !tx.postings && !refund?.postings
-    && tx.eventType !== "transfer" && !tx.fundingAccount2);
+    && isEditablePostingStatus(tx) && !tx.excludedReason && !tx.merge && !tx.postings && !refund?.postings);
   const options = eligible.length ? accounts.filter((option) => eligible.every(({ tx, refund }) =>
     option.account !== tx.fundingAccount && accountIsActive(option, tx.date, tx.currency)
-    && ((!refund && tx.eventType !== "refund") || option.account.startsWith("Expenses:"))
     && (!refund || !canFollowPurchaseRefund(refund) || accountIsActive(option, refund.date, refund.currency)))) : [];
   return { eligible, options, skipped: scoped.length - eligible.length };
 }
@@ -82,7 +89,7 @@ function planApproval(tx: ParsedTx, accounts: ReadonlySet<string>): { decision: 
   if (problems.length) return { target: { id: tx.id, field: problems.find(({ field }) => field)?.field } };
   const missing = postings.findIndex(({ account }) => !accounts.has(account));
   if (missing !== -1) {
-    return { target: { id: tx.id, field: tx.postings || (missing === 1 && tx.fundingAccount2) ? "postings" : missing === 0 ? "funding" : "category" } };
+    return { target: { id: tx.id, field: tx.postings ? "postings" : missing === 0 ? "funding" : "category" } };
   }
   const decision: TxDecision = !tx.postings && !tx.fundingAccount2 && finalAccount !== tx.finalAccount
     ? { id: tx.id, account: finalAccount, status: "ready" }
@@ -107,11 +114,10 @@ export function buildBulkPostingPlan(rows: readonly ReviewRow[], accounts: Reado
       const purchase = planApproval(tx, accounts);
       if ("target" in purchase) { reviewTargets.push(purchase.target); continue; }
       const category = purchase.decision.account ?? tx.finalAccount;
-      if (!category.startsWith("Expenses:")) { reviewTargets.push({ id: tx.id, field: "category" }); continue; }
       if (isSuspectedDuplicate(refund)) { reviewTargets.push({ id: refund.id }); continue; }
       const refundPlan = planApproval({ ...refund, finalAccount: category }, accounts);
       if ("target" in refundPlan) { reviewTargets.push(refundPlan.target); continue; }
-      // The server applies the expense category to the refund when it saves the purchase.
+      // The server applies the purchase's category to the refund when it saves the purchase.
       approvals.push(purchase.decision);
       followedRefundIds.push(refund.id);
       approvalCount++;
@@ -136,7 +142,8 @@ export function remainingReviewProblems(problems: ReviewProblem[], before: Parse
     const original = previous.get(id), updated = current.get(id);
     if (!original || updated?.status !== "ready") return false;
     if (field === "funding") return original.fundingAccount === updated.fundingAccount && Boolean(original.postings) === Boolean(updated.postings);
-    if (field === "category") return original.finalAccount === updated.finalAccount && Boolean(original.postings) === Boolean(updated.postings);
+    if (field === "category") return (original.fundingAccount2 || original.finalAccount) === (updated.fundingAccount2 || updated.finalAccount)
+      && Boolean(original.postings) === Boolean(updated.postings);
     if (field === "postings") return original.fundingAccount2 === updated.fundingAccount2 && JSON.stringify(original.postings) === JSON.stringify(updated.postings);
     if (field === "tags") return JSON.stringify(original.tags) === JSON.stringify(updated.tags);
     return original.date === updated.date && original.amount === updated.amount && original.currency === updated.currency && original.flag === updated.flag;

@@ -196,7 +196,8 @@ export function syncStatementRefunds(txs: readonly ParsedTx[], ledger?: readonly
     const following = refund.refundReviewMode === "follow-purchase";
 
     const purchase = byId.get(pairs.get(refund.id) ?? "");
-    if (!purchase || purchase.status !== "ready" || purchase.postings || purchase.fundingAccount2 || !purchase.finalAccount.startsWith("Expenses:")) {
+    if (!purchase || purchase.status !== "ready" || purchase.postings || purchase.fundingAccount2
+      || !purchase.finalAccount || purchase.finalAccount === refund.fundingAccount) {
       if (following) {
         refund.finalAccount = refund.suggestedAccount;
         refund.status = "pending";

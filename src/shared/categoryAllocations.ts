@@ -35,7 +35,6 @@ export function planCategoryAllocations(tx: ParsedTx, allocations: readonly Cate
   else if (target === undefined || target <= 0n || !allocations.length || allocations.length > MAX_CATEGORY_ALLOCATIONS) error = "交易金额或分类数量无效";
   else if (!isFundingAccount(tx.fundingAccount)) error = "请选择资金账户";
   else if (allocations.some(({ account }) => !accountPattern.test(account) || account === tx.fundingAccount)) error = "请选择有效的分类账户";
-  else if (tx.eventType === "refund" && allocations.some(({ account }) => account.startsWith("Income:"))) error = "退款请冲回原费用";
   else if (amounts.some(({ units, amount }) => units === undefined || amountUnits(amountText(amount)) !== units)) error = "请为每个分类填写有效金额";
   else if (remaining !== 0n) error = "分类金额合计须等于交易金额";
   const sign = fundingPostingSign(tx);

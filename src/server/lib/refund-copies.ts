@@ -50,7 +50,7 @@ function hasCopyEvidence(tx: ParsedTx): boolean {
   if (tx.eventType !== "refund" || tx.direction !== "in" || tx.merge || tx.reviewConflictId || tx.excludedReason
     || (tx.status === "duplicate" && tx.duplicateOf?.refundCopy !== "statement") || tx.fundingAccount2 || statementRefundEvidence(tx)?.unconfirmed) return false;
   if (tx.postings) {
-    const funding = tx.postings.filter((posting) => isFundingAccount(posting.account));
+    const funding = tx.postings.filter((posting) => posting.amount > 0 && isFundingAccount(posting.account));
     return funding.length === 1 && funding[0].account === tx.fundingAccount && funding[0].amount === tx.amount && funding[0].currency === tx.currency;
   }
   return Boolean(tx.refundEvidence?.cardIdentity || singlePaymentMethod(tx));
@@ -106,8 +106,8 @@ export function findPostedRefundCopies(txs: readonly ParsedTx[], ledger: readonl
   const posted = ledger.flatMap((tx) => {
     const source = tx.source ?? tx.metadata?.["import-source"];
     if (!source || tx.metadata?.["import-event"] !== "refund") return [];
-    const funding = tx.postings.filter((posting) => isFundingAccount(posting.account));
-    if (funding.length !== 1 || funding[0].amount <= 0) return [];
+    const funding = tx.postings.filter((posting) => posting.amount > 0 && isFundingAccount(posting.account));
+    if (funding.length !== 1) return [];
     const [{ account: fundingAccount, amount, currency }] = funding;
     return [{ tx, source, date: tx.date, time: tx.time, payee: tx.payee, sourceTxId: tx.sourceTxId ?? tx.metadata?.["import-id"],
       sourceFile: tx.metadata?.["source-file"], sourceFileHash: tx.metadata?.["source-file-hash"], rawAccount: tx.metadata?.["source-account"] ?? "",

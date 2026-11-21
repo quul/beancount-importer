@@ -91,7 +91,7 @@ function draftProblems(txs: ParsedTx[], ledger: LedgerInfo, opening: Set<string>
       problems.push({ id: tx.id, field, message });
     };
     for (const [index, { account, currency }] of transactionPostings(tx).entries()) {
-      const field = tx.postings || (index === 1 && tx.fundingAccount2) ? "postings" : index === 0 ? "funding" : "category";
+      const field = tx.postings ? "postings" : index === 0 ? "funding" : "category";
       const defined = accounts.get(account);
       if (!defined && !opening.has(account)) add(account ? `账户 ${account} 未在账本开户` : missingPostingAccountMessage[field], field);
       else if (defined && ((defined.openedAt && tx.date < defined.openedAt) || (defined.closedAt && tx.date > defined.closedAt))) add(`账户 ${account} 在交易日未生效`, field);
@@ -159,6 +159,23 @@ function applyWechatExclusions(txs: ParsedTx[], rules: ReturnType<typeof loadWec
 function needsFundingAccount(tx: ParsedTx): boolean {
   return !tx.fundingAccount && !tx.fundingAccount2 && !tx.postings?.length && !tx.excludedReason
     && tx.status !== "excluded" && tx.status !== "duplicate";
+}
+
+function restoreKnownWechatFunding(txs: ParsedTx[], rules: ReturnType<typeof loadWechatRules>, config: AppConfig, ledger: LedgerInfo): boolean {
+  let changed = false;
+  for (const tx of txs) {
+    if (tx.source !== "wechat" || !needsFundingAccount(tx)) continue;
+    const recognition = recognizeWechatTransaction(tx, rules);
+    if (!recognition) continue;
+    const guess = inferFundingAccount({ ...tx, recognition }, config, ledger);
+    if (!guess.account || guess.confidence < 1) continue;
+    tx.recognition = recognition;
+    confirmFundingAccount(tx, guess.account);
+    tx.fundingReason = guess.reason;
+    tx.issues = tx.issues?.filter((issue) => !fundingMappingIssue(issue));
+    changed = true;
+  }
+  return changed;
 }
 
 function restoreRefundedPurchases(txs: readonly ParsedTx[], config: AppConfig, ledger: LedgerInfo): ParsedTx[] {
@@ -556,15 +573,15 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
       requireRevision(batch, requested.revision);
       const txs = activeTransactions(batch.txs).filter((tx) => !tx.merge && !tx.reviewConflictId);
-      const exclusionsChanged = applyWechatExclusions(txs, wechatRulesFor(txs));
+      const rules = wechatRulesFor(txs);
+      const exclusionsChanged = applyWechatExclusions(txs, rules);
+      const fundingChanged = restoreKnownWechatFunding(txs, rules, config, currentLedger);
       const restored = restoreRefundedPurchases(txs, config, currentLedger);
-      if (restored.length) {
-        markDuplicates(restored, currentLedger.transactions);
-        batch.accountsDetected = detectAccounts(batch.txs);
-      }
+      if (restored.length) markDuplicates(restored, currentLedger.transactions);
+      if (restored.length || fundingChanged) batch.accountsDetected = detectAccounts(batch.txs);
       const result = refreshLedgerDuplicateHints(txs, currentLedger.transactions);
       const refundsChanged = syncStatementRefunds(txs, currentLedger.transactions);
-      if (exclusionsChanged || restored.length || result.changed || refundsChanged) saveBatchRevision(batch);
+      if (exclusionsChanged || fundingChanged || restored.length || result.changed || refundsChanged) saveBatchRevision(batch);
       res.json({ batch: publicReviewBatch(batch), suspected: result.suspected });
     } finally {
       release();
@@ -874,6 +891,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       if (decision.account !== undefined) {
         const account = decision.account;
         if (tx.postings) tx.postings = tx.postings.map((posting) => posting.account === tx.finalAccount ? { ...posting, account } : posting);
+        else if (tx.fundingAccount2) tx.fundingAccount2 = account;
         tx.finalAccount = account;
         if (/^(Expenses|Income):/.test(account)) {
           memory ??= loadMemory(memoryFile());

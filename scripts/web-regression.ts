@@ -3,7 +3,7 @@ import { api, ApiError, IncompleteReviewError } from "../web/src/api.js";
 import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, validatePostingDraft } from "../web/src/ReviewEditor.js";
 import { calculatePostingAmount } from "../web/src/postingCalculator.js";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
-import { buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch } from "../web/src/reviewRows.js";
+import { buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch, reviewCategoryOptions } from "../web/src/reviewRows.js";
 import { LEDGER_DUPLICATE_ISSUE } from "../src/shared/types.js";
 import { planCategoryAllocations, savedCategoryAllocations } from "../src/shared/categoryAllocations.js";
 import { planTransactionMerge } from "../src/shared/transactionMerge.js";
@@ -66,6 +66,8 @@ try {
   const note = draftDecision(transfer, { ...makeDraft(transfer), reviewNote: "核对了转账凭证" });
   assert.equal(note.reviewNote, "核对了转账凭证");
   assert.ok(!Object.hasOwn(note, "postings"));
+  const reviewedTransfer = applyPendingReviewPatches([transfer], [reviewPatches([{ id: transfer.id, account: "Income:Gifts" }])])[0];
+  assert.equal(reviewedTransfer.fundingAccount2, "Income:Gifts");
   console.log("✓ refund splits can be cleared and saving a transfer note preserves the inferred accounts");
 
   const rejected = reviewPatches([{ id: refund.id, tags: ["unconfirmed"], funding: "Assets:OtherWallet" }]);
@@ -106,6 +108,8 @@ try {
   const income = { ...expense, direction: "in", eventType: "income" } satisfies ParsedTx;
   const incomePlan = planCategoryAllocations(income, allocations.map((part) => ({ ...part, account: part.account.replace("Expenses:", "Income:") })));
   assert.deepEqual(incomePlan.postings?.map(({ amount }) => amount), [0.30, -0.10, -0.20]);
+  const refundPlan = planCategoryAllocations({ ...income, eventType: "refund" }, [{ account: "Income:Gifts", amount: "0.30" }]);
+  assert.deepEqual(refundPlan.postings?.map(({ amount }) => amount), [0.30, -0.30]);
   const signed = [{ account: "Expenses:Food", amount: "+.40" }, { account: "Expenses:Snacks", amount: "-.10" }, { account: "Expenses:Other", amount: "0" }];
   const signedExpense = planCategoryAllocations(expense, signed);
   assert.deepEqual(signedExpense.postings?.map(({ amount }) => amount), [-0.30, 0.40, -0.10, 0]);
@@ -211,22 +215,26 @@ try {
   ] };
   const categoryRows = buildReviewRows([fund, unpaidFund, unselectedFund, transferRow, manualRow, duplicate]);
   const categoryOptions = [fundAccount, foodAccount, walletAccount,
-    { ...fundAccount, account: "Income:Future", openedAt: "2026-12-01" }, { ...fundAccount, account: "Income:USD", currencies: ["USD"] }];
+    { account: "Equity:Opening", type: "equity" }, { account: "Liabilities:CreditCard", type: "liabilities" },
+    { ...fundAccount, account: "Income:Future", openedAt: "2026-12-01" }, { ...fundAccount, account: "Income:USD", currencies: ["USD"] }] satisfies ParsedAccount[];
+  const ledgerOptions = [...categoryOptions.slice(1), fundAccount];
+  assert.deepEqual(reviewCategoryOptions(pendingPurchase, ledgerOptions), ledgerOptions);
+  for (const tx of [fund, transferRow, pendingRefund]) assert.deepEqual(reviewCategoryOptions(tx, ledgerOptions), categoryOptions);
   const categoryPlan = buildBulkCategoryPlan(categoryRows, categoryOptions, new Set([fund.id, unpaidFund.id, transferRow.id, manualRow.id, duplicate.id]));
-  assert.deepEqual(categoryPlan.eligible.map(({ tx }) => tx.id), [fund.id, unpaidFund.id]);
-  assert.deepEqual(categoryPlan.options, [fundAccount, foodAccount]);
-  assert.equal(categoryPlan.skipped, 3);
-  assert.deepEqual(buildBulkCategoryPlan(categoryRows, categoryOptions).eligible.map(({ tx }) => tx.id), [fund.id, unpaidFund.id, unselectedFund.id]);
+  assert.deepEqual(categoryPlan.eligible.map(({ tx }) => tx.id), [fund.id, unpaidFund.id, transferRow.id]);
+  assert.deepEqual(categoryPlan.options, [fundAccount, foodAccount, ...categoryOptions.slice(3, 5)]);
+  assert.equal(categoryPlan.skipped, 2);
+  assert.deepEqual(buildBulkCategoryPlan(categoryRows, categoryOptions).eligible.map(({ tx }) => tx.id), [fund.id, unpaidFund.id, unselectedFund.id, transferRow.id]);
   const categorized = applyPendingReviewPatches([fund, unpaidFund, unselectedFund], [
     reviewPatches(categoryPlan.eligible.map(({ tx }) => ({ id: tx.id, account: fundAccount.account }))),
   ]);
   assert.deepEqual(categorized.map(({ finalAccount, fundingAccount, status: reviewStatus }) => [finalAccount, fundingAccount, reviewStatus]), [
     [fundAccount.account, fund.fundingAccount, "ready"], [fundAccount.account, "", "pending"], ["", unselectedFund.fundingAccount, "pending"],
   ]);
-  const refundableExpense = buildBulkCategoryPlan(bulkRows, [foodAccount, fundAccount, { ...foodAccount, account: "Expenses:Old", closedAt: "2026-09-30" }],
+  const refundable = buildBulkCategoryPlan(bulkRows, [foodAccount, fundAccount, { ...foodAccount, account: "Expenses:Old", closedAt: "2026-09-30" }],
     new Set([pendingPurchase.id, pendingRefund.id]));
-  assert.deepEqual(refundableExpense.options, [foodAccount]);
-  console.log("✓ bulk classification honors selection, ledger dates and currency, excludes special rows, and preserves funding");
+  assert.deepEqual(refundable.options, [foodAccount, fundAccount]);
+  console.log("✓ individual and bulk category choices accept every account type, including for transfers and refunds");
 
   status = 422;
   const reviewReminder = "请将待确认内容处理完毕后，再点击「生成预览」。";

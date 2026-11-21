@@ -10,6 +10,15 @@
     "fundingMethod": "零钱"
   },
   {
+    "label": "微信红包",
+    "when": {
+      "category": "微信红包",
+      "direction": "in",
+      "status": "已存入零钱"
+    },
+    "fundingMethod": "零钱"
+  },
+  {
     "label": "转账",
     "when": {
       "category": "转账",

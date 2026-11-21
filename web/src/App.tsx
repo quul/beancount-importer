@@ -26,7 +26,7 @@ import TransactionFlag from "./TransactionFlag";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "./reviewChanges";
 import {
   buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, EMPTY_REVIEW_DATE_RANGE, isEditablePostingStatus, matchesReviewDateRange,
-  matchesReviewFilter, matchesReviewSearch, refundFollowsCategory, remainingReviewProblems, type ReviewFilter, type ReviewRow, type ReviewTarget,
+  matchesReviewFilter, matchesReviewSearch, refundFollowsCategory, remainingReviewProblems, reviewCategoryOptions, type ReviewFilter, type ReviewRow, type ReviewTarget,
 } from "./reviewRows";
 
 const STATUS_TABS: Array<{ key: ReviewFilter; label: string }> = [
@@ -930,7 +930,7 @@ export default function App() {
           const purchase = refund.refundCounterpartId ? rows.get(refund.refundCounterpartId) : undefined;
           if (purchase?.status !== "ready" || !canFollowPurchaseRefund(refund) || isSuspectedDuplicate(refund)) return {};
           const account = purchase.finalAccount;
-          if (!account.startsWith("Expenses:") || missingPostingAccount({ ...refund, finalAccount: account })) return {};
+          if (account === refund.fundingAccount || missingPostingAccount({ ...refund, finalAccount: account })) return {};
           return { finalAccount: account, status: "ready", refundReviewMode: "follow-purchase", duplicateOf: undefined };
         });
       }
@@ -1233,14 +1233,11 @@ export default function App() {
   const renderAccountFields = (tx: ParsedTx, disabled: boolean, refund?: ParsedTx, detail = false) => {
     const payee = tx.payee || "（无商户）";
     const accountDisabled = disabled || Boolean(tx.postings || refund?.postings || tx.duplicateOf?.refundCopy);
-    const isTransfer = tx.eventType === "transfer" && !tx.fundingAccount2;
+    const isTransfer = tx.eventType === "transfer";
     const categoryLabel = isTransfer ? "对方账户" : "分类账户";
     const categoryError = fieldProblem(tx.id, "category");
-    const category = tx.finalAccount || (categoryError ? "" : tx.suggestedAccount);
-    const categoryOptions = refund || isTransfer || categoryError ? accounts.filter((option) =>
-      (!refund || option.account.startsWith("Expenses:") || option.account === tx.finalAccount)
-      && (!isTransfer || /^(Assets|Liabilities):/.test(option.account))
-      && (!categoryError || (option.account !== tx.fundingAccount && accountIsActive(option, tx.date, tx.currency)))) : accounts;
+    const category = tx.fundingAccount2 || tx.finalAccount || (categoryError ? "" : tx.suggestedAccount);
+    const categoryOptions = reviewCategoryOptions(tx, accounts);
     const allocations = savedCategoryAllocations(tx);
     return <>
       <div className={detail ? "account-fields" : "account-fields account-fields-compact"}>
@@ -1257,7 +1254,8 @@ export default function App() {
               confirmCurrent={tx.status === "pending" || Boolean(categoryError)}
               onChange={(account) => {
                 const decision = { id: tx.id, account, status: isEditablePostingStatus(tx) ? undefined : tx.status };
-                if (decision.status || missingPostingAccount({ ...tx, finalAccount: account })) { saveReviewDecisions([decision]); return; }
+                const reviewed = { ...tx, finalAccount: account, fundingAccount2: tx.fundingAccount2 ? account : undefined };
+                if (decision.status || missingPostingAccount(reviewed)) { saveReviewDecisions([decision]); return; }
                 savePostingDecisions([decision], {
                   followedRefundIds: refundFollowsCategory(refund, account) ? [refund.id] : [], advanceAfter: tx.status === "pending" ? tx.id : undefined,
                 });
@@ -1270,7 +1268,6 @@ export default function App() {
         </div>
       </div>
       {tx.postings && !allocations && <div className="account-hint">{tx.postings.length} 条分录</div>}
-      {tx.fundingAccount2 && <div className="account-hint">转入账户 <code>{tx.fundingAccount2}</code></div>}
       {refund && (tx.postings && refund.status === "pending" ? <div className="account-hint">退款待确认，可在详情中分配</div>
         : refund.finalAccount && refund.finalAccount !== tx.finalAccount && <div className="account-hint">退款分类见详情</div>)}
     </>;
@@ -1286,12 +1283,8 @@ export default function App() {
     const canInclude = tx.status !== "ready" && !tx.excludedReason && !tx.duplicateOf?.refundCopy && (!refund || (tx.status === "pending"
       && !tx.postings && refund.status === "pending" && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund)));
     const category = tx.finalAccount || tx.suggestedAccount || "";
-    const needsExpenseCategory = Boolean(refund) && !category.startsWith("Expenses:");
-    const needsCounterpart = tx.eventType === "transfer" && !tx.postings && !/^(Assets|Liabilities):/.test(tx.fundingAccount2 || category);
-    const missing = missingPostingAccount({ ...tx, finalAccount: category })
-      ?? (needsCounterpart && tx.fundingAccount2 ? "postings" : needsExpenseCategory || needsCounterpart ? "category" : undefined);
-    const includeHint = missing === "category" && needsExpenseCategory ? "请先选择费用分类账户"
-      : missing === "category" && needsCounterpart ? "请选择转账对方账户" : missing ? missingPostingAccountMessage[missing] : undefined;
+    const missing = missingPostingAccount({ ...tx, finalAccount: category });
+    const includeHint = missing === "category" && tx.eventType === "transfer" ? "请选择转账对方账户" : missing ? missingPostingAccountMessage[missing] : undefined;
     const include = () => {
       if (missing === "postings") { revealReviewTarget([{ id: tx.id, field: missing }]); return; }
       if (missing) {

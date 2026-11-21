@@ -572,7 +572,51 @@ try {
     await request(giftBase, "/api/config", { assetMapping: [...config.assetMapping, mapping] });
     const mapped = await upload(giftBase, `${header}\n${row("红包收入凭据", "gift-mapped")}`, file);
     assert.equal(mapped.txs[0].fundingAccount, income);
-    passed("an income account can fund a red-envelope receipt and its saved mapping can be reused");
+
+    const walletMapping = { keyword: "零钱", account: wallet, source: "wechat", kind: "debit", exact: true };
+    await request(giftBase, "/api/config", { assetMapping: [...config.assetMapping, mapping, walletMapping] });
+    const store = new BatchStore(path.join(giftData, "batches"));
+    const legacyRow = { ...tx, id: "old-gift", sourceTxId: "old-gift", recognition: undefined, reviewNote: "已核对" };
+    const old = store.create({ file, source: "merged", txs: [legacyRow], txCount: 1,
+      errors: [], accountsDetected: [], ledgerProfile: profileId(giftRoot, "main.bean") });
+    const oldRoute = `/api/batch/${old.batchId}`;
+    const reloaded = await request(giftBase, `${oldRoute}/recheck-ledger`, { revision: old.revision });
+    assert.equal(reloaded.batch.txs[0].fundingAccount, wallet);
+    assert.equal(reloaded.batch.txs[0].reviewNote, "已核对");
+    assert.equal(reloaded.batch.txs[0].status, "pending");
+
+    const transfer = "2026-11-06 12:01:00,转账,另一位发送人,转账,收入,56.78,/,已存入零钱,transfer-source";
+    const receipts = await upload(giftBase, [header, row("/", "new-gift"), transfer].join("\n"), file);
+    assert.deepEqual(receipts.txs.map((receipt) => [receipt.eventType, receipt.fundingAccount]), [["income", wallet], ["transfer", wallet]]);
+    const receiptRoute = `/api/batch/${receipts.batchId}`;
+    const categorized = await request(giftBase, `${receiptRoute}/decide`, {
+      revision: receipts.revision, decisions: receipts.txs.map(({ id }) => ({ id, account: income })),
+    });
+    assert.equal(categorized.ready, 2);
+    const receiptPreview = await request(giftBase, `${receiptRoute}/generate`, { revision: categorized.revision });
+    const parsedReceipts = parseLedgerText(giftDefinitions + receiptPreview.entries, python);
+    assert.deepEqual(parsedReceipts.errors, []);
+    assert.deepEqual(parsedReceipts.transactions.map(({ postings }) => postings), [12.34, 56.78].map((amount) => [
+      { account: wallet, amount, currency: "CNY" }, { account: income, amount: -amount, currency: "CNY" },
+    ]));
+
+    const counterpart = "Equity:Coupons:Payment";
+    const legacyTransfer: ParsedTx = { ...receipts.txs[1], id: "old-transfer", sourceTxId: "old-transfer", direction: "out",
+      originalDirection: "支出", sourceStatus: "对方已收钱", fundingAccount2: "Assets:CN:BOC:2222" };
+    const legBatch = store.create({ file, source: "wechat", txs: [legacyTransfer], txCount: 1,
+      errors: [], accountsDetected: [], ledgerProfile: profileId(giftRoot, "main.bean") });
+    const legRoute = `/api/batch/${legBatch.batchId}`;
+    const updatedLeg = await request(giftBase, `${legRoute}/decide`, {
+      revision: legBatch.revision, decisions: [{ id: legacyTransfer.id, account: counterpart }],
+    });
+    assert.equal(updatedLeg.batch.txs[0].fundingAccount2, counterpart);
+    const legPreview = await request(giftBase, `${legRoute}/generate`, { revision: updatedLeg.revision });
+    const leg = parseLedgerText(giftDefinitions + legPreview.entries, python);
+    assert.deepEqual(leg.errors, []);
+    assert.deepEqual(leg.transactions[0].postings, [
+      { account: wallet, amount: -56.78, currency: "CNY" }, { account: counterpart, amount: 56.78, currency: "CNY" },
+    ]);
+    passed("WeChat red envelopes and incoming transfers accept income categories and resolve the receiving wallet on reload and import");
   }
   {
     const splitRoot = path.join(temporary, "category-allocations");
@@ -1217,8 +1261,8 @@ try {
     const refundRoot = path.join(temporary, "pdf-refund-ledger");
     const refundData = path.join(temporary, "pdf-refund-data");
     const cmb = "Liabilities:CreditCard:CMB", citic = "Liabilities:CreditCard:CITIC";
-    const category = "Expenses:Food:Meals:Dine";
-    const refundDefinitions = definitions + [cmb, citic].map((account) => `2025-01-01 open ${account} CNY\n`).join("");
+    const category = "Expenses:Food:Meals:Dine", income = "Income:Adjustments";
+    const refundDefinitions = definitions + [cmb, citic, income].map((account) => `2025-01-01 open ${account} CNY\n`).join("");
     fs.mkdirSync(refundRoot);
     fs.writeFileSync(path.join(refundRoot, "main.bean"), refundDefinitions);
     const refundBase = await boot({ ...config, ledgerRoot: refundRoot, assetMapping: [
@@ -1294,9 +1338,9 @@ try {
     assert.equal(copy.duplicateOf?.id, refund.id);
     assert.equal(copy.duplicateOf?.refundCopy, "statement");
     await request(refundBase, route + "/decide", { revision: mixed.revision, decisions: [{ id: copy.id, account: category, status: "ready" }] }, 422);
-    const approved = await request(refundBase, route + "/decide", { revision: mixed.revision, decisions: [{ id: purchase.id, account: category, status: "ready" }] });
+    const approved = await request(refundBase, route + "/decide", { revision: mixed.revision, decisions: [{ id: purchase.id, account: income, status: "ready" }] });
     assert.equal(approved.ready, 2);
-    assert.equal(approved.batch.txs.find((tx: ParsedTx) => tx.id === refund.id).finalAccount, category);
+    assert.equal(approved.batch.txs.find((tx: ParsedTx) => tx.id === refund.id).finalAccount, income);
     const preview = await request(refundBase, route + "/generate", { revision: approved.revision });
     assert.equal(preview.generated, 2);
     await request(refundBase, route + "/commit", { revision: preview.revision });
@@ -1309,6 +1353,7 @@ try {
     assert.deepEqual(ledger.errors, []);
     assert.equal(ledger.transactions.length, 2);
     assert.equal(ledger.transactions.filter((entry) => entry.metadata?.["import-event"] === "refund").length, 1);
+    assert.deepEqual(ledger.transactions.map((entry) => entry.postings.find((posting) => posting.account === income)!.amount).sort((a, b) => a - b), [-38.5, 38.5]);
     passed("bank PDF refunds survive reload, follow the shared category, and post once across statements and batches");
   }
   {

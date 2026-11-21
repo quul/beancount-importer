@@ -43,22 +43,19 @@ export function transactionReviewProblems(tx: ParsedTx, postings: DraftPosting[]
   const add = (message: string, field?: ReviewProblem["field"]) => {
     if (!problems.some((problem) => problem.field === field && problem.message === message)) problems.push({ id: tx.id, field, message });
   };
-  const counterpart = tx.fundingAccount2 ? "postings" : "category";
   if (!validDate(tx.date)) add("交易日期无效");
   if (tx.excludedReason) add(`原始流水不可入账：${tx.excludedReason}`);
   if (!Number.isFinite(tx.amount) || tx.amount < 0 || (!tx.merge && tx.amount === 0)) add("交易金额须大于零");
   if (!tx.postings && (tx.fundingParts?.length ?? 0) > 1) add("请拆分组合支付", "postings");
-  if (!tx.postings && tx.eventType === "refund" && tx.finalAccount.startsWith("Income:")) add("请冲回原费用", "category");
-  if (!tx.postings && tx.eventType === "transfer" && !/^(Assets|Liabilities):/.test(tx.fundingAccount2 || tx.finalAccount)) add("请选择转账对方账户", counterpart);
   if (postings.length < 2) add("至少需要两条分录", "postings");
   const sameAccount = new Set(postings.map((posting) => posting.account)).size < 2;
   if (sameAccount && postings.every(({ account }) => isPostingAccount(account))) {
-    add("资金账户与对方账户不能相同", tx.postings ? "postings" : counterpart);
+    add("资金账户与对方账户不能相同", tx.postings ? "postings" : "category");
   }
   const totals = new Map<string, number>();
   for (const [index, posting] of postings.entries()) {
     if (!isPostingAccount(posting.account)) {
-      const field = tx.postings ? "postings" : index === 0 ? "funding" : counterpart;
+      const field = tx.postings ? "postings" : index === 0 ? "funding" : "category";
       add(posting.account ? `请选择有效账户（${posting.account}）` : missingPostingAccountMessage[field], field);
     }
     if (!currencyPattern.test(posting.currency)) add(`币种无效：${posting.currency}`, tx.postings ? "postings" : undefined);
