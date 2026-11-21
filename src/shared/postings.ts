@@ -1,4 +1,4 @@
-import { defaultNarration, type DraftPosting, type ParsedTx } from "./types.js";
+import { defaultNarration, type DraftPosting, type ParsedTx, type ReviewProblem } from "./types.js";
 
 export const accountPattern = /^(Assets|Liabilities|Equity|Income|Expenses)(?::[\p{Lu}\p{Nd}][\p{L}\p{Nd}-]*)+$/u;
 const isPostingAccount = (account: string) => accountPattern.test(account) && !/(?:^|:)(FixMe|Unknown)(?::|$)/i.test(account);
@@ -38,27 +38,41 @@ export function statusAfterCategorization(tx: ParsedTx): ParsedTx["status"] {
   return tx.status === "ready" ? "pending" : tx.status;
 }
 
-export function validateTransaction(tx: ParsedTx, postings: DraftPosting[]): string[] {
-  const errors: string[] = [];
-  if (!validDate(tx.date)) errors.push("交易日期无效");
-  if (tx.excludedReason) errors.push(`原始流水不可入账：${tx.excludedReason}`);
-  if (!Number.isFinite(tx.amount) || tx.amount < 0 || (!tx.merge && tx.amount === 0)) errors.push("交易金额须大于零");
-  if (!tx.postings && (tx.fundingParts?.length ?? 0) > 1) errors.push("请拆分组合支付");
-  if (!tx.postings && tx.eventType === "refund" && tx.finalAccount.startsWith("Income:")) errors.push("请冲回原费用");
-  if (!tx.postings && tx.eventType === "transfer" && !/^(Assets|Liabilities):/.test(tx.fundingAccount2 || tx.finalAccount)) errors.push("请选择转账对方账户");
-  if (postings.length < 2) errors.push("至少需要两条分录");
-  if (new Set(postings.map((posting) => posting.account)).size < 2) errors.push("资金账户与对方账户不能相同");
+export function transactionReviewProblems(tx: ParsedTx, postings: DraftPosting[]): ReviewProblem[] {
+  const problems: ReviewProblem[] = [];
+  const add = (message: string, field?: ReviewProblem["field"]) => {
+    if (!problems.some((problem) => problem.field === field && problem.message === message)) problems.push({ id: tx.id, field, message });
+  };
+  const counterpart = tx.fundingAccount2 ? "postings" : "category";
+  if (!validDate(tx.date)) add("交易日期无效");
+  if (tx.excludedReason) add(`原始流水不可入账：${tx.excludedReason}`);
+  if (!Number.isFinite(tx.amount) || tx.amount < 0 || (!tx.merge && tx.amount === 0)) add("交易金额须大于零");
+  if (!tx.postings && (tx.fundingParts?.length ?? 0) > 1) add("请拆分组合支付", "postings");
+  if (!tx.postings && tx.eventType === "refund" && tx.finalAccount.startsWith("Income:")) add("请冲回原费用", "category");
+  if (!tx.postings && tx.eventType === "transfer" && !/^(Assets|Liabilities):/.test(tx.fundingAccount2 || tx.finalAccount)) add("请选择转账对方账户", counterpart);
+  if (postings.length < 2) add("至少需要两条分录", "postings");
+  const sameAccount = new Set(postings.map((posting) => posting.account)).size < 2;
+  if (sameAccount && postings.every(({ account }) => isPostingAccount(account))) {
+    add("资金账户与对方账户不能相同", tx.postings ? "postings" : counterpart);
+  }
   const totals = new Map<string, number>();
-  for (const posting of postings) {
-    if (!isPostingAccount(posting.account)) errors.push(`账户无效或尚未确认：${posting.account}`);
-    if (!currencyPattern.test(posting.currency)) errors.push(`币种无效：${posting.currency}`);
-    if (!Number.isFinite(posting.amount)) errors.push("分录金额不是有效数字");
+  for (const [index, posting] of postings.entries()) {
+    if (!isPostingAccount(posting.account)) {
+      const field = tx.postings ? "postings" : index === 0 ? "funding" : counterpart;
+      add(posting.account ? `请选择有效账户（${posting.account}）` : missingPostingAccountMessage[field], field);
+    }
+    if (!currencyPattern.test(posting.currency)) add(`币种无效：${posting.currency}`, tx.postings ? "postings" : undefined);
+    if (!Number.isFinite(posting.amount)) add("分录金额不是有效数字", tx.postings ? "postings" : undefined);
     else totals.set(posting.currency, (totals.get(posting.currency) ?? 0) + Number(posting.amount.toFixed(8)));
   }
-  for (const [currency, total] of totals) if (Math.abs(total) > 0.0000001) errors.push(`${currency} 分录不平衡，差额 ${amountText(total)}`);
-  if (tx.flag && tx.flag !== "*" && tx.flag !== "!") errors.push("交易标记无效");
-  for (const tag of tx.tags ?? []) if (!/^[A-Za-z0-9][A-Za-z0-9_./-]*$/.test(tag)) errors.push(`标签无效：${tag}`);
-  return [...new Set(errors)];
+  for (const [currency, total] of totals) if (Math.abs(total) > 0.0000001) add(`${currency} 分录不平衡，差额 ${amountText(total)}`, "postings");
+  if (tx.flag && tx.flag !== "*" && tx.flag !== "!") add("交易标记无效");
+  for (const tag of tx.tags ?? []) if (!/^[A-Za-z0-9][A-Za-z0-9_./-]*$/.test(tag)) add(`标签无效：${tag}`, "tags");
+  return problems;
+}
+
+export function validateTransaction(tx: ParsedTx, postings: DraftPosting[]): string[] {
+  return [...new Set(transactionReviewProblems(tx, postings).map(({ message }) => message))];
 }
 
 export function formatTransactionHeader(tx: ParsedTx): string {

@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
-import type { AppConfig, FundingMappingChoice, FundingMappingGroup, ImportPreview, ParsedTx, TxDecision, LedgerInfo } from "../shared/types.js";
+import type { AppConfig, FundingMappingChoice, FundingMappingGroup, ImportPreview, ParsedTx, ReviewProblem, TxDecision, LedgerInfo } from "../shared/types.js";
 import { canExcludeSuspectedDuplicate, duplicateReviewIssue, MAX_NARRATION_LENGTH } from "../shared/types.js";
 import { MAX_CATEGORY_ALLOCATIONS, planCategoryAllocations, savedCategoryAllocations } from "../shared/categoryAllocations.js";
 import { activeTransactions, mergeSource, planTransactionMerge } from "../shared/transactionMerge.js";
@@ -76,24 +76,25 @@ function stats(batch: ImportPreview) {
     ready: txs.filter((tx) => tx.status === "ready").length };
 }
 
-function draftErrors(txs: ParsedTx[], ledger: LedgerInfo, opening?: Set<string>): string[] {
+function draftProblems(txs: ParsedTx[], ledger: LedgerInfo, opening: Set<string>) {
   const accounts = new Map(ledger.accounts.map((account) => [account.account, account]));
-  const errors: string[] = [];
+  const errors = new Set<string>();
+  const problems: ReviewProblem[] = [];
   for (const tx of txs.filter((tx) => tx.status === "ready")) {
-    const names = tx.postings?.length ? tx.postings.map((posting) => ({ account: posting.account, currency: posting.currency }))
-      : [tx.fundingAccount, tx.fundingAccount2 ?? tx.finalAccount].map((account) => ({ account, currency: tx.currency }));
-    for (const item of names) {
-      const defined = accounts.get(item.account), label = `${tx.sourceFile}:${tx.row}`;
-      if (!defined) {
-        if (opening?.has(item.account)) continue; // the commit will write this `open`
-        errors.push(`${label}：账户 ${item.account || "未选择"} 未在账本开户`);
-      }
-      else if ((defined.openedAt && tx.date < defined.openedAt) || (defined.closedAt && tx.date > defined.closedAt)) errors.push(`${label}：账户 ${item.account} 在交易日未生效`);
-      else if (defined.currencies?.length && !defined.currencies.includes(item.currency)) errors.push(`${label}：账户 ${item.account} 不支持币种 ${item.currency}`);
+    const add = (message: string, field: ReviewProblem["field"]) => {
+      errors.add(`${tx.sourceFile}:${tx.row}：${message}`);
+      problems.push({ id: tx.id, field, message });
+    };
+    for (const [index, { account, currency }] of transactionPostings(tx).entries()) {
+      const field = tx.postings || (index === 1 && tx.fundingAccount2) ? "postings" : index === 0 ? "funding" : "category";
+      const defined = accounts.get(account);
+      if (!defined && !opening.has(account)) add(account ? `账户 ${account} 未在账本开户` : missingPostingAccountMessage[field], field);
+      else if (defined && ((defined.openedAt && tx.date < defined.openedAt) || (defined.closedAt && tx.date > defined.closedAt))) add(`账户 ${account} 在交易日未生效`, field);
+      else if (defined?.currencies?.length && !defined.currencies.includes(currency)) add(`账户 ${account} 不支持币种 ${currency}`, field);
     }
-    if (tx.tags?.some((tag) => !TAG_RE.test(tag))) errors.push(`${tx.sourceFile}:${tx.row}：标签格式无效`);
+    if (tx.tags?.some((tag) => !TAG_RE.test(tag))) add("标签格式无效", "tags");
   }
-  return [...new Set(errors)];
+  return { errors: [...errors], problems };
 }
 
 function referenceUncommittedBatches(txs: ParsedTx[], previous: StoredBatch[]) {
@@ -706,15 +707,19 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const currentLedger = ledger(), result = generateEntries(batch.txs, batch.batchId, config);
     const defined = new Set(currentLedger.accounts.map((account) => account.account));
     const opens = suggestOpens(batch.txs, defined);
-    // draftErrors rejects undefined accounts; those the opens list will create
-    // (e.g. the family-card payer's card) are fine — commit writes the opens.
+    // Accounts in the opens list will be created when the preview is committed.
     const opening = new Set(opens.map((line) => line.split(" open ")[1]));
-    const errors = [...draftErrors(activeTransactions(batch.txs), currentLedger, opening), ...(result.errors ?? [])];
+    const draft = draftProblems(activeTransactions(batch.txs), currentLedger, opening);
+    const errors = [...draft.errors, ...(result.errors ?? [])];
     if (!result.generated.length && !errors.length) errors.push("没有标记入账的交易，请先审批");
     if (errors.length) {
       delete batch.preview;
       batches.save(batch);
-      res.status(422).json({ code: "review_incomplete", error: "请将待确认内容处理完毕后，再点击「生成预览」。", errors, details: errors, revision: batch.revision });
+      res.status(422).json({
+        code: "review_incomplete", error: "请将待确认内容处理完毕后，再点击「生成预览」。",
+        reviewProblems: [...(result.reviewProblems ?? []), ...draft.problems],
+        errors, details: errors, revision: batch.revision,
+      });
       return;
     }
     batch.preview = { revision: batch.revision, result, opens }; batches.save(batch);

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { api, ApiError } from "../web/src/api.js";
+import { api, ApiError, IncompleteReviewError } from "../web/src/api.js";
 import { draftDecision, invalidTags, makeDraft, parseTags } from "../web/src/ReviewEditor.js";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
 import { buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch } from "../web/src/reviewRows.js";
@@ -139,20 +139,26 @@ try {
   const bulkRows = buildReviewRows([pendingPurchase, pendingRefund, missing, duplicate]);
   assert.deepEqual(buildBulkPostingPlan(bulkRows, accounts, new Set([pendingPurchase.id, pendingRefund.id])), {
     approvals: [{ id: pendingPurchase.id, account: "Expenses:Food", status: "ready" }],
-    exclusionIds: [pendingPurchase.id, pendingRefund.id], followedRefundIds: [pendingRefund.id], needsReview: 0,
+    approvalCount: 1, exclusionIds: [pendingPurchase.id, pendingRefund.id], followedRefundIds: [pendingRefund.id], reviewTargets: [],
   });
   assert.deepEqual(buildBulkPostingPlan(bulkRows, accounts), {
     approvals: [{ id: pendingPurchase.id, account: "Expenses:Food", status: "ready" }],
-    exclusionIds: [pendingPurchase.id, pendingRefund.id, missing.id], followedRefundIds: [pendingRefund.id], needsReview: 1,
+    approvalCount: 1, exclusionIds: [pendingPurchase.id, pendingRefund.id, missing.id], followedRefundIds: [pendingRefund.id],
+    reviewTargets: [{ id: missing.id, field: "category" }],
   });
   const needsRefundReview = buildReviewRows([pendingPurchase, { ...pendingRefund, issues: [LEDGER_DUPLICATE_ISSUE] }]);
-  assert.deepEqual(buildBulkPostingPlan(needsRefundReview, accounts).approvals, []);
+  assert.deepEqual(buildBulkPostingPlan(needsRefundReview, accounts).reviewTargets, [{ id: pendingRefund.id }]);
   console.log("✓ bulk decisions honor the scope, keep paired refunds automatic, and leave unresolved rows for review");
 
   status = 422;
   const reviewReminder = "请将待确认内容处理完毕后，再点击「生成预览」。";
-  nextResponse = { code: "review_incomplete", error: reviewReminder, errors: ["微信支付账单.xlsx:50 请选择转账对方账户"] };
-  await assert.rejects(() => api.generate("batch", 8), (error: unknown) => error instanceof ApiError && error.status === 422 && error.message === reviewReminder);
+  const reviewProblems = [{ id: "transfer", field: "category", message: "请选择转账对方账户" }];
+  nextResponse = { code: "review_incomplete", error: reviewReminder, reviewProblems, errors: ["微信支付账单.xlsx:50 请选择转账对方账户"] };
+  await assert.rejects(() => api.generate("batch", 8), (error: unknown) => {
+    if (!(error instanceof IncompleteReviewError) || error.status !== 422 || error.message !== reviewReminder) return false;
+    assert.deepEqual(error.problems, reviewProblems);
+    return true;
+  });
   nextResponse = { error: "校验未通过", details: [{ file: "fixture.bean", line: 12, message: "账户未开户" }] };
   await assert.rejects(() => api.generate("batch", 8), (error: unknown) => error instanceof ApiError && error.status === 422 && /fixture.bean:12/.test(error.message) && /账户未开户/.test(error.message));
   status = 409; nextResponse = { error: "版本已更新" };

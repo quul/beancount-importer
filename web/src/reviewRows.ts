@@ -1,9 +1,10 @@
 import { isFundingAccount } from "../../src/shared/funding.js";
-import { fundingPostingSign, transactionPostings, validateTransaction } from "../../src/shared/postings.js";
+import { fundingPostingSign, transactionPostings, transactionReviewProblems } from "../../src/shared/postings.js";
 import { activeTransactions } from "../../src/shared/transactionMerge.js";
-import { canFollowPurchaseRefund, isSuspectedDuplicate, type ParsedTx, type TxDecision, type TxStatus } from "../../src/shared/types.js";
+import { canFollowPurchaseRefund, isSuspectedDuplicate, type ParsedTx, type ReviewProblem, type TxDecision, type TxStatus } from "../../src/shared/types.js";
 
 export type ReviewFilter = "all" | "suspectedDuplicate" | TxStatus;
+export type ReviewTarget = Pick<ReviewProblem, "id" | "field">;
 export interface ReviewDateRange { start: string; end: string; }
 export const EMPTY_REVIEW_DATE_RANGE: ReviewDateRange = { start: "", end: "" };
 
@@ -57,21 +58,28 @@ export function isEditablePostingStatus(tx: ParsedTx): boolean {
   return tx.status === "ready" || tx.status === "pending";
 }
 
-function approvalDecision(tx: ParsedTx, accounts: ReadonlySet<string>): TxDecision | undefined {
+function planApproval(tx: ParsedTx, accounts: ReadonlySet<string>): { decision: TxDecision } | { target: ReviewTarget } {
   const finalAccount = tx.finalAccount || tx.suggestedAccount || "";
   const reviewed = finalAccount === tx.finalAccount ? tx : { ...tx, finalAccount };
   const postings = transactionPostings(reviewed);
-  if (postings.some((posting) => !accounts.has(posting.account)) || validateTransaction(reviewed, postings).length) return;
-  return !tx.postings && !tx.fundingAccount2 && finalAccount !== tx.finalAccount
+  const problems = transactionReviewProblems(reviewed, postings);
+  if (problems.length) return { target: { id: tx.id, field: problems.find(({ field }) => field)?.field } };
+  const missing = postings.findIndex(({ account }) => !accounts.has(account));
+  if (missing !== -1) {
+    return { target: { id: tx.id, field: tx.postings || (missing === 1 && tx.fundingAccount2) ? "postings" : missing === 0 ? "funding" : "category" } };
+  }
+  const decision: TxDecision = !tx.postings && !tx.fundingAccount2 && finalAccount !== tx.finalAccount
     ? { id: tx.id, account: finalAccount, status: "ready" }
     : { id: tx.id, status: "ready" };
+  return { decision };
 }
 
 export function buildBulkPostingPlan(rows: readonly ReviewRow[], accounts: ReadonlySet<string>, selected?: ReadonlySet<string>) {
   const approvals: TxDecision[] = [];
   const exclusionIds: string[] = [];
   const followedRefundIds: string[] = [];
-  let needsReview = 0;
+  const reviewTargets: ReviewTarget[] = [];
+  let approvalCount = 0;
   for (const { tx, refund, entries } of rows) {
     const targets = selected ? entries.filter((entry) => selected.has(entry.id)) : entries;
     exclusionIds.push(...targets.filter(isEditablePostingStatus).map((entry) => entry.id));
@@ -80,22 +88,43 @@ export function buildBulkPostingPlan(rows: readonly ReviewRow[], accounts: Reado
 
     if (refund && targets.length === 2 && candidates.includes(refund) && canFollowPurchaseRefund(refund)
       && (tx.status === "ready" || candidates.includes(tx)) && !tx.postings && !tx.fundingAccount2) {
-      const purchase = approvalDecision(tx, accounts);
-      const category = purchase?.account ?? tx.finalAccount;
-      if (purchase && category.startsWith("Expenses:") && !isSuspectedDuplicate(refund)
-        && approvalDecision({ ...refund, finalAccount: category }, accounts)) {
-        // The server applies the expense category to the refund when it saves the purchase.
-        approvals.push(purchase);
-        followedRefundIds.push(refund.id);
-      } else needsReview++;
+      const purchase = planApproval(tx, accounts);
+      if ("target" in purchase) { reviewTargets.push(purchase.target); continue; }
+      const category = purchase.decision.account ?? tx.finalAccount;
+      if (!category.startsWith("Expenses:")) { reviewTargets.push({ id: tx.id, field: "category" }); continue; }
+      if (isSuspectedDuplicate(refund)) { reviewTargets.push({ id: refund.id }); continue; }
+      const refundPlan = planApproval({ ...refund, finalAccount: category }, accounts);
+      if ("target" in refundPlan) { reviewTargets.push(refundPlan.target); continue; }
+      // The server applies the expense category to the refund when it saves the purchase.
+      approvals.push(purchase.decision);
+      followedRefundIds.push(refund.id);
+      approvalCount++;
       continue;
     }
 
-    const decisions = candidates.map((entry) => approvalDecision(entry, accounts));
-    if (decisions.every((decision) => decision !== undefined)) approvals.push(...decisions);
-    else needsReview++;
+    const plans = candidates.map((entry) => planApproval(entry, accounts));
+    const blocked = plans.find((plan) => "target" in plan);
+    if (blocked) reviewTargets.push(blocked.target);
+    else {
+      approvals.push(...plans.flatMap((plan) => "decision" in plan ? [plan.decision] : []));
+      approvalCount++;
+    }
   }
-  return { approvals, exclusionIds, followedRefundIds, needsReview };
+  return { approvals, approvalCount, exclusionIds, followedRefundIds, reviewTargets };
+}
+
+export function remainingReviewProblems(problems: ReviewProblem[], before: ParsedTx[], after: ParsedTx[]): ReviewProblem[] {
+  const previous = new Map(before.map((tx) => [tx.id, tx]));
+  const current = new Map(activeTransactions(after).map((tx) => [tx.id, tx]));
+  return problems.filter(({ id, field }) => {
+    const original = previous.get(id), updated = current.get(id);
+    if (!original || updated?.status !== "ready") return false;
+    if (field === "funding") return original.fundingAccount === updated.fundingAccount && Boolean(original.postings) === Boolean(updated.postings);
+    if (field === "category") return original.finalAccount === updated.finalAccount && Boolean(original.postings) === Boolean(updated.postings);
+    if (field === "postings") return original.fundingAccount2 === updated.fundingAccount2 && JSON.stringify(original.postings) === JSON.stringify(updated.postings);
+    if (field === "tags") return JSON.stringify(original.tags) === JSON.stringify(updated.tags);
+    return original.date === updated.date && original.amount === updated.amount && original.currency === updated.currency && original.flag === updated.flag;
+  });
 }
 
 export function matchesReviewFilter(row: ReviewRow, filter: ReviewFilter): boolean {

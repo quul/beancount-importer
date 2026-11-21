@@ -1,6 +1,6 @@
 /** Generate only reviewed, balanced transactions; provenance makes later imports auditable. */
-import type { GenerateResult, ParsedTx } from "../../shared/types.js";
-import { accountPattern, amountText, currencyPattern, formatTransactionEntry, transactionPostings, validDate, validateTransaction } from "../../shared/postings.js";
+import type { GenerateResult, ParsedTx, ReviewProblem } from "../../shared/types.js";
+import { accountPattern, amountText, currencyPattern, formatTransactionEntry, transactionPostings, transactionReviewProblems, validDate } from "../../shared/postings.js";
 import { activeTransactions } from "../../shared/transactionMerge.js";
 import { loadWechatRules, wechatExclusionReason } from "../parsers/wechat-rules.js";
 import { importTarget, type ImportLayout } from "./import-paths.js";
@@ -11,6 +11,7 @@ export function generateEntries(txs: ParsedTx[], batchId: string | undefined, la
 export function generateEntries(txs: ParsedTx[], batchId?: string): GenerateResult;
 export function generateEntries(txs: ParsedTx[], batchId?: string, layout?: ImportLayout): GenerateResult {
   const monthFiles: Record<string, string> = {}, generated: string[] = [], errors: string[] = [];
+  const reviewProblems: ReviewProblem[] = [];
   const files: NonNullable<GenerateResult["files"]> = {};
   const append = (date: string, source: ParsedTx["source"], account: string, body: string) => {
     const month = date.slice(0, 7).replace("-", "");
@@ -29,9 +30,14 @@ export function generateEntries(txs: ParsedTx[], batchId?: string, layout?: Impo
   for (const tx of ready) {
     const members = tx.merge ? tx.merge.originals.map(({ id }) => originalsById.get(id)) : [tx];
     const exclusion = members.map((member) => member ? wechatExclusionReason(member, wechatRules) : "合并组缺少原交易").find(Boolean);
-    if (exclusion) { errors.push(`${tx.sourceFile}:${tx.row} ${exclusion}，请重新载入批次以更新排除项`); continue; }
-    const postings = transactionPostings(tx), validation = validateTransaction(tx, postings);
-    if (validation.length) { errors.push(...validation.map((error) => `${tx.sourceFile}:${tx.row} ${error}`)); continue; }
+    const postings = transactionPostings(tx);
+    const problems = exclusion ? [{ id: tx.id, message: `${exclusion}，请重新载入批次以更新排除项` }]
+      : transactionReviewProblems(tx, postings);
+    if (problems.length) {
+      reviewProblems.push(...problems);
+      errors.push(...new Set(problems.map(({ message }) => `${tx.sourceFile}:${tx.row} ${message}`)));
+      continue;
+    }
     const account = tx.merge ? tx.fundingAccount || "merged" : postings.find((posting) => posting.account === tx.fundingAccount)?.account
       ?? postings.find((posting) => /^(Assets|Liabilities):/.test(posting.account))?.account
       ?? postings[0].account;
@@ -71,7 +77,8 @@ export function generateEntries(txs: ParsedTx[], batchId?: string, layout?: Impo
   const sortedFiles = Object.fromEntries(Object.entries(files).sort(([a], [b]) => a.localeCompare(b)));
   const sections = layout ? Object.entries(sortedFiles).map(([file, { body }]) => [file, body]) : Object.entries(sortedMonths);
   return { entries: sections.map(([file, body]) => `; ===== ${file} =====\n${body}`).join("\n"),
-    monthFiles: sortedMonths, ...(layout ? { files: sortedFiles } : {}), generated, errors, opens: [] };
+    monthFiles: sortedMonths, ...(layout ? { files: sortedFiles } : {}), generated, errors,
+    ...(reviewProblems.length > 0 && { reviewProblems }), opens: [] };
 }
 
 /** Open each new account no later than its earliest referenced transaction. */

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import type { AppConfig, CategoryAllocation, EventType, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerMatch, ParsedTx, TxDecision, TxStatus } from "../../src/shared/types.js";
+import type { AppConfig, CategoryAllocation, EventType, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerMatch, ParsedTx, ReviewProblem, TxDecision, TxStatus } from "../../src/shared/types.js";
 import {
   canExcludeSuspectedDuplicate, canFollowPurchaseRefund, CROSS_SOURCE_ISSUE, defaultNarration, hasPdfSource, isSuspectedDuplicate,
   LEDGER_DUPLICATE_ISSUE, MAX_NARRATION_LENGTH, PDF_REVIEW_ISSUE,
@@ -8,7 +8,7 @@ import { MAX_CATEGORY_ALLOCATIONS, savedCategoryAllocations, supportsCategoryAll
 import { amountText, missingPostingAccount, missingPostingAccountMessage } from "../../src/shared/postings.js";
 import { accountIsActive, hasFundingPosting, isFundingAccount, reusablePaymentMethod } from "../../src/shared/funding.js";
 import { activeTransactions } from "../../src/shared/transactionMerge.js";
-import { api, ApiError, type BatchSummary, type ConfigResponse, type GeneratedPreview, type LedgerSummary, type MergeDraft } from "./api";
+import { api, ApiError, IncompleteReviewError, type BatchSummary, type ConfigResponse, type GeneratedPreview, type LedgerSummary, type MergeDraft } from "./api";
 import ReviewEditor, { draftDecision, invalidTags, makeDraft, parseTags, TransactionSourceDetails, type ReviewDraft } from "./ReviewEditor";
 import AccountSelect from "./AccountSelect";
 import BeancountCode from "./BeancountCode";
@@ -24,7 +24,7 @@ import TransactionFlag from "./TransactionFlag";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "./reviewChanges";
 import {
   buildBulkPostingPlan, buildReviewRows, EMPTY_REVIEW_DATE_RANGE, isEditablePostingStatus, matchesReviewDateRange,
-  matchesReviewFilter, matchesReviewSearch, type ReviewFilter, type ReviewRow,
+  matchesReviewFilter, matchesReviewSearch, remainingReviewProblems, type ReviewFilter, type ReviewRow, type ReviewTarget,
 } from "./reviewRows";
 
 const STATUS_TABS: Array<{ key: ReviewFilter; label: string }> = [
@@ -51,6 +51,7 @@ const DECISION_LABELS: Record<TxStatus, string> = { pending: "待确认", ready:
 const operationMessage = (failure: unknown) => failure instanceof ApiError ? failure.message : "暂时无法完成操作。请重试。";
 const EVENT_LABELS: Record<EventType, string> = { expense: "支出", income: "收入", refund: "退款", transfer: "转账", familyCard: "亲情卡", unknown: "待识别" };
 const PAGE_SIZE = 50;
+const DETAIL_DRAWER_QUERY = "(max-width: 1360px)";
 const fmt = (amount: number) => amount.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const batchTime = (createdAt: number) => new Date(createdAt).toLocaleString("zh-CN");
 const postingStatusLabel = (tx: ParsedTx, readOnly: boolean) => readOnly && tx.status === "ready" ? "已入账" : DECISION_LABELS[tx.status];
@@ -61,6 +62,7 @@ type TransactionDraft = { value: ReviewDraft; original: ReviewDraft };
 type DeleteTarget = Pick<BatchSummary, "batchId" | "file" | "revision"> & { createdAt?: number };
 type ReviewOpening = "import" | "resume" | "reload";
 type FundingTarget = { id: string; batch: ImportPreview; opening: ReviewOpening; groups: FundingMappingGroup[] };
+type PreviewCheck = { message: string; problems: ReviewProblem[] };
 
 const reviewIcons = {
   info: <><circle cx="10" cy="10" r="7.6" /><path d="M10 9.5v4" /><circle cx="10" cy="6.8" r=".9" fill="currentColor" stroke="none" /></>,
@@ -159,18 +161,30 @@ function HeaderDetails({ config, ledger, batch }: { config: ConfigResponse | nul
   </details>;
 }
 
-function HistoryMatch({ match, disabled, onApply, onAdopt, onExclude, counterpart, hasPostings }: {
+function duplicateEvidence(tx: ParsedTx): LedgerMatch | undefined {
+  return isSuspectedDuplicate(tx) ? tx.matches?.find(({ reason }) => !/^(历史分类参考|转账配对建议|未提交批次已有此交易)/.test(reason)) : undefined;
+}
+
+function HistoryMatch({ match, disabled, onApply, onAdopt, onExclude, counterpart, hasPostings, duplicate }: {
   match: LedgerMatch; disabled: boolean; onApply: (account: string) => void;
   onAdopt: () => void; onExclude: () => void; counterpart?: ParsedTx; hasPostings: boolean;
+  duplicate?: { tx: ParsedTx; label: string };
 }) {
   const category = match.postings.find((posting) => /^(Expenses|Income):/.test(posting.account))?.account;
   const transfer = match.reason.startsWith("转账配对建议");
-  return <article className="history-match">
-    <div className="toolbar"><b>{match.date} · {match.payee || "（无商户）"}</b>{category && <button className="btn small" disabled={disabled || hasPostings} onClick={() => onApply(category)}>沿用分类</button>}</div>
-    <div>{match.narration}</div><p className="reason">{match.reason}</p>
+  const matchedPayment = duplicate && match.postings.find(({ account, currency }) =>
+    account === duplicate.tx.fundingAccount && currency === duplicate.tx.currency);
+  const postings = <>
     <div className="history-postings">{match.postings.map((posting, index) => <div key={index}><code>{posting.account}</code><span>{fmt(posting.amount)} {posting.currency}</span></div>)}</div>
-    {transfer && <><p className="reason">采用后排除另一笔。</p><div className="toolbar"><button className="btn primary small" disabled={disabled} onClick={onAdopt}>采用分录</button>{counterpart && <button className="btn small" disabled={disabled || counterpart.status === "excluded"} onClick={onExclude}>{counterpart.status === "excluded" ? "已排除另一笔" : "排除另一笔"}</button>}</div></>}
     <div className="source-details">{match.file ? `${match.file}${match.line ? `:${match.line}` : ""}` : "历史账本"}<br />ID：{match.id}</div>
+  </>;
+  return <article className={duplicate ? "history-match duplicate-evidence" : "history-match"}>
+    {duplicate && <div className="duplicate-evidence-label">{duplicate.label}</div>}
+    <div className="toolbar"><b>{match.date} · {match.payee || "（无商户）"}</b>{category && <button className="btn small" disabled={disabled || hasPostings} onClick={() => onApply(category)}>沿用分类</button>}</div>
+    {matchedPayment && <strong className="duplicate-evidence-amount">{fmt(Math.abs(matchedPayment.amount))} {matchedPayment.currency}</strong>}
+    {match.narration && match.narration !== match.payee && <div>{match.narration}</div>}<p className="reason">{match.reason}</p>
+    {duplicate ? <details><summary>查看对照分录</summary>{postings}</details> : postings}
+    {transfer && <><p className="reason">采用后排除另一笔。</p><div className="toolbar"><button className="btn primary small" disabled={disabled} onClick={onAdopt}>采用分录</button>{counterpart && <button className="btn small" disabled={disabled || counterpart.status === "excluded"} onClick={onExclude}>{counterpart.status === "excluded" ? "已排除另一笔" : "排除另一笔"}</button>}</div></>}
   </article>;
 }
 
@@ -178,6 +192,8 @@ export default function App() {
   const [config, setConfig] = useState<ConfigResponse | null>(null);
   const [ledger, setLedger] = useState<LedgerSummary | null>(null);
   const [batches, setBatches] = useState<BatchSummary[]>([]);
+  const [batchesRefreshing, setBatchesRefreshing] = useState(false);
+  const [uploading, setUploading] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [fundingTarget, setFundingTarget] = useState<FundingTarget | null>(null);
   const [mappingTarget, setMappingTarget] = useState<ParsedTx | null>(null);
@@ -185,6 +201,7 @@ export default function App() {
   const [batchId, setBatchId] = useState("");
   const [routedBatchId, setRoutedBatchId] = useState(batchIdFromUrl);
   const [preview, setPreview] = useState<GeneratedPreview | null>(null);
+  const [previewCheck, setPreviewCheck] = useState<PreviewCheck | null>(null);
   const [busy, setBusy] = useState(true);
   const [pendingSaves, setPendingSaves] = useState<ReviewPatches[]>([]);
   const [rowFocusedDuringSave, setRowFocusedDuringSave] = useState<string>();
@@ -197,6 +214,8 @@ export default function App() {
   const [sort, setSort] = useState<"date" | "amount" | "payee">("date");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [detailTxId, setDetailTxId] = useState<string | null>(null);
+  const [detailAsDrawer, setDetailAsDrawer] = useState(() => window.matchMedia(DETAIL_DRAWER_QUERY).matches);
+  const [reviewFocus, setReviewFocus] = useState<ReviewTarget | null>(null);
   const [categoryAdvance, setCategoryAdvance] = useState<CategoryAdvance | null>(null);
   const [drafts, setDrafts] = useState<Record<string, TransactionDraft>>({});
   const [allocationDrafts, setAllocationDrafts] = useState<Record<string, CategoryAllocation[]>>({});
@@ -214,10 +233,14 @@ export default function App() {
   const searchInput = useRef<HTMLInputElement>(null);
   const tableScroll = useRef<HTMLDivElement>(null);
   const detailHeading = useRef<HTMLHeadingElement>(null);
+  const detailDialog = useRef<HTMLDialogElement>(null);
   const focusDetailHeading = useRef(false);
   const previewHeading = useRef<HTMLHeadingElement>(null);
+  const previewRepairButton = useRef<HTMLButtonElement>(null);
+  const focusPreviewRepair = useRef(false);
   const deleteDialog = useRef<HTMLDialogElement>(null);
   const locked = useRef(false);
+  const batchListRequest = useRef<AbortController | null>(null);
   const decisionQueue = useRef(Promise.resolve());
   const batchRef = useRef<ImportPreview | null>(null);
   const batchIdRef = useRef("");
@@ -233,6 +256,14 @@ export default function App() {
   };
 
   const replaceBatch = (value: ImportPreview | null, id = batchIdRef.current) => {
+    const previous = batchRef.current;
+    if (value && previous && batchIdRef.current === id && !value.committed) {
+      setPreviewCheck((check) => {
+        if (!check) return null;
+        const problems = remainingReviewProblems(check.problems, previous.txs, value.txs);
+        return !problems.length ? null : problems.length === check.problems.length ? check : { ...check, problems };
+      });
+    } else setPreviewCheck(null);
     batchRef.current = value;
     batchIdRef.current = id;
     setBatch(value);
@@ -270,10 +301,34 @@ export default function App() {
   const perform = async (work: () => Promise<void>) => {
     if (locked.current) return;
     locked.current = true;
+    if (batchListRequest.current) {
+      batchListRequest.current.abort();
+      batchListRequest.current = null;
+      setBatchesRefreshing(false);
+    }
     setBusy(true);
     setError("");
     try { await work(); } catch (failure) { await handleError(failure); }
     finally { locked.current = false; setBusy(false); }
+  };
+
+  const refreshBatchList = async () => {
+    if (locked.current || batchListRequest.current) return;
+    const request = new AbortController();
+    batchListRequest.current = request;
+    setBatchesRefreshing(true);
+    setError("");
+    try {
+      const current = await api.batches(request.signal);
+      if (!request.signal.aborted) setBatches(current);
+    } catch (failure) {
+      if (!request.signal.aborted) setError(operationMessage(failure));
+    } finally {
+      if (batchListRequest.current === request) {
+        batchListRequest.current = null;
+        setBatchesRefreshing(false);
+      }
+    }
   };
 
   useEffect(() => {
@@ -313,7 +368,12 @@ export default function App() {
     return () => window.removeEventListener("keydown", keyboard);
   }, []);
 
-  useEffect(() => { setPage(0); }, [filter, dateRange, statusFilter, sort, batchId]);
+  useEffect(() => {
+    const query = window.matchMedia(DETAIL_DRAWER_QUERY);
+    const resize = () => setDetailAsDrawer(query.matches);
+    query.addEventListener("change", resize);
+    return () => query.removeEventListener("change", resize);
+  }, []);
 
   useEffect(() => {
     const dialog = deleteDialog.current;
@@ -326,6 +386,22 @@ export default function App() {
   const txs = useMemo(() => applyPendingReviewPatches(batch?.txs ?? [], pendingSaves), [batch?.txs, pendingSaves]);
   const reviewRows = useMemo(() => buildReviewRows(txs), [txs]);
   const detailRow = detailTxId ? reviewRows.find(({ tx }) => tx.id === detailTxId) : undefined;
+  const previewProblems = useMemo(() => {
+    const byId = new Map<string, ReviewProblem[]>();
+    for (const problem of previewCheck?.problems ?? []) {
+      const problems = byId.get(problem.id) ?? [];
+      problems.push(problem);
+      byId.set(problem.id, problems);
+    }
+    return byId;
+  }, [previewCheck]);
+  const previewTargets = useMemo(() => previewProblems.size ? reviewRows.flatMap(({ entries }) => {
+    const problems = entries.flatMap(({ id }) => previewProblems.get(id) ?? []);
+    const target = problems.find(({ field }) => field) ?? problems[0];
+    return target ? [target] : [];
+  }) : [], [previewProblems, reviewRows]);
+  const fieldProblem = (id: string, field: ReviewProblem["field"]) =>
+    previewProblems.get(id)?.find((problem) => problem.field === field)?.message;
   const active = useMemo(() => activeTransactions(txs), [txs]);
   const accounts = ledger?.accounts ?? [];
   const readOnly = Boolean(batch?.committed);
@@ -369,6 +445,11 @@ export default function App() {
   const showDecisionStatus = statusFilter === "all";
 
   useLayoutEffect(() => {
+    // A repair request chooses its own page after any filters change.
+    if (!reviewFocus) setPage(0);
+  }, [filter, dateRange, statusFilter, sort, batchId]);
+
+  useLayoutEffect(() => {
     if (!rowFocusedDuringSave) return;
     if (focusedRowIndex >= 0 && page !== currentPage) {
       setPage(currentPage);
@@ -382,20 +463,63 @@ export default function App() {
   }, [batchId, currentPage, dateRange, filter, sort, statusFilter]);
 
   useLayoutEffect(() => {
-    if (!settings && detailRow && focusDetailHeading.current) {
+    if (settings || !detailRow) return;
+    const dialog = detailDialog.current;
+    const openingDrawer = Boolean(dialog && !dialog.open);
+    if (openingDrawer) dialog?.showModal();
+    if (openingDrawer || focusDetailHeading.current) {
       focusDetailHeading.current = false;
       detailHeading.current?.focus({ preventScroll: true });
     }
-  }, [detailRow, settings]);
+  }, [detailAsDrawer, detailRow, settings]);
 
   useLayoutEffect(() => {
     if (preview) previewHeading.current?.focus();
   }, [preview]);
 
   useLayoutEffect(() => {
+    if (previewCheck && focusPreviewRepair.current && previewRepairButton.current) {
+      focusPreviewRepair.current = false;
+      previewRepairButton.current.focus();
+    }
+  }, [previewCheck]);
+
+  useLayoutEffect(() => {
+    if (!reviewFocus || busy || settings) return;
+    const index = visible.findIndex(({ entries }) => entries.some(({ id }) => id === reviewFocus.id));
+    if (index < 0) { setReviewFocus(null); return; }
+    const targetPage = Math.floor(index / PAGE_SIZE);
+    if (currentPage !== targetPage) { setPage(targetPage); return; }
+    const row = visible[index];
+    const { id, field } = reviewFocus;
+    const tableRow = document.getElementById(`review-row-${row.tx.id}`);
+    const inRefundDetail = id !== row.tx.id || Boolean(row.refund?.postings && (field === "category" || field === "funding"));
+    const inDetail = inRefundDetail || field === "postings" || field === "tags";
+    if (inDetail && detailTxId !== row.tx.id) {
+      tableRow?.scrollIntoView({ block: "nearest" });
+      setDetailTxId(row.tx.id);
+      return;
+    }
+    if (!inDetail && detailAsDrawer && detailTxId) {
+      detailDialog.current?.close();
+      setDetailTxId(null);
+    }
+    let input: HTMLElement | null = null;
+    if (field === "category") input = document.getElementById(categoryInputId(id, inRefundDetail));
+    if (field === "funding") input = document.getElementById(fundingInputId(id, inRefundDetail));
+    if (field === "tags" || field === "postings") input = document.getElementById(`review-${field}-${id}`);
+    const leg = inRefundDetail || row.refund ? document.getElementById(`refund-leg-${id}`) : null;
+    if (inDetail && leg) leg.querySelector("details.refund-leg-actions")?.setAttribute("open", "");
+    const target = input ?? (inDetail ? leg ?? detailHeading.current : tableRow);
+    target?.scrollIntoView({ block: "nearest" });
+    target?.focus({ preventScroll: true });
+    setReviewFocus(null);
+  }, [busy, currentPage, detailAsDrawer, detailTxId, reviewFocus, settings, visible]);
+
+  useLayoutEffect(() => {
     if (!categoryAdvance || busy) return;
     const active = document.activeElement;
-    if (!settings && !readOnly && (active === document.body || active === categoryAdvance.origin)) {
+    if (!settings && !readOnly && (active === document.body || active === categoryAdvance.origin || active === detailHeading.current)) {
       for (const [index, row] of visible.entries()) {
         if (!categoryAdvance.rowIds.has(row.tx.id) || row.entries.some((entry) => drafts[entry.id] || allocationDrafts[entry.id])) continue;
         const target = pendingCategory(row);
@@ -406,6 +530,10 @@ export default function App() {
           setDetailTxId(row.tx.id);
           return;
         }
+        if (!target.detail && detailAsDrawer && detailTxId) {
+          detailDialog.current?.close();
+          setDetailTxId(null);
+        }
         const input = document.getElementById(categoryInputId(target.id, target.detail));
         input?.closest("details.refund-leg-actions")?.setAttribute("open", "");
         input?.focus();
@@ -413,7 +541,7 @@ export default function App() {
       }
     }
     setCategoryAdvance(null);
-  }, [allocationDrafts, busy, categoryAdvance, currentPage, detailTxId, drafts, readOnly, settings, visible]);
+  }, [allocationDrafts, busy, categoryAdvance, currentPage, detailAsDrawer, detailTxId, drafts, readOnly, settings, visible]);
   const suspectedEntries = active.filter(canExcludeSuspectedDuplicate);
 
   const selectTransactions = (transactions: ParsedTx[], checked: boolean) => {
@@ -426,9 +554,22 @@ export default function App() {
   };
 
   const closeDetails = () => {
+    detailDialog.current?.close();
     setDetailTxId(null);
     const trigger = document.getElementById(`detail-toggle-${detailTxId}`) ?? searchInput.current;
     trigger?.focus({ preventScroll: true });
+  };
+
+  const revealReviewTarget = (targets: ReviewTarget[]) => {
+    const byId = new Map(targets.map((target) => [target.id, target]));
+    const row = visible.find(({ entries }) => entries.some(({ id }) => byId.has(id)))
+      ?? reviewRows.find(({ entries }) => entries.some(({ id }) => byId.has(id)));
+    const entry = row?.entries.find(({ id }) => byId.has(id));
+    if (!row || !entry) return;
+    if (!matchesReviewFilter(row, statusFilter)) setStatusFilter(entry.status);
+    if (!matchesReviewDateRange(row, dateRange)) setDateRange(EMPTY_REVIEW_DATE_RANGE);
+    if (!matchesReviewSearch(row, filter.trim().toLowerCase())) setFilter("");
+    setReviewFocus(byId.get(entry.id)!);
   };
 
   const startReview = (id: string, value: ImportPreview, resumed: boolean) => {
@@ -437,6 +578,8 @@ export default function App() {
     setMergeIds(null);
     setPdfPreviewTx(null);
     replaceBatch(value, id);
+    setPreviewCheck(null);
+    setReviewFocus(null);
     setDrafts({}); setAllocationDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null);
     setFilter(""); setDateRange(EMPTY_REVIEW_DATE_RANGE); setStatusFilter(value.committed ? "all" : "pending");
     setBulkScope("selected"); setBulkTags("");
@@ -507,7 +650,8 @@ export default function App() {
     const selectedFiles = [...files];
     if (fileInput.current) fileInput.current.value = "";
     void perform(async () => {
-      const result = await api.upload(selectedFiles);
+      setUploading(true);
+      const result = await api.upload(selectedFiles).finally(() => setUploading(false));
       const { file, createdAt, revision, committed, txCount } = result.preview;
       const saved = { batchId: result.batchId, file, createdAt, revision, committed, txCount };
       setBatches((previous) => [saved, ...previous.filter((item) => item.batchId !== saved.batchId)]);
@@ -723,10 +867,18 @@ export default function App() {
     await decisionQueue.current;
     const current = batchRef.current;
     if (!current || current.committed) return;
-    const result = await api.generate(batchIdRef.current, current.revision ?? 0);
-    setPreview(result);
-    if (result.errors?.length) setError(result.errors.join("；"));
-    else setNotice("");
+    setPreview(null);
+    setPreviewCheck(null);
+    try {
+      const result = await api.generate(batchIdRef.current, current.revision ?? 0);
+      setPreview(result);
+      if (result.errors?.length) setError(result.errors.join("；"));
+      else setNotice("");
+    } catch (failure) {
+      if (!(failure instanceof IncompleteReviewError) || !failure.problems.length) throw failure;
+      focusPreviewRepair.current = true;
+      setPreviewCheck({ message: failure.message, problems: failure.problems });
+    }
   });
 
   const commit = () => void perform(async () => {
@@ -745,19 +897,31 @@ export default function App() {
     setFundingTarget(null);
     setPdfPreviewTx(null);
     setMappingTarget(null);
+    setReviewFocus(null);
   };
 
   useEffect(() => {
     if (busy || (settings && routedBatchId) || routedBatchId === (fundingTarget?.id ?? batchId)) return;
+    if (!routedBatchId) {
+      void decisionQueue.current.then(() => {
+        if (batchIdFromUrl() || locked.current) return;
+        const id = batchIdRef.current;
+        const current = batchRef.current;
+        if (id && current?.revision !== undefined) {
+          const { revision, committed } = current;
+          setBatches((previous) => previous.map((item) => item.batchId === id ? { ...item, revision, committed: Boolean(committed) } : item));
+        }
+        clearReview();
+        setNotice("");
+        void refreshBatchList();
+      });
+      return;
+    }
     void perform(async () => {
       await decisionQueue.current;
       if (batchIdFromUrl() !== routedBatchId) return;
       clearReview();
       setNotice("");
-      if (!routedBatchId) {
-        setBatches(await api.batches());
-        return;
-      }
       try {
         await loadReview(routedBatchId, "resume");
       } catch (failure) {
@@ -818,6 +982,15 @@ export default function App() {
     const payee = tx.payee || "（无商户）";
     const fundingRows = refund ? [tx, refund] : [tx];
     const accountDisabled = disabled || Boolean(tx.postings || refund?.postings);
+    const isTransfer = tx.eventType === "transfer" && !tx.fundingAccount2;
+    const categoryLabel = isTransfer ? "对方账户" : "分类账户";
+    const categoryError = fieldProblem(tx.id, "category");
+    const fundingError = fieldProblem(tx.id, "funding");
+    const category = tx.finalAccount || (categoryError ? "" : tx.suggestedAccount);
+    const categoryOptions = refund || isTransfer || categoryError ? accounts.filter((option) =>
+      (!refund || option.account.startsWith("Expenses:") || option.account === tx.finalAccount)
+      && (!isTransfer || /^(Assets|Liabilities):/.test(option.account))
+      && (!categoryError || (option.account !== tx.fundingAccount && accountIsActive(option, tx.date, tx.currency)))) : accounts;
     const matchReason = fundingMatchReason(tx);
     const paymentMethod = matchReason ? reusablePaymentMethod(tx) : "";
     const mappingDisabledReason = !paymentMethod ? "账单缺少可保存的单一付款方式"
@@ -854,15 +1027,16 @@ export default function App() {
     return <>
       <div className={detail ? "account-fields" : "account-fields account-fields-compact"}>
         <div className={allocations ? "account-field has-allocations" : "account-field"}>
-          <div className="account-caption">{detail || allocations ? "分类账户" : "分类"}{detail && tx.refundReviewMode === "follow-purchase" && <small>沿用原消费</small>}{allocations && addButton}</div>
+          <div className="account-caption">{detail || allocations ? categoryLabel : isTransfer ? "对方" : "分类"}{detail && tx.refundReviewMode === "follow-purchase" && <small>沿用原消费</small>}{allocations && addButton}</div>
           {allocations ? <div className="account-allocation-fields">
             {refund && <small className="muted">按原消费金额分配</small>}
             <CategoryAllocationEditor tx={tx} allocations={allocations} accounts={accounts} dirty={Boolean(draft)} disabled={disabled}
               readOnly={readOnly} onChange={changeAllocations} onSave={saveAllocations} onDiscard={discardAllocations} />
           </div> : <div className="category-field">
-            <AccountSelect value={tx.finalAccount || tx.suggestedAccount} inputId={categoryInputId(tx.id, detail)}
-              accounts={refund ? accounts.filter(({ account }) => account.startsWith("Expenses:") || account === tx.finalAccount) : accounts}
-              label={`${payee} · 分类账户`} disabled={accountDisabled} autoHighlight={tx.status === "pending"} confirmCurrent={tx.status === "pending"}
+            <AccountSelect value={category} inputId={categoryInputId(tx.id, detail)}
+              accounts={categoryOptions} placeholder={isTransfer ? "选择对方账户" : "选择分类"} validationMessage={categoryError}
+              label={`${payee} · ${categoryLabel}`} disabled={accountDisabled} autoHighlight={tx.status === "pending" || Boolean(categoryError)}
+              confirmCurrent={tx.status === "pending" || Boolean(categoryError)}
               onChange={(account) => {
                 const decision = { id: tx.id, account, status: isEditablePostingStatus(tx) ? undefined : tx.status };
                 if (decision.status || missingPostingAccount({ ...tx, finalAccount: account })) { saveReviewDecisions([decision]); return; }
@@ -877,8 +1051,9 @@ export default function App() {
         <div className="account-field">
           <div className="account-caption">{detail ? "资金账户" : "资金"}</div>
           <div className="funding-control-row">
-            <AccountSelect value={tx.fundingAccount} accounts={accounts} funding label={`${payee} · 资金账户`} inputId={fundingInputId(tx.id, detail)}
-              matchReason={matchReason} confirmCurrent={Boolean(matchReason && tx.fundingAccount)}
+            <AccountSelect value={tx.fundingAccount} accounts={fundingError ? accounts.filter((account) => accountIsActive(account, tx.date, tx.currency)) : accounts}
+              funding label={`${payee} · 资金账户`} inputId={fundingInputId(tx.id, detail)} placeholder="选择资金账户" validationMessage={fundingError}
+              matchReason={matchReason} confirmCurrent={Boolean(matchReason && tx.fundingAccount)} autoHighlight={Boolean(fundingError)}
               disabled={accountDisabled} onChange={(funding) => saveReviewDecisions(fundingRows.map(({ id }) => ({ id, funding })))} />
             {matchReason && !readOnly && <button type="button" className="btn small quiet review-icon-button funding-map-button" aria-haspopup="dialog"
               aria-label={`添加映射 · ${payee}`} disabled={disabled || Boolean(mappingDisabledReason)}
@@ -905,11 +1080,13 @@ export default function App() {
       && !tx.postings && refund.status === "pending" && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund)));
     const category = tx.finalAccount || tx.suggestedAccount || "";
     const needsExpenseCategory = Boolean(refund) && !category.startsWith("Expenses:");
-    const missing = missingPostingAccount({ ...tx, finalAccount: category }) ?? (needsExpenseCategory ? "category" : undefined);
+    const needsCounterpart = tx.eventType === "transfer" && !tx.postings && !/^(Assets|Liabilities):/.test(tx.fundingAccount2 || category);
+    const missing = missingPostingAccount({ ...tx, finalAccount: category })
+      ?? (needsCounterpart && tx.fundingAccount2 ? "postings" : needsExpenseCategory || needsCounterpart ? "category" : undefined);
     const includeHint = missing === "category" && needsExpenseCategory ? "请先选择费用分类账户"
-      : missing ? missingPostingAccountMessage[missing] : undefined;
+      : missing === "category" && needsCounterpart ? "请选择转账对方账户" : missing ? missingPostingAccountMessage[missing] : undefined;
     const include = () => {
-      if (missing === "postings") { setError(missingPostingAccountMessage.postings); return; }
+      if (missing === "postings") { revealReviewTarget([{ id: tx.id, field: missing }]); return; }
       if (missing) {
         const inputId = missing === "funding" ? fundingInputId(tx.id, !compact) : categoryInputId(tx.id, !compact);
         document.getElementById(inputId)?.focus();
@@ -924,7 +1101,7 @@ export default function App() {
     if (!canInclude && !exclude.length && !tx.merge) return null;
     const iconButton = compact ? " review-icon-button" : "";
     return <div className={compact ? "decision-actions icon-actions" : "decision-actions"}>
-      {canInclude && <button type="button" className={`btn small decision-include${iconButton}`} disabled={disabled} aria-label={`标记入账 · ${payee}`}
+      {canInclude && <button type="button" className={`btn small decision-include${iconButton}${missing ? " needs-account" : ""}`} disabled={disabled} aria-label={`标记入账 · ${payee}`}
         title={includeHint ? `标记入账\n${includeHint}` : "标记入账"} onClick={include}>{compact ? <ReviewIcon name="check" /> : "标记入账"}</button>}
       {exclude.length > 0 && <button type="button" className={`btn small quiet decision-exclude${iconButton}${emphasizeExclude ? " is-urgent" : ""}`} disabled={disabled}
         aria-label={`${excludeLabel} · ${payee}`} title={excludeLabel} onClick={excludeEntries}>{compact ? <ReviewIcon name="cross" /> : excludeLabel}</button>}
@@ -972,6 +1149,7 @@ export default function App() {
     const draft = drafts[tx.id];
     return <ReviewEditor tx={tx}
       draft={draft?.value ?? makeDraft(tx)} dirty={Boolean(draft)} accounts={accounts} editFlag={editFlag} disabled={editingDisabled || Boolean(allocationDrafts[tx.id])}
+      postingError={fieldProblem(tx.id, "postings")} tagError={fieldProblem(tx.id, "tags")}
       onChange={(next) => changeDraft(tx, next)} onSave={() => { if (draft) saveReviewDraft(tx, draft); }}
       onDiscard={() => discardReviewDraft(tx.id)} />;
   };
@@ -999,26 +1177,30 @@ export default function App() {
     </article>)}
   </div>;
 
+  const renderHistoryMatch = (tx: ParsedTx, match: LedgerMatch, disabled: boolean, label?: string) =>
+    <HistoryMatch key={match.id} match={match} disabled={disabled} hasPostings={Boolean(tx.postings)}
+      onApply={(account) => saveReviewDecisions([{ id: tx.id, account, status: isEditablePostingStatus(tx) ? undefined : tx.status }])}
+      counterpart={active.find((other) => other.id === match.id)}
+      onAdopt={() => void saveDecisions([{ id: tx.id, postings: match.postings, status: "ready" }])}
+      onExclude={() => savePostingStatus([match.id], "excluded")} duplicate={label ? { tx, label } : undefined} />;
+
   const renderHistory = (tx: ParsedTx, disabled: boolean) => {
-    if (!tx.matches?.length) return null;
+    const promoted = duplicateEvidence(tx);
+    const matches = tx.matches?.filter((match) => match !== promoted);
+    if (!matches?.length) return null;
     return <details className="detail-section">
-      <summary>历史账本参考（{tx.matches.length}）</summary>
-      {tx.matches.map((match) => <HistoryMatch key={match.id} match={match}
-        disabled={disabled} hasPostings={Boolean(tx.postings)}
-        onApply={(account) => saveReviewDecisions([{ id: tx.id, account, status: isEditablePostingStatus(tx) ? undefined : tx.status }])}
-        counterpart={active.find((other) => other.id === match.id)}
-        onAdopt={() => void saveDecisions([{ id: tx.id, postings: match.postings, status: "ready" }])}
-        onExclude={() => savePostingStatus([match.id], "excluded")} />)}
+      <summary>历史账本参考（{matches.length}）</summary>
+      {matches.map((match) => renderHistoryMatch(tx, match, disabled))}
     </details>;
   };
 
-  const renderTransactionDetails = ({ tx, entries, refund, originals }: ReviewRow) => {
+  const renderTransactionDetails = ({ tx, entries, refund, originals, amount }: ReviewRow) => {
     const fieldsDisabled = editingDisabled || entries.some((entry) => Boolean(drafts[entry.id]));
     const rowDisabled = editingDisabled || entries.some((entry) => Boolean(drafts[entry.id] || allocationDrafts[entry.id]));
     const status = refund && refund.status !== tx.status ? "分别核对" : postingStatusLabel(tx, readOnly);
     const counterpart = tx.refundCounterpartId ? txs.find(({ id }) => id === tx.refundCounterpartId) : undefined;
     const timestamp = tx.time ? `${tx.date} ${tx.time}` : tx.date;
-    return <aside key={tx.id} className="transaction-detail" id="transaction-detail" data-review-id={tx.id} aria-labelledby="transaction-detail-heading"
+    const panel = <aside key={tx.id} className="transaction-detail" id="transaction-detail" data-review-id={tx.id} aria-labelledby="transaction-detail-heading"
       onKeyDown={(event) => {
         if (event.key === "Escape" && !event.defaultPrevented) {
           event.preventDefault();
@@ -1030,15 +1212,21 @@ export default function App() {
           <h3 id="transaction-detail-heading" ref={detailHeading} tabIndex={-1}>{tx.payee || "（无商户）"}</h3>
           <div className="detail-meta">
             <time dateTime={tx.time ? `${tx.date}T${tx.time}` : tx.date}>{timestamp}</time>
+            {!tx.merge && <span>{refund ? "净支出" : tx.direction === "in" ? "收入" : "支出"} {fmt(amount)} {tx.currency}</span>}
             {showDecisionStatus && <span>{status}</span>}
           </div>
         </div>
         <button type="button" className="btn small quiet close-detail" aria-label="关闭详情" title="关闭详情" onClick={closeDetails}>×</button>
       </header>
       <div className="transaction-detail-body">
+        {entries.map((entry) => {
+          const match = duplicateEvidence(entry);
+          const label = refund ? `${entry === refund ? "退款" : "原消费"} · 疑似重复` : "疑似重复核对";
+          return match ? renderHistoryMatch(entry, match, rowDisabled, label) : null;
+        })}
         {refund ? entries.map((entry) => {
           const label = entry === refund ? "退款" : "原消费";
-          return <section className="refund-leg" aria-label={label} key={entry.id}>
+          return <section className="refund-leg" id={`refund-leg-${entry.id}`} tabIndex={-1} aria-label={label} key={entry.id}>
             <div className="refund-leg-heading"><h3>{label}</h3>
               <strong className={`amt ${entry.direction}`}>{fmt(entry.amount)} {entry.currency}</strong>
               {showDecisionStatus && <span className={`decision-status ${entry.status}`}>{postingStatusLabel(entry, readOnly)}</span>}</div>
@@ -1073,6 +1261,8 @@ export default function App() {
         </>}
       </div>
     </aside>;
+    return detailAsDrawer ? <dialog ref={detailDialog} className="transaction-detail-drawer" aria-labelledby="transaction-detail-heading"
+      onCancel={(event) => { event.preventDefault(); closeDetails(); }}>{panel}</dialog> : panel;
   };
 
   const renderReviewRow = ({ tx, refund, entries, amount }: ReviewRow) => {
@@ -1088,7 +1278,7 @@ export default function App() {
     const detailsOpen = detailTxId === tx.id;
     const detailsLabel = detailsOpen ? "收起详情" : readOnly ? "查看详情" : "详情与备注";
     const tags = [...new Set(entries.flatMap((entry) => entry.tags ?? []))];
-    const shownTags = detailRow ? 1 : 2;
+    const shownTags = detailRow && !detailAsDrawer ? 1 : 2;
     const remainingTags = tags.slice(shownTags);
     const directionLabel = tx.direction === "in" ? "收入" : "支出";
     const eventLabel = EVENT_LABELS[tx.eventType ?? (tx.direction === "in" ? "income" : "expense")];
@@ -1097,6 +1287,12 @@ export default function App() {
     if (sourceType && sourceType !== eventLabel) {
       typeLabel = eventLabel === directionLabel ? sourceType : `${eventLabel} · ${sourceType}`;
     }
+    const eventText = tx.merge ? `合并 ${tx.merge.originals.length} 笔` : refund ? "含退款" : typeLabel === directionLabel ? "" : typeLabel;
+    const hasPreviewProblem = entries.some(({ id }) => previewProblems.has(id));
+    const rowProblem = [...new Set(entries.flatMap(({ id }) => {
+      const message = fieldProblem(id, undefined);
+      return message ? [message] : [];
+    }))].join(" · ");
     const issues = entries.flatMap(reviewIssues);
     const warnings = new Set([...issues.filter((issue) => issue === LEDGER_DUPLICATE_ISSUE || issue === CROSS_SOURCE_ISSUE), ...issues]);
     const pdfEntries = entries.filter(hasPdfSource);
@@ -1109,7 +1305,9 @@ export default function App() {
       if (entry.duplicateOf && entry.status !== "ready") warnings.add(entry.duplicateOf.label);
     }
 
-    return <tr key={tx.id} role="row" data-review-id={tx.id} className={`tx-row${detailsOpen ? " details-open" : ""}${isSelected ? " is-selected" : ""}`}>
+    return <tr key={tx.id} id={`review-row-${tx.id}`} role="row" tabIndex={-1} data-review-id={tx.id}
+      aria-describedby={rowProblem ? `review-row-error-${tx.id}` : undefined}
+      className={`tx-row${detailsOpen ? " details-open" : ""}${isSelected ? " is-selected" : ""}${hasPreviewProblem ? " has-review-problem" : ""}`}>
       {!readOnly && <td role="cell" className="tx-select-cell">
         <label className="row-selection">
           <input type="checkbox" className="checkbox" aria-label={`批量选择 ${payee}`} checked={isSelected}
@@ -1123,13 +1321,6 @@ export default function App() {
           <TransactionFlag value={entries.some((entry) => entry.flag === "!") ? "!" : "*"}
             label={`${payee} · 账本标记`} disabled={rowDisabled} onChange={(flag) => saveFlags(entries, flag)} />
           <div className="payee" title={payee}>{payee}</div>
-          <button id={`detail-toggle-${tx.id}`} type="button" className="btn small quiet review-icon-button detail-toggle"
-            aria-label={`${detailsLabel} · ${payee}`} title={detailsLabel} aria-expanded={detailsOpen}
-            aria-controls={detailsOpen ? "transaction-detail" : undefined} onClick={() => {
-              if (detailsOpen) { closeDetails(); return; }
-              focusDetailHeading.current = true;
-              setDetailTxId(tx.id);
-            }}><ReviewIcon name="info" /></button>
         </div>
         <div className="tx-secondary">
           <time className="tx-date" dateTime={tx.time ? `${tx.date}T${tx.time}` : tx.date}
@@ -1148,7 +1339,20 @@ export default function App() {
           {[...warnings].map((warning) => <li key={warning}>{warning}</li>)}
           {pdfEntries.map((entry) => <li className="pdf-preview-item" key={entry.id}>{pdfPreviewButton(entry)}</li>)}
         </ul>}
+        {rowProblem && <p id={`review-row-error-${tx.id}`} className="review-field-error">{rowProblem}</p>}
         {renderNarration(tx, payee)}
+      </td>
+      <td role="cell" className="tx-type-cell">
+        <div className="tx-event">
+          {eventText && <span title={eventText}>{eventText}</span>}
+          <button id={`detail-toggle-${tx.id}`} type="button" className="btn small quiet review-icon-button detail-toggle"
+            aria-label={`${detailsLabel} · ${payee}`} title={detailsLabel} aria-expanded={detailsOpen}
+            aria-controls={detailsOpen ? "transaction-detail" : undefined} onClick={() => {
+              if (detailsOpen) { closeDetails(); return; }
+              focusDetailHeading.current = true;
+              setDetailTxId(tx.id);
+            }}><ReviewIcon name="info" /></button>
+        </div>
       </td>
       <td role="cell" className={`tx-amount-cell${tx.merge ? "" : ` amt ${tx.direction}`}`}>
         {tx.merge ? <div className="merge-amounts">
@@ -1161,7 +1365,6 @@ export default function App() {
           <strong className="amount-value">{fmt(amount)}</strong>{" "}
           <span className="amount-currency">{tx.currency}</span>
         </div>}
-        <div className="tx-event">{tx.merge ? `合并 ${tx.merge.originals.length} 笔` : typeLabel}</div>
       </td>
       <td role="cell" className="tx-account-cell">
         {tx.merge ? <><div className="account-caption">{tx.postings?.length ?? 0} 条分录</div>
@@ -1237,10 +1440,10 @@ export default function App() {
     {!settings && !routedBatchId && !batch && <>
       <section className="card"><div className={`dropzone${dragOver ? " over" : ""}`} role="button" tabIndex={0} aria-label="选择账单文件" aria-disabled={busy} onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") { event.preventDefault(); if (!busy) fileInput.current?.click(); }
-      }} onClick={() => { if (!busy) fileInput.current?.click(); }} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={(event) => { event.preventDefault(); setDragOver(false); upload(event.dataTransfer.files); }}><span className="dz-glyph" aria-hidden="true" /><div className="dz-main">{busy ? "正在读取账单…" : "拖入账单，或点击选择文件"}</div><div className="dz-sub">可同时选择多个 CSV / XLSX / PDF · ZIP 请先解压</div></div></section>
-      <section className="card">
-        <div className="toolbar"><h2>导入批次</h2><span className="spacer" /><button className="btn small" disabled={busy} onClick={() => void perform(async () => { setBatches(await api.batches()); })}>刷新</button></div>
-        {!batches.length ? <p className="muted">暂无已保存批次。</p> : <div className="batch-list">{batches.map((item) => <div className="batch-row" key={item.batchId}>
+      }} onClick={() => { if (!busy) fileInput.current?.click(); }} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={(event) => { event.preventDefault(); setDragOver(false); upload(event.dataTransfer.files); }}><span className="dz-glyph" aria-hidden="true" /><div className="dz-main">{uploading ? "正在读取账单…" : "拖入账单，或点击选择文件"}</div><div className="dz-sub">可同时选择多个 CSV / XLSX / PDF · ZIP 请先解压</div></div></section>
+      <section className="card" aria-busy={batchesRefreshing}>
+        <div className="toolbar"><h2>导入批次</h2><span className="spacer" /><button className="btn small" disabled={busy || batchesRefreshing} onClick={() => void refreshBatchList()}>刷新</button></div>
+        {!batches.length ? <p className="muted">{batchesRefreshing ? "正在加载导入批次…" : "暂无已保存批次。"}</p> : <div className="batch-list">{batches.map((item) => <div className="batch-row" key={item.batchId}>
           <div className="batch-info"><b>{item.file}</b><small>{batchTime(item.createdAt)} · {item.txCount} 笔{item.committed && " · 已提交"}</small></div>
           <div className="batch-actions">
             <button type="button" className={`btn${item.committed ? "" : " primary"}`} disabled={busy}
@@ -1271,6 +1474,13 @@ export default function App() {
             {!readOnly && <button className="btn primary" disabled={busy || blockBatchChanges || readyCount === 0} onClick={generate}>生成预览（{readyCount}）</button>}
           </div>}
         </div>
+        {previewCheck && <div className="review-validation">
+          <p role="alert">{previewCheck.message}</p>
+          {previewTargets.length > 0 && <button ref={previewRepairButton} type="button" className="btn small"
+            onClick={() => revealReviewTarget(previewTargets)}>查看需修正的 {previewTargets.length} 笔</button>}
+          <button type="button" className="btn small quiet close-detail" aria-label="关闭预览提示" title="关闭预览提示"
+            onClick={() => setPreviewCheck(null)}>×</button>
+        </div>}
         {batch.committedAt && <p className="muted review-diagnostic">提交于 {batchTime(Date.parse(batch.committedAt))}</p>}
         {(fileErrors.length > 0 || emptyImportFailed) && <div className="review-import-alert review-diagnostic" role="alert">
           <strong>{emptyImportFailed ? "未读取到账单交易" : "部分账单未导入"}</strong>
@@ -1291,7 +1501,7 @@ export default function App() {
           </nav>
           <select aria-label="排序" value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="date">按日期</option><option value="amount">按金额</option><option value="payee">按商户</option></select>
         </div>
-        <div className={`review-workspace${detailRow ? " has-detail" : ""}`}>
+        <div className={`review-workspace${detailRow && !detailAsDrawer ? " has-detail" : ""}`}>
           {!rows.length ? <div className="empty">无匹配交易</div> : <div className="table-scroll" ref={tableScroll}>
           <table className={`tx${readOnly ? " read-only" : ""}`} role="table" aria-labelledby="review-heading">
             <thead role="rowgroup">
@@ -1305,6 +1515,7 @@ export default function App() {
                   </label>
                 </th>}
                 <th role="columnheader" scope="col">交易</th>
+                <th role="columnheader" scope="col" className="type-column">交易类型</th>
                 <th role="columnheader" scope="col" className="amount-column">金额</th>
                 <th role="columnheader" scope="col" className="account-column">账户</th>
                 <th role="columnheader" scope="col" className="decision-column">入账决定</th>
@@ -1324,8 +1535,8 @@ export default function App() {
               <option value="filtered">全部筛选结果 · {visible.length} 笔</option>
             </select>
             <button type="button" className="btn primary small" disabled={bulkEditDisabled || !bulkPosting.approvals.length}
-              aria-describedby={bulkPosting.needsReview ? "bulk-review-hint" : undefined}
-              onClick={() => savePostingDecisions(bulkPosting.approvals, { followedRefundIds: bulkPosting.followedRefundIds })}>标记入账</button>
+              aria-describedby={bulkPosting.reviewTargets.length ? "bulk-review-hint" : undefined}
+              onClick={() => savePostingDecisions(bulkPosting.approvals, { followedRefundIds: bulkPosting.followedRefundIds })}>标记 {bulkPosting.approvalCount} 笔入账</button>
             <button type="button" className="btn small" disabled={bulkEditDisabled || !bulkPosting.exclusionIds.length}
               onClick={() => void savePostingStatus(bulkPosting.exclusionIds, "excluded")}>{bulkScope === "filtered" ? "排除筛选结果" : "排除所选"}</button>
             {(bulkScope === "filtered" ? visible.length : selectedRows) >= 2 && <button type="button" className="btn small" disabled={bulkEditDisabled || targets.length < 2}
@@ -1344,7 +1555,8 @@ export default function App() {
               </div>
             </div>}</ReviewMenu>
             <button type="button" className="btn small quiet" onClick={() => setSelected(new Set())}>清空选择</button>
-            {bulkPosting.needsReview > 0 && <span id="bulk-review-hint" className="bulk-review-hint" role="status">{bulkPosting.needsReview} 笔需单独核对</span>}
+            {bulkPosting.reviewTargets.length > 0 && <button id="bulk-review-hint" type="button" className="btn small quiet bulk-review-hint"
+              onClick={() => revealReviewTarget(bulkPosting.reviewTargets)}>{bulkPosting.reviewTargets.length} 笔需核对</button>}
           </div> : <span className="review-count">{visible.length} 笔</span>}
           <nav className="toolbar pagination" aria-label="分页">
             <button type="button" className="btn small quiet" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>上一页</button>

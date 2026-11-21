@@ -1,4 +1,4 @@
-import type { AppConfig, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerError, ParsedAccount, ParsedTx, TxDecision } from "../../src/shared/types.js";
+import type { AppConfig, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, TxDecision } from "../../src/shared/types.js";
 
 export type ConfigResponse = AppConfig & { nativePathPicker?: boolean };
 export type PathField = "ledgerRoot" | "pythonPath";
@@ -59,13 +59,20 @@ export class ApiError extends Error {
   constructor(public status: number, message: string, public temporary = false) { super(message); }
 }
 
+export class IncompleteReviewError extends ApiError {
+  constructor(status: number, message: string, public problems: ReviewProblem[]) { super(status, message); }
+}
+
 async function json<T>(response: Response): Promise<T> {
   const body: unknown = await response.json().catch(() => undefined);
   if (response.ok && body !== undefined) return body as T;
   if (!response.ok && body && typeof body === "object") {
-    const parsed = body as { code?: unknown; error?: unknown; details?: unknown; errors?: unknown };
+    const parsed = body as { code?: unknown; error?: unknown; details?: unknown; errors?: unknown; reviewProblems?: unknown };
     if (parsed.code === "review_incomplete" && typeof parsed.error === "string") {
-      throw new ApiError(response.status, parsed.error);
+      const problems = Array.isArray(parsed.reviewProblems) ? parsed.reviewProblems.filter((item): item is ReviewProblem =>
+        item && typeof item.id === "string" && typeof item.message === "string"
+        && (item.field === undefined || ["funding", "category", "postings", "tags"].includes(item.field))) : [];
+      throw new IncompleteReviewError(response.status, parsed.error, problems);
     }
     const describe = (detail: unknown): string => {
       if (typeof detail === "string") return detail;
@@ -100,7 +107,7 @@ export const api = {
     for (const file of files) body.append("files", file);
     return send<UploadSummary>("/api/upload", { method: "POST", body });
   },
-  batches: () => send<BatchSummary[]>("/api/batches"),
+  batches: (signal?: AbortSignal) => send<BatchSummary[]>("/api/batches", { signal }),
   batch: (id: string) => send<ImportPreview>(`/api/batch/${encodeURIComponent(id)}`),
   pdfPreview: (id: string, txId: string, signal?: AbortSignal) =>
     send<PdfPreview>(`/api/batch/${encodeURIComponent(id)}/pdf-preview/${encodeURIComponent(txId)}`, { signal }),

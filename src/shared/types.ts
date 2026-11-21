@@ -273,6 +273,14 @@ export interface AppConfig {
   llm: LlmConfig;
 }
 
+export type ReviewField = "funding" | "category" | "postings" | "tags";
+
+export interface ReviewProblem {
+  id: string;
+  field?: ReviewField;
+  message: string;
+}
+
 export interface GenerateResult {
   entries: string;
   monthFiles: Record<string, string>;
@@ -281,6 +289,7 @@ export interface GenerateResult {
   /** tx ids that were generated */
   generated: string[];
   errors?: string[];
+  reviewProblems?: ReviewProblem[];
   /** suggested `open` directives for accounts referenced but not yet defined */
   opens: string[];
 }

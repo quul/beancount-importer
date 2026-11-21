@@ -5,6 +5,7 @@ export default function useAnchoredOptions(
   input: RefObject<HTMLInputElement>,
   list: RefObject<HTMLUListElement>,
   bottomBoundary?: RefObject<HTMLElement>,
+  anchor?: RefObject<HTMLElement>,
 ) {
   useLayoutEffect(() => {
     const field = input.current, menu = list.current;
@@ -12,7 +13,7 @@ export default function useAnchoredOptions(
     const viewport = window.visualViewport;
     const place = (event?: Event) => {
       if (event?.target === menu) return;
-      const bounds = field.getBoundingClientRect();
+      const bounds = (anchor?.current ?? field).getBoundingClientRect();
       const screenTop = viewport?.offsetTop ?? 0;
       const screenBottom = screenTop + (viewport?.height ?? window.innerHeight);
       const above = bounds.top - screenTop - 10;
@@ -40,5 +41,5 @@ export default function useAnchoredOptions(
       viewport?.removeEventListener("scroll", place);
       observer.disconnect();
     };
-  }, [open, input, list, bottomBoundary]);
+  }, [open, input, list, bottomBoundary, anchor]);
 }

@@ -1,5 +1,5 @@
 import type { DraftPosting, ParsedAccount, ParsedTx, TxDecision } from "../../src/shared/types.js";
-import { amountText, fundingPostingSign } from "../../src/shared/postings.js";
+import { amountText, fundingPostingSign, transactionPostings } from "../../src/shared/postings.js";
 import AccountSelect from "./AccountSelect";
 import TransactionFlag from "./TransactionFlag";
 
@@ -21,7 +21,7 @@ export function invalidTags(value: string): string[] {
 
 export function makeDraft(tx: ParsedTx): ReviewDraft {
   const amount = -fundingPostingSign(tx) * tx.amount;
-  const postings: DraftPosting[] = tx.postings ?? [
+  const postings: DraftPosting[] = tx.postings || tx.fundingAccount2 ? transactionPostings(tx) : [
     { account: tx.finalAccount || tx.suggestedAccount, amount, currency: tx.currency },
     { account: tx.fundingAccount, amount: -amount, currency: tx.currency },
   ];
@@ -48,9 +48,11 @@ export function draftDecision(tx: ParsedTx, draft: ReviewDraft, original?: Revie
   return decision;
 }
 
-export default function ReviewEditor({ tx, draft, dirty, accounts, disabled, editFlag, onChange, onSave, onDiscard }: {
+export default function ReviewEditor({ tx, draft, dirty, accounts, disabled, editFlag, postingError, tagError, onChange, onSave, onDiscard }: {
   tx: ParsedTx; draft: ReviewDraft; dirty: boolean; accounts: ParsedAccount[]; disabled: boolean;
   editFlag?: boolean;
+  postingError?: string;
+  tagError?: string;
   onChange: (draft: ReviewDraft) => void; onSave: () => void; onDiscard: () => void;
 }) {
   const totals = new Map<string, number>();
@@ -64,18 +66,24 @@ export default function ReviewEditor({ tx, draft, dirty, accounts, disabled, edi
   const imbalances = [...totals].filter(([, amount]) => Math.abs(amount) > 0.000001);
   const splitError = !tx.merge && draft.split && (invalid || draft.postings.length < 2 || imbalances.length > 0);
   const badTags = invalidTags(draft.tags);
+  const tagMessage = badTags.length > 0 ? `标签格式无效：${badTags.join("、")}` : tagError;
+  const tagsId = `review-tags-${tx.id}`, postingsId = `review-postings-${tx.id}`;
   const setPosting = (index: number, patch: Partial<ReviewDraft["postings"][number]>) => onChange({ ...draft, postings: draft.postings.map((posting, i) => i === index ? { ...posting, ...patch } : posting) });
 
   return <div className="review-editor">
     <fieldset disabled={disabled}>
       <div className="editor-grid">
         <label className="wide">审批备注<textarea rows={3} maxLength={2000} value={draft.reviewNote} onChange={(event) => onChange({ ...draft, reviewNote: event.target.value })} /></label>
-        <label>标签<input value={draft.tags} placeholder="trip2026 reimbursement" onChange={(event) => onChange({ ...draft, tags: event.target.value })} /><small>英文标签，空格分隔。</small>{badTags.length > 0 && <small className="error-line">标签格式无效：{badTags.join("、")}</small>}</label>
+        <label>标签<input id={tagsId} value={draft.tags} placeholder="trip2026 reimbursement" aria-invalid={Boolean(tagMessage) || undefined}
+          aria-describedby={`${tagsId}-hint`} onChange={(event) => onChange({ ...draft, tags: event.target.value })} />
+          <small id={`${tagsId}-hint`} className={tagMessage ? "review-field-error" : undefined}>{tagMessage || "英文标签，空格分隔。"}</small></label>
         {editFlag && <div className="editor-flag"><span>账本标记</span>
           <TransactionFlag label="单笔账本标记" value={draft.flag} onChange={(flag) => onChange({ ...draft, flag })} />
         </div>}
       </div>
-      {!tx.merge && <label className="check-label"><input type="checkbox" checked={draft.split} onChange={(event) => onChange({ ...draft, split: event.target.checked })} />拆分分录</label>}
+      {!tx.merge && <label className="check-label"><input id={postingsId} type="checkbox" checked={draft.split} aria-describedby={postingError ? `${postingsId}-error` : undefined}
+        onChange={(event) => onChange({ ...draft, split: event.target.checked })} />拆分分录</label>}
+      {postingError && <p className="review-field-error" id={`${postingsId}-error`}>{postingError}{tx.merge && "。请先撤销合并，再修正原交易。"}</p>}
       {!tx.merge && draft.split && <div className="posting-editor">
         <p className="muted">每种币种合计须为 0。</p>
         {draft.postings.map((posting, index) => <div className="posting-row" key={index}>

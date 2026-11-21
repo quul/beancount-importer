@@ -837,6 +837,8 @@ try {
     assert.equal(preview.code, "review_incomplete");
     assert.equal(preview.error, "请将待确认内容处理完毕后，再点击「生成预览」。");
     assert.ok(preview.errors.some((error: string) => error.includes("请拆分组合支付")));
+    assert.ok(preview.reviewProblems.some((problem: { id: string; field: string; message: string }) =>
+      problem.id === older.id && problem.field === "postings" && problem.message === "请拆分组合支付"));
     passed("combined payment defaults work on import and resume while preserving review and split validation");
   }
   {
