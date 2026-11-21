@@ -5,8 +5,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import iconv from "iconv-lite";
 import * as XLSX from "xlsx";
-import { parseAlipay } from "../src/server/parsers/alipay.js";
+import { isAlipay, parseAlipay } from "../src/server/parsers/alipay.js";
 import { parseWechat } from "../src/server/parsers/wechat.js";
 import { parseDate, parseCsv, readSheet, readTextSmart, txId } from "../src/server/parsers/common.js";
 import { markDuplicates } from "../src/server/lib/dedup.js";
@@ -53,6 +54,32 @@ try {
     const ids = new Map(parsed.txs.map((item) => [item.sourceTxId, item.id]));
     fs.writeFileSync(aliFile, ["导出说明", alipayHeader, ...[...aliRows].reverse()].join("\n"));
     for (const item of parseAlipay(aliFile).txs) assert.equal(item.id, ids.get(item.sourceTxId));
+  });
+  check("legacy Alipay GBK headers parse transaction columns and skip the report summary", () => {
+    const file = path.join(tmp, "renamed-statement.csv");
+    const text = [
+      "支付宝交易记录明细查询",
+      "交易号,商家订单号,交易创建时间,付款时间,最近修改时间,交易来源地,类型,交易对方,商品名称,金额（元）,收/支,交易状态,服务费（元）,成功退款（元）,备注,资金状态,",
+      "2026112000000001\t,订单甲,2026-11-20 23:58:00,2026-11-21 00:02:00,2026-11-21 00:02:00,,即时到账交易,示例商店,示例商品,12.34,支出,交易成功,0.03,0.00,测试备注,已支出,",
+      "2026112000000002\t,订单乙,2026-11-20 18:00:00,,,,支付宝担保交易,示例商店,其他商品,5.00,不计收支,交易关闭,0.00,0.00,,,",
+      "------------------------",
+      "共2笔记录",
+      "收入共0笔,0.00",
+      "支出共1笔,12.34",
+    ].join("\r\n");
+    fs.writeFileSync(file, iconv.encode(text, "gbk"));
+    assert.ok(isAlipay(file, path.basename(file)));
+    const { txs, errors } = parseAlipay(file);
+    assert.deepEqual(errors, []);
+    assert.equal(txs.length, 2);
+    assert.equal(txs[0].sourceTxId, "2026112000000001");
+    assert.equal(txs[0].date, "2026-11-20");
+    assert.equal(txs[0].time, "23:58:00");
+    assert.equal(txs[0].amount, 12.34);
+    assert.equal(txs[0].payee, "示例商店");
+    assert.equal(txs[0].rawCategory, "即时到账交易");
+    assert.equal(txs[0].rawAccount, "");
+    assert.ok(txs[1].excludedReason);
   });
   check("unknown WeChat states are retained and visibly need review", () => {
     const file = path.join(tmp, "wechat.csv");

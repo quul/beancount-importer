@@ -182,7 +182,7 @@ export function parseDate(raw: string): { date: string; time?: string } | null {
 /** Payment methods can contain coupons with unknown value or explicit split tender. */
 export function parseFundingParts(raw: string): { fundingParts?: RawTx["fundingParts"]; issues: string[] } {
   if (!raw || raw === "/" || raw === "-") return { issues: [] };
-  const parts = raw.split(/\r?\n|[&＆]/).map((part) => part.trim()).filter(Boolean);
+  const parts = raw.split(/\r?\n|[&＆+＋]/).map((part) => part.trim()).filter(Boolean);
   if (parts.length < 2) return { issues: [] };
   const fundingParts = parts.map((part) => {
     const explicit = part.match(/(?:付款|支付)?[¥￥]\s*([\d,.]+)/);

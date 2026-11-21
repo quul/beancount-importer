@@ -1,33 +1,48 @@
 /** Alipay export: retain every source transaction, including excluded rows. */
 import fs from "node:fs";
 import type { EventType, RawTx } from "../../shared/types.js";
-import { col, findHeader, parseAmount, parseDate, readTextSmart, parseCsv, txId, parseFundingParts, UNREADABLE_TRANSACTION, type ParseResult } from "./common.js";
+import { col, parseAmount, parseDate, readTextSmart, parseCsv, txId, parseFundingParts, UNREADABLE_TRANSACTION, type ParseResult } from "./common.js";
+
+const requiredColumns = {
+  date: ["交易时间", "交易创建时间", "记录时间"],
+  payee: ["交易对方"],
+  amount: ["金额", "金额（元）", "金额(元)"],
+};
+
+function findAlipayHeader(rows: string[][]): number {
+  return rows.findIndex((row) => Object.values(requiredColumns).every((names) => col(row, names) >= 0));
+}
 
 export function isAlipay(file: string, name: string): boolean {
   if (/支付宝|alipay|ali-pay|zhifubao/i.test(name)) return true;
-  try { const text = readTextSmart(fs.readFileSync(file)).slice(0, 4000); return text.includes("支付宝") && text.includes("交易时间"); }
+  try {
+    const text = readTextSmart(fs.readFileSync(file)).slice(0, 4000);
+    return text.includes("支付宝") && findAlipayHeader(parseCsv(text)) >= 0;
+  }
   catch { return false; }
 }
 
 export function parseAlipay(file: string): ParseResult {
   const rows = parseCsv(readTextSmart(fs.readFileSync(file)));
-  const headerIdx = findHeader(rows, ["交易时间", "交易对方", "金额"]);
+  const headerIdx = findAlipayHeader(rows);
   const errors: ParseResult["errors"] = [];
   const txs: RawTx[] = [];
   if (headerIdx < 0) return { source: "alipay", txs, errors: [{ row: 0, message: "未找到支付宝交易明细表头" }] };
   const header = rows[headerIdx].map((h) => h.trim());
   const indexes = {
-    date: col(header, ["交易时间", "记录时间"]), payee: col(header, ["交易对方"]), direction: col(header, ["收/支"]),
-    amount: col(header, ["金额"]), status: col(header, ["交易状态"]), method: col(header, ["收/付款方式"]),
-    category: col(header, ["交易分类"]), tag: col(header, ["标签"]), note: col(header, ["商品说明", "商品名称"]),
+    date: col(header, requiredColumns.date), payee: col(header, requiredColumns.payee), direction: col(header, ["收/支"]),
+    amount: col(header, requiredColumns.amount), status: col(header, ["交易状态"]), method: col(header, ["收/付款方式"]),
+    category: col(header, ["交易分类", "类型"]), tag: col(header, ["标签"]), note: col(header, ["商品说明", "商品名称"]),
     remark: col(header, ["备注"]), id: col(header, ["交易订单号", "交易号", "订单号"]),
   };
   for (let r = headerIdx + 1; r < rows.length; r++) {
     const row = rows[r];
     const cell = (key: keyof typeof indexes) => indexes[key] >= 0 ? (row[indexes[key]] ?? "").trim() : "";
-    if (!row.some((value) => value.trim())) continue;
-    if (!cell("id") && !/^\d{4}/.test(cell("date"))) continue;
-    const parsed = parseDate(cell("date"));
+    const rawDate = cell("date"), sourceTxId = cell("id") || undefined;
+    // The older export starts with the ID column and ends with short summary rows.
+    if (row.length <= indexes.amount && !rawDate) continue;
+    if (!sourceTxId && !/^\d{4}/.test(rawDate)) continue;
+    const parsed = parseDate(rawDate);
     const amount = parseAmount(cell("amount"));
     const sourceStatus = cell("status"), originalDirection = cell("direction"), category = cell("category"), rawAccount = cell("method"), payee = cell("payee");
     const note = [...new Set([cell("note"), cell("remark")].filter(Boolean))].join(" · ");
@@ -51,7 +66,7 @@ export function parseAlipay(file: string): ParseResult {
     if (refund) issues.push("冲回原费用");
     if (familyCard) issues.push("对方付款");
     const split = parseFundingParts(rawAccount); issues.push(...split.issues);
-    const sourceTxId = cell("id") || undefined, date = parsed?.date ?? "";
+    const date = parsed?.date ?? "";
     txs.push({ id: txId(date, Math.abs(amount ?? 0), direction, payee, `${parsed?.time ?? ""}|${note}|${rawAccount}`, "alipay", sourceTxId),
       date, time: parsed?.time, amount: Math.abs(amount ?? 0), direction, currency: "CNY", payee, note,
       rawCategory: cell("tag") || category, rawAccount, sourceTxId, source: "alipay", sourceFile: file, row: r + 1,

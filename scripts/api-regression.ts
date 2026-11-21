@@ -671,6 +671,44 @@ try {
     passed("funding preflight groups unresolved methods, applies choices and reuses persisted exact mappings");
   }
   {
+    const splitRoot = path.join(temporary, "split-funding-ledger"), splitData = path.join(temporary, "split-funding-data");
+    const card = "Liabilities:CreditCard:Fixture", method = "联名信用卡(9999)";
+    fs.mkdirSync(splitRoot);
+    fs.writeFileSync(path.join(splitRoot, "main.bean"), `${definitions}2025-01-01 open ${card} CNY\n`);
+    const splitConfig: AppConfig = { ...config, ledgerRoot: splitRoot, assetMapping: [
+      ...config.assetMapping, { keyword: method, source: "alipay", exact: true, account: card, kind: "credit" },
+    ] };
+    const splitBase = await boot(splitConfig, splitData);
+    const imported = await upload(splitBase, [csv().split("\n")[0],
+      `2026-01-02 10:10:00,餐饮美食,测试餐厅,午餐,支出,10,${method}&红包,交易成功,split-1`,
+      `2026-01-03 10:10:00,餐饮美食,测试餐厅,午餐,支出,10,积分＋${method},交易成功,split-2`,
+    ].join("\n"));
+    assert.ok(imported.txs.every((tx) => tx.status === "pending" && tx.fundingAccount === card && tx.fundingConfidence! < 1
+      && tx.fundingParts?.length === 2 && tx.issues?.includes("组合支付，分摊待确认")));
+
+    const store = new BatchStore(path.join(splitData, "batches"));
+    const older: ParsedTx = { ...imported.txs[1], id: "older-split", sourceTxId: "older-split", fundingAccount: "", fundingConfidence: 0,
+      fundingParts: undefined, issues: ["组合支付"], status: "ready", reviewNote: "之前的审批备注" };
+    const manual: ParsedTx = { ...imported.txs[0], id: "manual-split", sourceTxId: "manual-split", fundingAccount: "Assets:CN:BOC:2222", fundingConfidence: 1 };
+    const saved = store.create({ file: "older-splits.csv", source: "alipay", txs: [older, manual], txCount: 2, errors: [],
+      accountsDetected: [], ledgerProfile: profileId(splitRoot, "main.bean") });
+    store.save({ ...saved, revision: 3 });
+    const route = `/api/batch/${saved.batchId}`;
+    const resumed = await request(splitBase, `${route}/funding`, { revision: 3 });
+    assert.deepEqual(resumed.groups, []);
+    assert.equal(resumed.batch.revision, 4);
+    assert.equal(resumed.batch.txs[0].fundingAccount, card);
+    assert.equal(resumed.batch.txs[0].reviewNote, older.reviewNote);
+    assert.equal(resumed.batch.txs[0].status, "ready");
+    assert.deepEqual(resumed.batch.txs[0].issues, ["组合支付，分摊待确认"]);
+    assert.deepEqual(resumed.batch.txs[1], manual);
+    assert.deepEqual(resumed.config.assetMapping, splitConfig.assetMapping);
+    assert.deepEqual(await request(splitBase, `${route}/funding`, { revision: 4 }), { groups: [] });
+    const preview = await request(splitBase, `${route}/generate`, { revision: 4 }, 422);
+    assert.ok(preview.errors.some((error: string) => error.includes("请拆分组合支付")));
+    passed("combined payment defaults work on import and resume while preserving review and split validation");
+  }
+  {
     const quickRoot = path.join(temporary, "quick-funding-mapping");
     const quickData = path.join(temporary, "quick-funding-data");
     fs.mkdirSync(quickRoot);

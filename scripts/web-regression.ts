@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { api, ApiError } from "../web/src/api.js";
 import { draftDecision, invalidTags, makeDraft, parseTags } from "../web/src/ReviewEditor.js";
+import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
 import { buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch } from "../web/src/reviewRows.js";
 import { LEDGER_DUPLICATE_ISSUE } from "../src/shared/types.js";
 import { planCategoryAllocations, savedCategoryAllocations } from "../src/shared/categoryAllocations.js";
@@ -53,6 +54,21 @@ try {
   assert.equal(note.reviewNote, "核对了转账凭证");
   assert.ok(!Object.hasOwn(note, "postings"));
   console.log("✓ refund splits can be cleared and saving a transfer note preserves the inferred accounts");
+
+  const rejected = reviewPatches([{ id: refund.id, tags: ["unconfirmed"], funding: "Assets:OtherWallet" }]);
+  const later: ReviewPatches = new Map([[refund.id, (tx) => ({ tags: [...(tx.tags ?? []), "checked"], flag: "*" })]]);
+  const [projected] = applyPendingReviewPatches([refund], [rejected, later]);
+  assert.deepEqual(projected.tags, ["unconfirmed", "checked"]);
+  assert.equal(projected.fundingAccount, "Assets:OtherWallet");
+  const [rolledBack] = applyPendingReviewPatches([refund], [later]);
+  assert.deepEqual(rolledBack.tags, ["refund", "checked"]);
+  assert.equal(rolledBack.fundingAccount, "Assets:Wallet");
+  assert.equal(rolledBack.flag, "*");
+  assert.deepEqual(refund.tags, ["refund"]);
+  const metadataBefore = makeDraft(projected);
+  assert.deepEqual(draftDecision(rolledBack, { ...metadataBefore, reviewNote: "补充说明" }, metadataBefore),
+    { id: refund.id, reviewNote: "补充说明" });
+  console.log("✓ rolling back a queued edit keeps later choices and does not resubmit untouched draft fields");
 
   const purchase = { ...refund, id: "purchase", eventType: "expense", direction: "out", date: "2026-09-13", amount: 100,
     status: "ready", currency: "CNY", sourceTxId: "purchase-id", refundCounterpartId: refund.id } satisfies ParsedTx;
@@ -130,5 +146,5 @@ try {
   await assert.rejects(() => api.upload([]), (error: unknown) => error instanceof ApiError && error.temporary
     && error.message === "服务连接中断，请重试");
   console.log("✓ empty responses, proxy pages and network exceptions get friendly retry messages");
-  console.log("Web contract regression passed (9 groups).");
+  console.log("Web contract regression passed (10 groups).");
 } finally { globalThis.fetch = originalFetch; }

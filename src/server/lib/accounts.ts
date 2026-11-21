@@ -1,7 +1,8 @@
 /** Funding inference only selects defined accounts; ambiguity is a review task. */
 import { isFamilyCard } from "../../shared/types.js";
 import type { AppConfig, LedgerInfo, ParsedAccount, ParsedTx, SourceType } from "../../shared/types.js";
-import { accountIsActive, isCombinedPayment, normalizePaymentMethod, singlePaymentMethod } from "../../shared/funding.js";
+import { accountIsActive, isCombinedPayment, isFundingAccount, isMissingPaymentMethod, normalizePaymentMethod, singlePaymentMethod } from "../../shared/funding.js";
+import { parseFundingParts } from "../parsers/common.js";
 
 export { accountIsActive, isMissingPaymentMethod, normalizePaymentMethod, singlePaymentMethod } from "../../shared/funding.js";
 
@@ -77,15 +78,39 @@ export function confirmFundingAccount(tx: ParsedTx, account: string): void {
 export const fundingMappingIssue = (issue: string) => issue === "账户未映射" || issue === "账户映射冲突"
   || issue === "支付方式缺失" || /未绑定账本账户|^支付方式对应 \d+ 个账户|^账单未注明支付方式/.test(issue);
 
+const unknown = (message: string): FundingGuess => ({ account: "", confidence: 0, issues: [message], reason: message });
+const isPaymentAccountPart = ({ rawAccount }: { rawAccount: string }) =>
+  !isMissingPaymentMethod(rawAccount) && !/红包|积分|优惠|立减|满减|折扣|补贴|抵扣|代金券|消费券|淘金币|集分宝|京豆/.test(rawAccount);
+
+export function unallocatedFundingParts(tx: ParsedTx): ParsedTx["fundingParts"] {
+  if (!isCombinedPayment(tx) || isFamilyCard(tx)) return;
+  const parts = tx.fundingParts ?? parseFundingParts(tx.rawAccount).fundingParts;
+  if (parts && parts.length > 1 && parts.some(({ amount }) => amount == null) && parts.some(isPaymentAccountPart)) return parts;
+}
+
 export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo): FundingGuess {
-  const unknown = (message: string): FundingGuess => ({ account: "", confidence: 0, issues: [message], reason: message });
   // 亲情卡/代付: the payment method belongs to the other person. Never match it
   // against my own wallet/card mappings (e.g. their 花呗 is not my Huabei account).
   if (isFamilyCard(tx)) return unknown("对方付款");
-  if (isCombinedPayment(tx)) return unknown("组合支付");
+  if (isCombinedPayment(tx)) {
+    for (const { rawAccount } of unallocatedFundingParts(tx) ?? []) {
+      if (!isPaymentAccountPart({ rawAccount })) continue;
+      const matched = matchFundingAccount(rawAccount.trim(), tx, config, ledger);
+      if (!isFundingAccount(matched.account) || (ledger && !ledger.accounts.some((entry) =>
+        entry.account === matched.account && accountIsActive(entry, tx.date, tx.currency)))) continue;
+      return {
+        account: matched.account, confidence: Math.min(matched.confidence, 0.98),
+        reason: `按组合支付中的「${rawAccount.trim()}」预填，分摊金额待确认`, issues: ["组合支付，分摊待确认"],
+      };
+    }
+    return unknown("组合支付");
+  }
   const raw = singlePaymentMethod(tx) || (!tx.rawAccount?.trim() && tx.source.startsWith("bank-") ? tx.source.slice(5) : "");
   if (!raw) return unknown("支付方式缺失");
+  return matchFundingAccount(raw, tx, config, ledger);
+}
 
+function matchFundingAccount(raw: string, tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo): FundingGuess {
   const available = ledger?.accounts;
   const valid = (name: string) => {
     if (!/^(Assets|Liabilities):/.test(name)) return false;

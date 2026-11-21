@@ -31,8 +31,11 @@ export function makeDraft(tx: ParsedTx): ReviewDraft {
   };
 }
 
-export function draftDecision(tx: ParsedTx, draft: ReviewDraft): TxDecision {
-  const decision: TxDecision = { id: tx.id, tags: parseTags(draft.tags), flag: draft.flag, reviewNote: draft.reviewNote };
+export function draftDecision(tx: ParsedTx, draft: ReviewDraft, original?: ReviewDraft): TxDecision {
+  const decision: TxDecision = { id: tx.id };
+  if (draft.tags !== original?.tags) decision.tags = parseTags(draft.tags);
+  if (draft.flag !== original?.flag) decision.flag = draft.flag;
+  if (draft.reviewNote !== original?.reviewNote) decision.reviewNote = draft.reviewNote;
   if (draft.split) {
     const postings = draft.postings.map((posting) => ({ ...posting, amount: Number(posting.amount), currency: posting.currency.trim().toUpperCase() }));
     const previous = tx.postings;

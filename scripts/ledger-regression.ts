@@ -86,12 +86,27 @@ try {
     assert.equal(inferFundingAccount(tx({ rawAccount: "中国银行(9999)" }), config, ledger).account, "");
     assert.equal(inferFundingAccount(tx({ rawAccount: "中国银行" }), config, ledger).account, "");
   });
-  check("wallet ambiguity, investment wallets and combined payments remain pending", () => {
+  check("ambiguous cash wallets and distinct investment wallets require their own mappings", () => {
     assert.equal(inferFundingAccount(tx({ rawAccount: "零钱", source: "wechat" }), config, ledger).account, "");
     assert.equal(inferFundingAccount(tx({ rawAccount: "零钱通", source: "wechat" }), config, ledger).account, "");
-    assert.equal(inferFundingAccount(tx({ fundingParts: [{ rawAccount: "零钱" }, { rawAccount: "中国银行(5678)" }] }), config, ledger).account, "");
     const bound = { ...config, assetMapping: [{ keyword: "零钱", account: "Assets:CN:Wallet:WeChat2", kind: "debit" as const }] };
     assert.equal(inferFundingAccount(tx({ rawAccount: "零钱", source: "wechat" }), bound, ledger).account, "Assets:CN:Wallet:WeChat2");
+  });
+  check("combined payments choose a matched funding part and keep the allocation open", () => {
+    const card = "中国银行信用卡(1234)", debit = "中国银行储蓄卡(5678)";
+    const account = "Liabilities:CreditCard:BOC:1234", debitAccount = "Assets:CN:Bank:BOC:5678";
+    for (const rawAccount of [`${card}&红包`, `${debit}积分＋${card}`, `优惠券&${card}支付¥9.50`]) {
+      const guess = inferFundingAccount(tx({ rawAccount }), config, ledger);
+      assert.equal(guess.account, account);
+      assert.ok(guess.confidence < 1);
+      assert.deepEqual(guess.issues, ["组合支付，分摊待确认"]);
+    }
+    assert.equal(inferFundingAccount(tx({ rawAccount: `${debit}&${card}` }), config, ledger).account, debitAccount);
+    assert.equal(inferFundingAccount(tx({ fundingParts: [{ rawAccount: "零钱" }, { rawAccount: debit }] }), config, ledger).account, debitAccount);
+    for (const rawAccount of [`${card}¥6&红包¥1`, "红包&积分", "中国银行信用卡(9999)&积分"]) {
+      assert.equal(inferFundingAccount(tx({ rawAccount }), config, ledger).account, "");
+    }
+    assert.equal(inferFundingAccount(tx({ rawAccount: `${card}&积分`, eventType: "familyCard" }), config, ledger).account, "");
   });
   check("classification rejects undefined memory, wrong direction and transfers as income", () => {
     assert.equal(classifyLocal(tx({ payee: "咖啡" }), { mapping: { "咖啡|": "Expenses:Undefined" } }, ledger)?.account, "Expenses:Food:Drinks");

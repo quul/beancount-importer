@@ -21,6 +21,7 @@ import MergeDialog from "./MergeDialog";
 import PdfPreviewDialog from "./PdfPreviewDialog";
 import ReviewMenu from "./ReviewMenu";
 import TransactionFlag from "./TransactionFlag";
+import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "./reviewChanges";
 import {
   buildBulkPostingPlan, buildReviewRows, EMPTY_REVIEW_DATE_RANGE, isEditablePostingStatus, matchesReviewDateRange,
   matchesReviewFilter, matchesReviewSearch, type ReviewFilter, type ReviewRow,
@@ -45,6 +46,7 @@ const batchTime = (createdAt: number) => new Date(createdAt).toLocaleString("zh-
 const postingStatusLabel = (tx: ParsedTx, readOnly: boolean) => readOnly && tx.status === "ready" ? "已入账" : DECISION_LABELS[tx.status];
 const categoryInputId = (id: string, detail = false) => `${detail ? "detail" : "row"}-category-${id}`;
 type CategoryAdvance = { rowIds: ReadonlySet<string>; origin: Element | null };
+type TransactionDraft = { value: ReviewDraft; original: ReviewDraft };
 type DeleteTarget = Pick<BatchSummary, "batchId" | "file" | "revision"> & { createdAt?: number };
 type ReviewOpening = "import" | "resume" | "reload";
 type FundingTarget = { id: string; batch: ImportPreview; opening: ReviewOpening; groups: FundingMappingGroup[] };
@@ -161,18 +163,19 @@ export default function App() {
   const [batchId, setBatchId] = useState("");
   const [preview, setPreview] = useState<GeneratedPreview | null>(null);
   const [busy, setBusy] = useState(false);
-  const [savingStatus, setSavingStatus] = useState<{ accountsById: ReadonlyMap<string, string | undefined>; status: "ready" | "excluded" } | null>(null);
+  const [pendingSaves, setPendingSaves] = useState<ReviewPatches[]>([]);
+  const [rowFocusedDuringSave, setRowFocusedDuringSave] = useState<string>();
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [settings, setSettings] = useState(settingsRoute);
   const [filter, setFilter] = useState("");
   const [dateRange, setDateRange] = useState(EMPTY_REVIEW_DATE_RANGE);
-  const [statusFilter, setStatusFilter] = useState<ReviewFilter>("all");
+  const [statusFilter, setStatusFilter] = useState<ReviewFilter>("pending");
   const [sort, setSort] = useState<"date" | "amount" | "payee">("date");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [detailTxId, setDetailTxId] = useState<string | null>(null);
   const [categoryAdvance, setCategoryAdvance] = useState<CategoryAdvance | null>(null);
-  const [drafts, setDrafts] = useState<Record<string, ReviewDraft>>({});
+  const [drafts, setDrafts] = useState<Record<string, TransactionDraft>>({});
   const [allocationDrafts, setAllocationDrafts] = useState<Record<string, CategoryAllocation[]>>({});
   const [narrationDrafts, setNarrationDrafts] = useState<Record<string, string>>({});
   const [bulkTags, setBulkTags] = useState("");
@@ -205,15 +208,30 @@ export default function App() {
 
   const invalidate = () => { setPreview(null); setValidation(""); };
 
-  const handleError = async (failure: unknown) => {
+  const preserveEditingRow = () => {
+    const focused = document.activeElement;
+    const id = focused?.matches("input, textarea, select") ? focused.closest<HTMLElement>("[data-review-id]")?.dataset.reviewId : undefined;
+    if (id) setRowFocusedDuringSave(id);
+  };
+
+  const handleError = async (failure: unknown, refreshUncertain = false) => {
     const message = operationMessage(failure);
-    if (failure instanceof ApiError && failure.status === 409) {
+    const conflict = failure instanceof ApiError && failure.status === 409;
+    const uncertain = failure instanceof ApiError && (failure.temporary || failure.status >= 500);
+    if (conflict || (refreshUncertain && uncertain)) {
       invalidate();
-      if (batchIdRef.current) {
-        try { replaceBatch(await api.batch(batchIdRef.current)); } catch { /* keep the conflict visible */ }
+      const id = batchIdRef.current;
+      if (id) {
+        try {
+          const current = await api.batch(id);
+          if (batchIdRef.current === id) {
+            preserveEditingRow();
+            replaceBatch(current, id);
+          }
+        } catch { /* Keep the save error visible. */ }
       }
-      setError(batchIdRef.current ? `请检查批次并重新生成预览。\n${message}` : message);
-    } else setError(message);
+    }
+    setError(conflict && batchIdRef.current ? `请检查批次并重新生成预览。\n${message}` : message);
   };
 
   const perform = async (work: () => Promise<void>) => {
@@ -265,13 +283,7 @@ export default function App() {
     }
   }, [deleteTarget]);
 
-  const txs = useMemo(() => {
-    const rows = batch?.txs ?? [];
-    if (!savingStatus) return rows;
-    const { accountsById, status } = savingStatus;
-    return rows.map((tx) => accountsById.has(tx.id)
-      ? { ...tx, status, finalAccount: accountsById.get(tx.id) ?? tx.finalAccount, duplicateOf: undefined } : tx);
-  }, [batch?.txs, savingStatus]);
+  const txs = useMemo(() => applyPendingReviewPatches(batch?.txs ?? [], pendingSaves), [batch?.txs, pendingSaves]);
   const reviewRows = useMemo(() => buildReviewRows(txs), [txs]);
   const detailRow = detailTxId ? reviewRows.find(({ tx }) => tx.id === detailTxId) : undefined;
   const active = useMemo(() => activeTransactions(txs), [txs]);
@@ -282,7 +294,9 @@ export default function App() {
   const emptyImportFailed = !!batch?.errors.length && batch.txs.length === 0;
   const editingDisabled = busy || readOnly;
   const detailDraftIds = [...new Set([...Object.keys(drafts), ...Object.keys(allocationDrafts)])];
-  const dirtyCount = new Set([...detailDraftIds, ...Object.keys(narrationDrafts)]).size;
+  const hasReviewDrafts = detailDraftIds.length > 0 || Object.keys(narrationDrafts).length > 0;
+  const reviewIsSaving = pendingSaves.length > 0;
+  const blockBatchChanges = hasReviewDrafts || reviewIsSaving;
   const dateScopedRows = useMemo(() => dateRange.start || dateRange.end
     ? reviewRows.filter((row) => matchesReviewDateRange(row, dateRange)) : reviewRows, [dateRange, reviewRows]);
   const visible = useMemo(() => {
@@ -292,7 +306,8 @@ export default function App() {
         : `${a.tx.date} ${a.tx.time ?? ""}`.localeCompare(`${b.tx.date} ${b.tx.time ?? ""}`));
   }, [dateScopedRows, filter, statusFilter, sort]);
   const totalPages = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
-  const currentPage = Math.min(page, totalPages - 1);
+  const focusedRowIndex = rowFocusedDuringSave ? visible.findIndex(({ tx }) => tx.id === rowFocusedDuringSave) : -1;
+  const currentPage = focusedRowIndex < 0 ? Math.min(page, totalPages - 1) : Math.floor(focusedRowIndex / PAGE_SIZE);
   const rows = visible.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
   const visibleEntries = visible.flatMap((row) => row.entries);
   const selectedVisible = visibleEntries.filter((tx) => selected.has(tx.id)).length;
@@ -312,7 +327,16 @@ export default function App() {
   const readyCount = active.filter((tx) => tx.status === "ready").length;
 
   useLayoutEffect(() => {
-    if (tableScroll.current) tableScroll.current.scrollTop = 0;
+    if (!rowFocusedDuringSave) return;
+    if (focusedRowIndex >= 0 && page !== currentPage) {
+      setPage(currentPage);
+      document.activeElement?.scrollIntoView({ block: "nearest" });
+    }
+    setRowFocusedDuringSave(undefined);
+  }, [currentPage, focusedRowIndex, page, rowFocusedDuringSave]);
+
+  useLayoutEffect(() => {
+    if (!rowFocusedDuringSave && tableScroll.current) tableScroll.current.scrollTop = 0;
   }, [batchId, currentPage, dateRange, filter, sort, statusFilter]);
 
   useLayoutEffect(() => {
@@ -327,7 +351,7 @@ export default function App() {
   }, [preview]);
 
   useLayoutEffect(() => {
-    if (!categoryAdvance || busy || savingStatus) return;
+    if (!categoryAdvance || busy) return;
     const active = document.activeElement;
     if (!settings && !readOnly && (active === document.body || active === categoryAdvance.origin)) {
       for (const [index, row] of visible.entries()) {
@@ -347,8 +371,8 @@ export default function App() {
       }
     }
     setCategoryAdvance(null);
-  }, [allocationDrafts, busy, categoryAdvance, currentPage, detailTxId, drafts, readOnly, savingStatus, settings, visible]);
-  const suspectedToExclude = active.filter(canExcludeSuspectedDuplicate).length;
+  }, [allocationDrafts, busy, categoryAdvance, currentPage, detailTxId, drafts, readOnly, settings, visible]);
+  const suspectedEntries = active.filter(canExcludeSuspectedDuplicate);
 
   const selectTransactions = (transactions: ParsedTx[], checked: boolean) => {
     if (!selected.size) setBulkScope("selected");
@@ -372,7 +396,7 @@ export default function App() {
     setPdfPreviewTx(null);
     replaceBatch(value, id);
     setDrafts({}); setAllocationDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null);
-    setFilter(""); setDateRange(EMPTY_REVIEW_DATE_RANGE); setStatusFilter("all");
+    setFilter(""); setDateRange(EMPTY_REVIEW_DATE_RANGE); setStatusFilter(value.committed ? "all" : "pending");
     setBulkScope("selected"); setBulkTags("");
     invalidate(); setNotice(value.committed ? "已提交" : resumed && value.txs.length > 0 ? "已恢复审批进度" : "");
   };
@@ -406,7 +430,10 @@ export default function App() {
     }
   };
 
-  const openBatch = (id: string, opening: ReviewOpening = "resume") => void perform(() => loadReview(id, opening));
+  const openBatch = (id: string, opening: ReviewOpening = "resume") => void perform(async () => {
+    await decisionQueue.current;
+    await loadReview(id, opening);
+  });
 
   const confirmFunding = (target: FundingTarget, mappings: FundingMappingChoice[]) => void perform(async () => {
     try {
@@ -456,60 +483,117 @@ export default function App() {
     return next;
   });
 
-  const saveDecisions = async (decisions: TxDecision[], {
-    savedDraftIds = [], savedNarration, changesOnly = false, onSaved,
-  }: { savedDraftIds?: string[]; savedNarration?: { id: string; value: string }; changesOnly?: boolean; onSaved?: () => void } = {}) => {
-    if (!decisions.length || !batchRef.current || batchRef.current.committed) return;
+  const enqueueReviewSave = (
+    save: (id: string, current: ImportPreview) => Promise<{ batch: ImportPreview; notice: string } | undefined>,
+    { patches, blocking = false, saveOnBlur = false, onSaved }: {
+      patches?: ReviewPatches; blocking?: boolean; saveOnBlur?: boolean; onSaved?: () => void;
+    } = {},
+  ) => {
+    if (!batchRef.current || batchRef.current.committed || (locked.current && !saveOnBlur)) return false;
     const id = batchIdRef.current;
-    const save = async () => {
-      const current = batchRef.current;
-      if (!current || current.committed || batchIdRef.current !== id) return;
-      if (savedNarration && (current.txs.find((tx) => tx.id === savedNarration.id)?.narration ?? null) === decisions[0].narration) {
-        discardNarrationDraft(savedNarration.id, savedNarration.value);
-        return;
-      }
-      invalidate();
-      const saved = await api.decide(id, current.revision ?? 0, decisions, changesOnly);
-      if (saved.batch) replaceBatch(saved.batch, id);
-      else if (saved.changes) {
-        const updated = new Map(saved.changes.txs.map((tx) => [tx.id, tx]));
-        replaceBatch({ ...current, revision: saved.revision, parseStats: saved.changes.parseStats, txs: current.txs.map((tx) => updated.get(tx.id) ?? tx) }, id);
-      } else replaceBatch(await api.batch(id), id);
-      if (savedDraftIds.length) setDrafts((previous) => Object.fromEntries(Object.entries(previous).filter(([id]) => !savedDraftIds.includes(id))));
-      if (savedNarration) discardNarrationDraft(savedNarration.id, savedNarration.value);
-      setNotice(`已保存 ${decisions.length} 笔`);
-      onSaved?.();
-    };
     const enqueue = () => {
-      const pending = decisionQueue.current.then(save).catch(handleError);
+      invalidate();
+      if (patches) setPendingSaves((previous) => [...previous, patches]);
+      const pending = decisionQueue.current.then(async () => {
+        const current = batchRef.current;
+        if (!current || current.committed || batchIdRef.current !== id) return;
+        try {
+          const result = await save(id, current);
+          if (result && batchIdRef.current === id) {
+            preserveEditingRow();
+            replaceBatch(result.batch, id);
+            setNotice(result.notice);
+            onSaved?.();
+          }
+        } catch (failure) {
+          if (batchIdRef.current === id) await handleError(failure, true);
+        }
+      }).finally(() => {
+        if (patches) {
+          preserveEditingRow();
+          setPendingSaves((previous) => previous.filter((item) => item !== patches));
+        }
+      });
       decisionQueue.current = pending;
       return pending;
     };
-    if (savedNarration) {
-      setError("");
-      await enqueue();
-    } else await perform(enqueue);
+    if (blocking) void perform(enqueue);
+    else { setError(""); void enqueue(); }
+    return true;
   };
 
-  const savePostingDecisions = async (decisions: TxDecision[], status: "ready" | "excluded", {
-    followedRefundIds = [], advanceAfter, onSaved,
-  }: { followedRefundIds?: readonly string[]; advanceAfter?: string; onSaved?: () => void } = {}) => {
-    if (locked.current || !decisions.length) return;
+  const saveDecisions = (
+    decisions: TxDecision[] | ((current: ImportPreview) => TxDecision[]),
+    { patches, savedNarration, blocking = !patches && !savedNarration, onSaved }: {
+      patches?: ReviewPatches; savedNarration?: { id: string; value: string }; blocking?: boolean; onSaved?: () => void;
+    } = {},
+  ) => {
+    if (Array.isArray(decisions) && !decisions.length) return false;
+    return enqueueReviewSave(async (id, current) => {
+      const changes = typeof decisions === "function" ? decisions(current) : decisions;
+      if (!changes.length) return;
+      if (savedNarration && (current.txs.find((tx) => tx.id === savedNarration.id)?.narration ?? null) === changes[0].narration) {
+        discardNarrationDraft(savedNarration.id, savedNarration.value);
+        return;
+      }
+      const saved = await api.decide(id, current.revision ?? 0, changes, true);
+      let next = saved.batch;
+      if (!next && saved.changes) {
+        const updated = new Map(saved.changes.txs.map((tx) => [tx.id, tx]));
+        next = {
+          ...current, revision: saved.revision, parseStats: saved.changes.parseStats,
+          txs: current.txs.map((tx) => updated.get(tx.id) ?? tx),
+        };
+      }
+      return { batch: next ?? await api.batch(id), notice: `已保存 ${changes.length} 笔` };
+    }, {
+      patches, blocking, saveOnBlur: Boolean(savedNarration),
+      onSaved: () => {
+        if (savedNarration) discardNarrationDraft(savedNarration.id, savedNarration.value);
+        onSaved?.();
+      },
+    });
+  };
+
+  const saveReviewDecisions = (decisions: TxDecision[]) =>
+    saveDecisions(decisions, { patches: reviewPatches(decisions) });
+
+  const saveFlags = (entries: ParsedTx[], flag: "*" | "!") =>
+    saveReviewDecisions(entries.filter((tx) => (tx.flag ?? "*") !== flag).map(({ id }) => ({ id, flag })));
+
+  const savePostingDecisions = (decisions: TxDecision[], {
+    followedRefundIds = [], advanceAfter, blocking = false, onSaved,
+  }: { followedRefundIds?: readonly string[]; advanceAfter?: string; blocking?: boolean; onSaved?: () => void } = {}) => {
+    if (!decisions.length) return;
     const currentIndex = advanceAfter ? visible.findIndex((row) => row.entries.some((entry) => entry.id === advanceAfter)) : -1;
     const advance = currentIndex >= 0 && currentIndex + 1 < visible.length
       ? { rowIds: new Set(visible.slice(currentIndex + 1).map(({ tx }) => tx.id)), origin: document.activeElement } : undefined;
-    const accountsById = new Map(decisions.map(({ id, account }) => [id, account]));
-    for (const id of followedRefundIds) accountsById.set(id, undefined);
-    setSavingStatus({ accountsById, status });
-    try { await saveDecisions(decisions, { changesOnly: true, onSaved: () => {
-      onSaved?.();
-      if (advance) setCategoryAdvance(advance);
-    } }); }
-    finally { setSavingStatus(null); }
+    const patches = blocking ? undefined : reviewPatches(decisions);
+    if (patches && followedRefundIds.length) {
+      const txById = new Map(active.map((tx) => [tx.id, tx]));
+      const decisionById = new Map(decisions.map((decision) => [decision.id, decision]));
+      for (const id of followedRefundIds) {
+        const refund = txById.get(id);
+        const purchase = refund?.refundCounterpartId ? txById.get(refund.refundCounterpartId) : undefined;
+        const approval = purchase && decisionById.get(purchase.id);
+        const account = approval?.account ?? purchase?.finalAccount;
+        if (account) patches.set(id, () => ({
+          finalAccount: account, status: "ready", refundReviewMode: "follow-purchase", duplicateOf: undefined,
+        }));
+      }
+    }
+    const queued = saveDecisions(decisions, {
+      patches, blocking,
+      onSaved: () => {
+        onSaved?.();
+        if (blocking && advance) setCategoryAdvance(advance);
+      },
+    });
+    if (queued && !blocking && advance) setCategoryAdvance(advance);
   };
 
   const savePostingStatus = (ids: string[], status: "ready" | "excluded") =>
-    savePostingDecisions(ids.map((id) => ({ id, status })), status);
+    saveReviewDecisions(ids.map((id) => ({ id, status })));
 
   const createMerge = (draft: MergeDraft) => void perform(async () => {
     await decisionQueue.current;
@@ -545,34 +629,65 @@ export default function App() {
     setNotice(`已恢复 ${originalIds.size} 笔原交易`);
   });
 
-  const changeDraft = (tx: ParsedTx, draft: ReviewDraft) => { invalidate(); setDrafts((previous) => ({ ...previous, [tx.id]: draft })); };
-  const bulkFlag = (flag: "*" | "!") => void saveDecisions(targets.map((tx) => ({ id: tx.id, flag })));
+  const changeDraft = (tx: ParsedTx, value: ReviewDraft) => {
+    invalidate();
+    setDrafts((previous) => ({ ...previous, [tx.id]: { value, original: previous[tx.id]?.original ?? makeDraft(tx) } }));
+  };
+
+  const discardReviewDraft = (id: string, draft?: TransactionDraft) => setDrafts((previous) => {
+    if (draft && previous[id] !== draft) return previous;
+    const next = { ...previous };
+    delete next[id];
+    return next;
+  });
+
+  const saveReviewDraft = (tx: ParsedTx, draft: TransactionDraft) => {
+    const decision = draftDecision(tx, draft.value, draft.original);
+    const discard = () => discardReviewDraft(tx.id, draft);
+    if (decision.postings !== undefined) {
+      saveDecisions([decision], { onSaved: discard });
+    } else if (Object.keys(decision).length === 1 || saveReviewDecisions([decision])) discard();
+  };
+
+  const bulkFlag = (flag: "*" | "!") => saveFlags(targets, flag);
   const applyTags = (mode: "add" | "remove") => {
     const tags = parseTags(bulkTags);
     if (!tags.length || invalidTags(bulkTags).length) return;
-    void saveDecisions(targets.map((tx) => ({ id: tx.id, tags: mode === "add" ? [...new Set([...(tx.tags ?? []), ...tags])] : (tx.tags ?? []).filter((tag) => !tags.includes(tag)) })));
+    const changeTags = (tx: ParsedTx) => ({
+      tags: mode === "add" ? [...new Set([...(tx.tags ?? []), ...tags])] : (tx.tags ?? []).filter((tag) => !tags.includes(tag)),
+    });
+    const patches: ReviewPatches = new Map(targets.map(({ id }) => [id, changeTags]));
+    saveDecisions((current) => {
+      const txById = new Map(current.txs.map((tx) => [tx.id, tx]));
+      return targets.map((tx) => ({ id: tx.id, ...changeTags(txById.get(tx.id) ?? tx) }));
+    }, { patches });
   };
 
-  const excludeSuspected = () => void perform(async () => {
-    const current = batchRef.current;
-    if (!current || current.committed || dirtyCount) return;
-    const id = batchIdRef.current;
-    const result = await api.excludeSuspected(id, current.revision ?? 0);
-    if (result.excluded) invalidate();
-    replaceBatch(result.batch, id);
-    setNotice(`已剔除 ${result.excluded} 笔疑似重复`);
-  });
+  const excludeSuspected = () => {
+    if (blockBatchChanges || !suspectedEntries.length) return;
+    const patches: ReviewPatches = new Map(suspectedEntries.map(({ id }) => [id, () => ({ status: "excluded", duplicateOf: undefined })]));
+    enqueueReviewSave(async (id, current) => {
+      const result = await api.excludeSuspected(id, current.revision ?? 0);
+      return { batch: result.batch, notice: `已剔除 ${result.excluded} 笔疑似重复` };
+    }, { patches });
+  };
 
   const generate = () => void perform(async () => {
-    if (!batchRef.current || batchRef.current.committed || dirtyCount) return;
-    const result = await api.generate(batchIdRef.current, batchRef.current.revision ?? 0);
+    if (blockBatchChanges) return;
+    await decisionQueue.current;
+    const current = batchRef.current;
+    if (!current || current.committed) return;
+    const result = await api.generate(batchIdRef.current, current.revision ?? 0);
     setPreview(result);
     if (result.errors?.length) setError(result.errors.join("；"));
     else setNotice("");
   });
 
   const commit = () => void perform(async () => {
-    if (!preview || preview.revision !== batchRef.current?.revision || batchRef.current.committed || dirtyCount) return;
+    if (blockBatchChanges) return;
+    await decisionQueue.current;
+    const current = batchRef.current;
+    if (!current || current.committed || !preview || preview.revision !== current.revision) return;
     const result = await api.commit(batchIdRef.current, preview.revision);
     replaceBatch(await api.batch(batchIdRef.current));
     setBatches(await api.batches());
@@ -587,7 +702,7 @@ export default function App() {
 
   const goHome = (event: MouseEvent<HTMLAnchorElement>) => {
     if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-    if (locked.current || dirtyCount > 0) { event.preventDefault(); return; }
+    if (locked.current || blockBatchChanges) { event.preventDefault(); return; }
     if (!batchRef.current && !settings) return;
     clearReview(); setNotice("");
     void perform(async () => { setBatches(await api.batches()); });
@@ -612,7 +727,7 @@ export default function App() {
   });
 
   const saveConfig = async (values: Partial<AppConfig>) => {
-    if (dirtyCount) return;
+    if (blockBatchChanges) return;
     let saved: ConfigResponse | undefined;
     await perform(async () => {
       saved = await api.saveConfig(values);
@@ -657,13 +772,10 @@ export default function App() {
       if (!draft) return;
       const status = tx.status === "pending" ? "ready" : tx.status;
       const decisions: TxDecision[] = [{ id: tx.id, categoryAllocations: draft, status }];
-      if (status !== "ready") { void saveDecisions(decisions, { changesOnly: true, onSaved: discardAllocations }); return; }
-      const singleCategory = draft.length === 1;
-      const follows = refund && singleCategory && draft[0].account.startsWith("Expenses:")
-        && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund);
-      void savePostingDecisions(decisions, "ready", {
-        followedRefundIds: follows ? [refund.id] : [],
-        advanceAfter: tx.status === "pending" && (!refund || singleCategory) ? tx.id : undefined,
+      if (status !== "ready") { saveDecisions(decisions, { onSaved: discardAllocations }); return; }
+      savePostingDecisions(decisions, {
+        advanceAfter: tx.status === "pending" && (!refund || draft.length === 1) ? tx.id : undefined,
+        blocking: true,
         onSaved: discardAllocations,
       });
     };
@@ -687,9 +799,9 @@ export default function App() {
               onChange={(account) => {
                 const status = tx.status === "pending" ? "ready" : tx.status;
                 const decisions = [{ id: tx.id, account, status }];
-                if (status !== "ready") { void saveDecisions(decisions, { changesOnly: true }); return; }
+                if (status !== "ready") { saveReviewDecisions(decisions); return; }
                 const follows = refund && account.startsWith("Expenses:") && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund);
-                void savePostingDecisions(decisions, "ready", {
+                savePostingDecisions(decisions, {
                   followedRefundIds: follows ? [refund.id] : [], advanceAfter: tx.status === "pending" ? tx.id : undefined,
                 });
               }} />
@@ -701,7 +813,7 @@ export default function App() {
           <div className="funding-control-row">
             <AccountSelect value={tx.fundingAccount} accounts={accounts} funding label={`${payee} · 资金账户`}
               matchReason={matchReason} confirmCurrent={Boolean(matchReason && tx.fundingAccount)}
-              disabled={accountDisabled} onChange={(funding) => void saveDecisions(fundingRows.map(({ id }) => ({ id, funding })), { changesOnly: true })} />
+              disabled={accountDisabled} onChange={(funding) => saveReviewDecisions(fundingRows.map(({ id }) => ({ id, funding })))} />
             {matchReason && !readOnly && <button type="button" className="btn small quiet funding-map-button" aria-haspopup="dialog"
               aria-label={`添加映射 · ${payee}`} disabled={disabled || Boolean(mappingDisabledReason)}
               title={mappingDisabledReason || "为此付款方式保存账本账户"}
@@ -730,7 +842,7 @@ export default function App() {
     const include = () => {
       if (needsCategory) { document.getElementById(categoryInputId(tx.id))?.focus(); return; }
       const decision: TxDecision = { id: tx.id, status: "ready", ...(refund && !tx.finalAccount ? { account: category } : {}) };
-      void savePostingDecisions([decision], "ready", { followedRefundIds: refund ? [refund.id] : [], advanceAfter: tx.id });
+      savePostingDecisions([decision], { followedRefundIds: refund ? [refund.id] : [], advanceAfter: tx.id });
     };
     const excludeEntries = () => void savePostingStatus(exclude.map(({ id }) => id), "excluded");
     if (!canInclude && !exclude.length && !tx.merge) return null;
@@ -762,7 +874,7 @@ export default function App() {
       onBlur={() => {
         if (readOnly || draft === undefined) return;
         void saveDecisions([{ id: tx.id, narration: draft.trim() ? draft : null }], {
-          savedNarration: { id: tx.id, value: draft }, changesOnly: true,
+          savedNarration: { id: tx.id, value: draft },
         });
       }} onKeyDown={(event) => {
         if (editingDisabled || event.nativeEvent.isComposing) return;
@@ -782,9 +894,9 @@ export default function App() {
   const renderEditor = (tx: ParsedTx, editFlag = false) => {
     const draft = drafts[tx.id];
     return <ReviewEditor tx={tx}
-      draft={draft ?? makeDraft(tx)} dirty={Boolean(draft)} accounts={accounts} editFlag={editFlag} disabled={editingDisabled || Boolean(allocationDrafts[tx.id])}
-      onChange={(next) => changeDraft(tx, next)} onSave={() => { if (draft) void saveDecisions([draftDecision(tx, draft)], { savedDraftIds: [tx.id] }); }}
-      onDiscard={() => setDrafts((previous) => Object.fromEntries(Object.entries(previous).filter(([id]) => id !== tx.id)))} />;
+      draft={draft?.value ?? makeDraft(tx)} dirty={Boolean(draft)} accounts={accounts} editFlag={editFlag} disabled={editingDisabled || Boolean(allocationDrafts[tx.id])}
+      onChange={(next) => changeDraft(tx, next)} onSave={() => { if (draft) saveReviewDraft(tx, draft); }}
+      onDiscard={() => discardReviewDraft(tx.id)} />;
   };
 
   const pdfPreviewButton = (tx: ParsedTx) => <button type="button" className="pdf-preview-button" aria-haspopup="dialog"
@@ -816,10 +928,10 @@ export default function App() {
       <summary>历史账本参考（{tx.matches.length}）</summary>
       {tx.matches.map((match) => <HistoryMatch key={match.id} match={match}
         disabled={disabled} hasPostings={Boolean(tx.postings)}
-        onApply={(account) => void saveDecisions([{ id: tx.id, account, status: tx.status === "pending" ? "ready" : tx.status }])}
+        onApply={(account) => saveReviewDecisions([{ id: tx.id, account, status: tx.status === "pending" ? "ready" : tx.status }])}
         counterpart={active.find((other) => other.id === match.id)}
         onAdopt={() => void saveDecisions([{ id: tx.id, postings: match.postings, status: "ready" }])}
-        onExclude={() => void saveDecisions([{ id: match.id, status: "excluded" }])} />)}
+        onExclude={() => savePostingStatus([match.id], "excluded")} />)}
     </details>;
   };
 
@@ -829,7 +941,7 @@ export default function App() {
     const status = refund && refund.status !== tx.status ? "分别核对" : postingStatusLabel(tx, readOnly);
     const counterpart = tx.refundCounterpartId ? txs.find(({ id }) => id === tx.refundCounterpartId) : undefined;
     const timestamp = tx.time ? `${tx.date} ${tx.time}` : tx.date;
-    return <aside key={tx.id} className="transaction-detail" id="transaction-detail" aria-labelledby="transaction-detail-heading"
+    return <aside key={tx.id} className="transaction-detail" id="transaction-detail" data-review-id={tx.id} aria-labelledby="transaction-detail-heading"
       onKeyDown={(event) => {
         if (event.key === "Escape" && !event.defaultPrevented) {
           event.preventDefault();
@@ -920,7 +1032,7 @@ export default function App() {
       if (entry.duplicateOf && entry.status !== "ready") warnings.add(entry.duplicateOf.label);
     }
 
-    return <tr key={tx.id} role="row" className={`tx-row${detailsOpen ? " details-open" : ""}${isSelected ? " is-selected" : ""}`}>
+    return <tr key={tx.id} role="row" data-review-id={tx.id} className={`tx-row${detailsOpen ? " details-open" : ""}${isSelected ? " is-selected" : ""}`}>
       {!readOnly && <td role="cell" className="tx-select-cell">
         <label className="row-selection">
           <input type="checkbox" className="checkbox" aria-label={`批量选择 ${payee}`} checked={isSelected}
@@ -932,10 +1044,7 @@ export default function App() {
       <td role="cell" className="tx-summary-cell">
         <div className="tx-payee-line">
           <TransactionFlag value={entries.some((entry) => entry.flag === "!") ? "!" : "*"}
-            label={`${payee} · 账本标记`} disabled={rowDisabled} onChange={(flag) => {
-              const changes = entries.filter((entry) => (entry.flag ?? "*") !== flag).map(({ id }) => ({ id, flag }));
-              void saveDecisions(changes, { changesOnly: true });
-            }} />
+            label={`${payee} · 账本标记`} disabled={rowDisabled} onChange={(flag) => saveFlags(entries, flag)} />
           <div className="payee" title={payee}>{payee}</div>
         </div>
         <div className="tx-secondary">
@@ -995,15 +1104,16 @@ export default function App() {
     accounts: accounts.filter((item) => isFundingAccount(item.account) && item.account !== mappingTarget.fundingAccount2
       && accountIsActive(item, mappingTarget.date, mappingTarget.currency)).map(({ account }) => account),
   } : undefined;
+  const reviewNotice = busy && batch ? "处理中…" : reviewIsSaving ? "保存审批中…" : notice;
   return <main className="container">
     <header className="masthead">
-      <a className="masthead-brand" href="#" aria-label="Bean Import · 返回主页" aria-disabled={busy || dirtyCount > 0 || undefined}
-        title={dirtyCount ? "请先保存或放弃交易编辑" : "返回主页"} onClick={goHome}>
+      <a className="masthead-brand" href="#" aria-label="Bean Import · 返回主页" aria-disabled={busy || blockBatchChanges || undefined}
+        title={hasReviewDrafts ? "请先保存或放弃交易编辑" : reviewIsSaving ? "保存审批中…" : "返回主页"} onClick={goHome}>
         <img className="brand-mark" src="/bean-import.svg" width="30" height="30" alt="" /><h1>Bean Import</h1>
       </a>
       <div className="masthead-context">
         <HeaderDetails config={config} ledger={ledger} batch={batch} />
-        {(notice || savingStatus) && <span className="notice" role="status">{savingStatus ? "保存审批中…" : notice}</span>}
+        {reviewNotice && <span className="notice" role="status">{reviewNotice}</span>}
       </div>
       <div className="masthead-actions">
         <button className="btn help-toggle" aria-expanded={help} onClick={() => setHelp(!help)}>使用说明</button>
@@ -1036,7 +1146,7 @@ export default function App() {
     </dialog>
     {ledger?.errors?.length ? <details className="card ledger-errors"><summary>账本校验信息（{ledger.errors.length}）</summary>{ledger.errors.map((item, index) => <p className="error-line" key={index}>{item.file}{item.line ? `:${item.line}` : ""} {item.message}</p>)}</details> : null}
     {config ? <ConfigPanel key={`${config.ledgerRoot}|${config.mainFile}`} section={settings} config={config} accounts={accounts}
-      busy={busy} lockedByDrafts={dirtyCount > 0} onSave={saveConfig} /> :
+      busy={busy} lockedByDrafts={blockBatchChanges} onSave={saveConfig} /> :
       settings && <section className="card" aria-busy={busy}><h2>设置</h2><p className="muted">{busy ? "正在读取设置…" : "未能读取设置"}</p></section>}
 
     {!settings && <input ref={fileInput} type="file" accept=".csv,.xlsx,.xls,.pdf" multiple hidden disabled={busy} onChange={(event) => upload(event.target.files)} />}
@@ -1064,17 +1174,17 @@ export default function App() {
           <h2 id="review-heading">审批交易</h2>
           {!emptyImportFailed && <div className="toolbar review-actions" role="group" aria-label="批次操作">
             <ReviewMenu label="批次操作" title="批次操作">{(close) => <>
-              <button className="menu-action" disabled={busy || dirtyCount > 0} onClick={() => { close(); openBatch(batchId, "reload"); }}>重新载入</button>
+              <button className="menu-action" disabled={busy || blockBatchChanges} onClick={() => { close(); openBatch(batchId, "reload"); }}>重新载入</button>
               {!readOnly && <>
-                <button className="menu-action" disabled={editingDisabled || dirtyCount > 0 || !pendingHigh.length}
-                  onClick={() => { close(); void saveDecisions(pendingHigh.map((tx) => ({ id: tx.id, account: tx.suggestedAccount, status: "ready" }))); }}>
+                <button className="menu-action" disabled={editingDisabled || blockBatchChanges || !pendingHigh.length}
+                  onClick={() => { close(); saveReviewDecisions(pendingHigh.map((tx) => ({ id: tx.id, account: tx.suggestedAccount, status: "ready" }))); }}>
                   接受高置信度（{pendingHigh.length}）
                 </button>
-                <button className="menu-action danger-text" disabled={editingDisabled || dirtyCount > 0 || suspectedToExclude === 0}
-                  title="批量排除当前批次中仍可入账的疑似重复交易" onClick={() => { close(); excludeSuspected(); }}>剔除疑似重复（{suspectedToExclude}）</button>
+                <button className="menu-action danger-text" disabled={editingDisabled || blockBatchChanges || !suspectedEntries.length}
+                  title="批量排除当前批次中仍可入账的疑似重复交易" onClick={() => { close(); excludeSuspected(); }}>剔除疑似重复（{suspectedEntries.length}）</button>
               </>}
             </>}</ReviewMenu>
-            {!readOnly && <button className="btn primary" disabled={busy || dirtyCount > 0 || readyCount === 0} onClick={generate}>生成预览（{readyCount}）</button>}
+            {!readOnly && <button className="btn primary" disabled={busy || blockBatchChanges || readyCount === 0} onClick={generate}>生成预览（{readyCount}）</button>}
           </div>}
         </div>
         {batch.committedAt && <p className="muted review-diagnostic">提交于 {batchTime(Date.parse(batch.committedAt))}</p>}
@@ -1131,7 +1241,7 @@ export default function App() {
             </select>
             <button type="button" className="btn primary small" disabled={bulkEditDisabled || !bulkPosting.approvals.length}
               aria-describedby={bulkPosting.needsReview ? "bulk-review-hint" : undefined}
-              onClick={() => void savePostingDecisions(bulkPosting.approvals, "ready", { followedRefundIds: bulkPosting.followedRefundIds })}>标记入账</button>
+              onClick={() => savePostingDecisions(bulkPosting.approvals, { followedRefundIds: bulkPosting.followedRefundIds })}>标记入账</button>
             <button type="button" className="btn small" disabled={bulkEditDisabled || !bulkPosting.exclusionIds.length}
               onClick={() => void savePostingStatus(bulkPosting.exclusionIds, "excluded")}>{bulkScope === "filtered" ? "排除筛选结果" : "排除所选"}</button>
             {(bulkScope === "filtered" ? visible.length : selectedRows) >= 2 && <button type="button" className="btn small" disabled={bulkEditDisabled || targets.length < 2}
@@ -1160,7 +1270,7 @@ export default function App() {
         </footer>
       </section>
 
-      {preview && <section className="card"><div className="toolbar"><h2 ref={previewHeading} tabIndex={-1}>分录预览</h2><span>共 {preview.generated} 笔</span><span className="spacer" />{!readOnly && <button className="btn primary" disabled={busy || dirtyCount > 0 || Boolean(preview.errors?.length) || preview.revision !== batch.revision} onClick={commit}>校验并写入账本</button>}</div><p className="muted preview-targets">{(preview.targetFiles ?? Object.keys(preview.monthFiles)).join(" · ")}</p>{preview.opens.length > 0 && <p className="error-line">账户指令建议：{preview.opens.join("；")}</p>}{preview.errors?.map((message, index) => <p role="alert" className="error-line" key={index}>{message}</p>)}<BeancountCode className="code" text={preview.entries} /></section>}
+      {preview && <section className="card"><div className="toolbar"><h2 ref={previewHeading} tabIndex={-1}>分录预览</h2><span>共 {preview.generated} 笔</span><span className="spacer" />{!readOnly && <button className="btn primary" disabled={busy || blockBatchChanges || Boolean(preview.errors?.length) || preview.revision !== batch.revision} onClick={commit}>校验并写入账本</button>}</div><p className="muted preview-targets">{(preview.targetFiles ?? Object.keys(preview.monthFiles)).join(" · ")}</p>{preview.opens.length > 0 && <p className="error-line">账户指令建议：{preview.opens.join("；")}</p>}{preview.errors?.map((message, index) => <p role="alert" className="error-line" key={index}>{message}</p>)}<BeancountCode className="code" text={preview.entries} /></section>}
       {readOnly && <section className="card done-banner"><h2>此批次已过账</h2>{Boolean(batch.written?.length) && <p>{batch.written?.join(" · ")}</p>}</section>}
       <section className="card"><div className="toolbar"><button className="btn" disabled={busy} onClick={() => void perform(async () => { const result = await api.validate(); setValidation(`${result.ok ? "校验通过" : "校验未通过"}\n${result.output}`); })}>校验当前账本</button><button className="btn" disabled={busy} onClick={() => void perform(async () => { const result = await api.fava(); setFavaMessage(result.running ? `http://localhost:${result.port}` : result.error ?? "Fava 启动失败"); })}>打开 Fava 报表</button></div>{validation && <pre className="code">{validation}</pre>}{favaMessage && <p>{favaMessage.startsWith("http") ? <a href={favaMessage} target="_blank" rel="noreferrer">在新窗口查看 Fava</a> : favaMessage}</p>}</section>
     </>}

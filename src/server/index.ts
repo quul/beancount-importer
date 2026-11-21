@@ -17,7 +17,7 @@ import { discoverPython, LedgerAccessError, parseLedger, parseLedgerAsync, valid
 import { markDuplicates, refreshLedgerDuplicateHints, sourceKey } from "./lib/dedup.js";
 import { matchWechatRefunds, syncWechatRefunds } from "./lib/refunds.js";
 import { classifyLocal, classifyWithLlm, loadMemory, saveMemory, suggestRefundsFromBatch } from "./lib/classify.js";
-import { accountIsActive, confirmFundingAccount, detectAccounts, fundingMappingIssue, inferFundingAccount, isMissingPaymentMethod, normalizePaymentMethod, setExactFundingMapping, singlePaymentMethod } from "./lib/accounts.js";
+import { accountIsActive, confirmFundingAccount, detectAccounts, fundingMappingIssue, inferFundingAccount, isMissingPaymentMethod, normalizePaymentMethod, setExactFundingMapping, singlePaymentMethod, unallocatedFundingParts } from "./lib/accounts.js";
 import { generateEntries, suggestOpens, transactionPostings } from "./lib/generate.js";
 import { isAlipay, parseAlipay } from "./parsers/alipay.js";
 import { isWechat, parseWechat } from "./parsers/wechat.js";
@@ -148,10 +148,15 @@ function applyWechatExclusions(txs: ParsedTx[], rules: ReturnType<typeof loadWec
   return true;
 }
 
+function needsFundingAccount(tx: ParsedTx): boolean {
+  return !tx.fundingAccount && !tx.fundingAccount2 && !tx.postings?.length && !tx.excludedReason
+    && tx.status !== "excluded" && tx.status !== "duplicate";
+}
+
 function unmappedPayments(txs: ParsedTx[], wechatRules: ReturnType<typeof loadWechatRules>) {
   const groups = new Map<string, { raw: string; fromFile: boolean; txs: ParsedTx[] }>();
   for (const tx of txs) {
-    if (tx.fundingAccount || tx.fundingAccount2 || tx.postings?.length || tx.excludedReason || tx.status === "excluded" || tx.status === "duplicate") continue;
+    if (!needsFundingAccount(tx)) continue;
     if (tx.source === "wechat" && isMissingPaymentMethod(tx.rawAccount)) {
       const recognition = recognizeWechatTransaction(tx, wechatRules);
       if (recognition) tx.recognition = recognition;
@@ -462,14 +467,15 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const rules = wechatRulesFor(txs);
     const exclusionsChanged = applyWechatExclusions(txs, rules);
     const payments = unmappedPayments(txs, rules);
+    const splitPayments = txs.flatMap((tx) => {
+      const fundingParts = needsFundingAccount(tx) ? unallocatedFundingParts(tx) : undefined;
+      return fundingParts ? [{ tx, fundingParts }] : [];
+    });
     const mappings = req.body?.mappings as FundingMappingChoice[] | undefined;
     if (mappings !== undefined && (!Array.isArray(mappings) || mappings.length > payments.size
       || mappings.some((item) => !item || !payments.has(item.id) || typeof item.account !== "string")
       || new Set(mappings.map((item) => item.id)).size !== mappings.length)) throw new ImportError(400, "资金映射无效");
-    const refundsChanged = !payments.size && syncWechatRefunds(txs);
-    if (!payments.size && !exclusionsChanged && !refundsChanged) { res.json({ groups: [] }); return; }
-
-    const currentLedger = payments.size ? ledger() : undefined;
+    const currentLedger = payments.size || splitPayments.length ? ledger() : undefined;
     const available = currentLedger?.accounts.filter(({ account }) => isFundingAccount(account)) ?? [];
     const choices = new Map(mappings?.map(({ id, account }) => [id, account]));
     const groups: FundingMappingGroup[] = [];
@@ -499,8 +505,21 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       confirmFundingAccount(tx, account);
       tx.issues = tx.issues?.filter((issue) => !fundingMappingIssue(issue));
     }
+    let fundingChanged = resolved.size > 0;
+    const fundingConfig = { ...config, assetMapping };
+    for (const { tx, fundingParts } of splitPayments) {
+      const guess = inferFundingAccount({ ...tx, fundingParts }, fundingConfig, currentLedger);
+      if (!guess.account) continue;
+      tx.fundingParts = fundingParts;
+      tx.fundingAccount = guess.account;
+      tx.fundingConfidence = guess.confidence;
+      tx.fundingReason = guess.reason;
+      const issues = (tx.issues ?? []).filter((issue) => issue !== "组合支付" && !fundingMappingIssue(issue));
+      tx.issues = [...new Set([...issues, ...(guess.issues ?? [])])];
+      fundingChanged = true;
+    }
     // Matching can use the new funding accounts before review starts. Resumed batches keep prior review decisions.
-    if (batch.revision === 1 && currentLedger) {
+    if (fundingChanged && batch.revision === 1 && currentLedger) {
       for (const tx of batch.txs) {
         delete tx.matches;
         delete tx.duplicateOf;
@@ -511,9 +530,11 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       const deduped = markDuplicates(batch.txs, currentLedger.transactions), paired = pairTransfers(batch.txs);
       referenceUncommittedBatches(batch.txs, batches.list().filter((item) => item.batchId !== batch.batchId && item.ledgerProfile === batch.ledgerProfile));
       batch.dedup = { ...deduped.stats, transferPairs: paired.pairs.length, familyCardPairs: paired.familyCardPairs };
-    } else if (currentLedger) {
+    } else if (fundingChanged && currentLedger) {
       refreshLedgerDuplicateHints(txs, currentLedger.transactions);
     }
+    const refundsChanged = syncWechatRefunds(txs);
+    if (!fundingChanged && !exclusionsChanged && !refundsChanged) { res.json({ groups: [] }); return; }
     const release = lockBatch(batch.batchId);
     try {
       const latest = getBatch(batch.batchId);
@@ -524,7 +545,6 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
         saveConfig(candidate, { activeLedgerFile: options.activeLedgerFile });
         config = candidate;
       }
-      if (payments.size) syncWechatRefunds(txs);
       batch.accountsDetected = detectAccounts(batch.txs.filter((tx) => !tx.merge));
       saveBatchRevision(batch);
     } finally {
