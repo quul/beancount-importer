@@ -27,13 +27,21 @@ try {
   assert.deepEqual(JSON.parse(String(requests.at(-1)?.init?.body)), { revision: 7, decisions: [{ id: "row", funding: "Assets:Wallet", tags: ["checked"], flag: "!" }] });
   await api.decide("batch/one", 7, [{ id: "row", status: "excluded" }], true);
   assert.deepEqual(JSON.parse(String(requests.at(-1)?.init?.body)), { revision: 7, decisions: [{ id: "row", status: "excluded" }], changesOnly: true });
+  const reviewSessionId = "1234567890abcdef1234567890abcdef";
+  await api.decide("batch/one", 7, [{ id: "row", status: "ready" }], true, reviewSessionId);
+  assert.deepEqual(JSON.parse(String(requests.at(-1)?.init?.body)), { revision: 7, decisions: [{ id: "row", status: "ready" }], changesOnly: true, reviewSessionId });
+  await api.excludeSuspected("batch/one", 7, reviewSessionId);
+  assert.deepEqual(JSON.parse(String(requests.at(-1)?.init?.body)), { revision: 7, reviewSessionId });
+  await api.undoReviewStatus("batch/one", 8, reviewSessionId);
+  assert.equal(requests.at(-1)?.url, "/api/batch/batch%2Fone/undo-review-status");
+  assert.deepEqual(JSON.parse(String(requests.at(-1)?.init?.body)), { revision: 8, reviewSessionId });
   await api.commit("batch", 8);
   assert.deepEqual(JSON.parse(String(requests.at(-1)?.init?.body)), { revision: 8 });
   await api.deleteBatch("batch/one", 9);
   assert.equal(requests.at(-1)?.url, "/api/batch/batch%2Fone");
   assert.equal(requests.at(-1)?.init?.method, "DELETE");
   assert.deepEqual(JSON.parse(String(requests.at(-1)?.init?.body)), { revision: 9 });
-  console.log("✓ config is parsed; reviewed funding reaches decide; commit sends only its revision");
+  console.log("✓ config is parsed; review saves, undo and commit use their expected request fields");
 
   assert.deepEqual(parseTags("#trip trip,checked，!bad"), ["trip", "checked", "!bad"]);
   assert.deepEqual(invalidTags("trip2026 checked.one refund/a other_tag ok-tag"), []);

@@ -55,6 +55,7 @@ interface SavedDecisions {
   ok: boolean;
   revision: number;
   ready: number;
+  reviewUndo?: ImportPreview["reviewUndo"];
   batch?: ImportPreview;
   changes?: { txs: ParsedTx[]; parseStats: NonNullable<ImportPreview["parseStats"]> };
 }
@@ -123,7 +124,10 @@ export const api = {
   pdfPreview: (id: string, txId: string, signal?: AbortSignal) =>
     send<PdfPreview>(`/api/batch/${encodeURIComponent(id)}/pdf-preview/${encodeURIComponent(txId)}`, { signal }),
   recheckLedger: (id: string, revision: number) => post<{ batch: ImportPreview; suspected: number }>(`/api/batch/${encodeURIComponent(id)}/recheck-ledger`, { revision }),
-  excludeSuspected: (id: string, revision: number) => post<{ batch: ImportPreview; excluded: number }>(`/api/batch/${encodeURIComponent(id)}/exclude-suspected`, { revision }),
+  excludeSuspected: (id: string, revision: number, reviewSessionId?: string) =>
+    post<{ batch: ImportPreview; excluded: number }>(`/api/batch/${encodeURIComponent(id)}/exclude-suspected`, { revision, reviewSessionId }),
+  undoReviewStatus: (id: string, revision: number, reviewSessionId: string) =>
+    post<{ batch: ImportPreview; restoredIds: string[] }>(`/api/batch/${encodeURIComponent(id)}/undo-review-status`, { revision, reviewSessionId }),
   funding: (id: string, revision: number, mappings?: FundingMappingChoice[]) => post<{ groups: FundingMappingGroup[]; batch?: ImportPreview; config?: ConfigResponse }>(`/api/batch/${encodeURIComponent(id)}/funding`, { revision, mappings }),
   saveFundingMapping: (batchId: string, revision: number, id: string, account: string) =>
     post<{ batch: ImportPreview; config: ConfigResponse; updated: number }>(
@@ -132,8 +136,8 @@ export const api = {
   deleteBatch: (id: string, revision: number) => send<{ ok: true }>(`/api/batch/${encodeURIComponent(id)}`, {
     method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ revision }),
   }),
-  decide: (id: string, revision: number, decisions: TxDecision[], changesOnly = false) => post<SavedDecisions>(
-    `/api/batch/${encodeURIComponent(id)}/decide`, { revision, decisions, changesOnly: changesOnly || undefined }),
+  decide: (id: string, revision: number, decisions: TxDecision[], changesOnly = false, reviewSessionId?: string) => post<SavedDecisions>(
+    `/api/batch/${encodeURIComponent(id)}/decide`, { revision, decisions, changesOnly: changesOnly || undefined, reviewSessionId }),
   merge: (id: string, revision: number, ids: string[], draft: MergeDraft) => post<{ batch: ImportPreview; mergedId: string }>(
     `/api/batch/${encodeURIComponent(id)}/merge`, { revision, ids, ...draft }),
   undoMerge: (id: string, revision: number, mergedId: string) => post<{ batch: ImportPreview }>(

@@ -16,6 +16,7 @@ import { configWithDefaults, defaultActiveLedgerFile, loadConfig, readLedgerSett
 import { discoverPython, LedgerAccessError, parseLedger, parseLedgerAsync, validateLedgerFile } from "./lib/ledger.js";
 import { markDuplicates, refreshLedgerDuplicateHints, sourceKey } from "./lib/dedup.js";
 import { matchStatementRefunds, restoreAlipayFullRefundPurchases, syncStatementRefunds } from "./lib/refunds.js";
+import { availableReviewUndo, rememberReviewStatusChange, reviewStatuses } from "./lib/review-undo.js";
 import { classifyLocal, classifyWithLlm, loadMemory, saveMemory, suggestRefundsFromBatch } from "./lib/classify.js";
 import {
   accountIsActive, confirmFundingAccount, detectAccounts, fundingMappingIssue, inferFundingAccount, isMissingPaymentMethod,
@@ -248,21 +249,35 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   const requireRevision = (batch: StoredBatch, value: unknown) => {
     if (!Number.isInteger(value) || value !== batch.revision) throw new ImportError(409, "批次已被更新，请重新加载");
   };
+  const readReviewSessionId = (value: unknown) => {
+    if (value === undefined) return;
+    if (typeof value !== "string" || !/^[a-f0-9]{32}$/.test(value)) throw new ImportError(400, "审批会话无效，请重新打开审批页");
+    return value;
+  };
   const requireActiveBatch = (batch: StoredBatch) => {
     if (batch.mergedInto) throw new ImportError(409, "此批次已合并，请打开合并后的批次");
   };
   const saveBatchRevision = (batch: StoredBatch) => {
+    if (batch.reviewStatusHistory) {
+      const undo = availableReviewUndo(batch);
+      if (undo) batch.reviewStatusHistory.operations.length = undo.depth;
+      else delete batch.reviewStatusHistory;
+    }
     batch.revision++;
     delete batch.preview;
     batches.save(batch);
   };
   const publicBatch = (batch: StoredBatch) => {
-    const counterparts = matchStatementRefunds(activeTransactions(batch.txs));
+    const active = activeTransactions(batch.txs);
+    const counterparts = matchStatementRefunds(active);
     const txs = counterparts.size ? batch.txs.map((tx) => {
       const refundCounterpartId = counterparts.get(tx.id);
       return refundCounterpartId ? { ...tx, refundCounterpartId } : tx;
     }) : batch.txs;
-    return { ...batch, file: batchFileLabel(batch), txs, errors: publicParseErrors(batch.errors), preview: undefined, pdfUploads: undefined, ledgerProfile: undefined, parseStats: stats(batch) };
+    const undo = availableReviewUndo(batch, active);
+    return { ...batch, file: batchFileLabel(batch), txs, errors: publicParseErrors(batch.errors),
+      preview: undefined, pdfUploads: undefined, ledgerProfile: undefined, reviewStatusHistory: undefined, parseStats: stats(batch),
+      reviewUndo: undo ? { sessionId: undo.history.sessionId, depth: undo.depth, action: undo.operation.action, count: undo.operation.entries.length } : undefined };
   };
   const publicReviewBatch = (batch: StoredBatch) => {
     const existence = new Map<string, boolean>();
@@ -556,17 +571,36 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   app.post("/api/batch/:id/exclude-suspected", withBatchWrite((req, res, batch) => {
     if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
     requireRevision(batch, req.body?.revision);
+    const sessionId = readReviewSessionId(req.body?.reviewSessionId);
     const txs = activeTransactions(batch.txs);
     const targets = txs.filter(canExcludeSuspectedDuplicate);
-    for (const tx of targets) {
-      tx.status = "excluded";
-      delete tx.duplicateOf;
-    }
     if (targets.length) {
+      const previous = reviewStatuses(txs);
+      for (const tx of targets) {
+        tx.status = "excluded";
+        delete tx.duplicateOf;
+      }
       syncStatementRefunds(txs);
+      rememberReviewStatusChange(batch, txs, previous, "deduplicate", sessionId);
       saveBatchRevision(batch);
     }
     res.json({ batch: publicReviewBatch(batch), excluded: targets.length });
+  }));
+  app.post("/api/batch/:id/undo-review-status", withBatchWrite((req, res, batch) => {
+    if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
+    requireRevision(batch, req.body?.revision);
+    const sessionId = readReviewSessionId(req.body?.reviewSessionId);
+    const active = activeTransactions(batch.txs);
+    const undo = availableReviewUndo(batch, active);
+    if (!undo || undo.history.sessionId !== sessionId) throw new ImportError(409, "本次审批没有可撤销的状态变更");
+    const previous = new Map(undo.operation.entries.map(({ id, before }) => [id, before]));
+    for (const tx of active) {
+      const status = previous.get(tx.id);
+      if (status !== undefined) tx.status = status;
+    }
+    undo.history.operations.length = undo.depth - 1;
+    saveBatchRevision(batch);
+    res.json({ batch: publicReviewBatch(batch), restoredIds: [...previous.keys()] });
   }));
   app.delete("/api/batch/:id", withBatchWrite((req, res, batch) => {
     requireRevision(batch, req.body?.revision);
@@ -781,6 +815,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   app.post("/api/batch/:id/decide", withBatchWrite((req, res, batch) => {
     if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
     requireRevision(batch, req.body.revision);
+    const sessionId = readReviewSessionId(req.body.reviewSessionId);
     const requested = req.body.decisions as TxDecision[];
     if (!Array.isArray(requested) || requested.length > 5000) throw new ImportError(400, "审阅决策格式无效");
     const decisions: TxDecision[] = [];
@@ -827,6 +862,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     }
     const changesOnly = req.body.changesOnly === true;
     const before = changesOnly ? publicBatch(batch).txs.map((tx) => ({ ...tx })) : undefined;
+    const previousStatuses = reviewStatuses(active);
     let memory: ReturnType<typeof loadMemory> | undefined;
     for (const decision of decisions) {
       const tx = txById.get(decision.id)!;
@@ -858,10 +894,13 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       if (tx.status !== "duplicate") delete tx.duplicateOf;
     }
     syncStatementRefunds(active);
+    const undoAction = decisions.every(({ status }) => status === "ready") ? "approve"
+      : decisions.every(({ status }) => status === "excluded") ? "exclude" : "update";
+    rememberReviewStatusChange(batch, active, previousStatuses, undoAction, sessionId);
     saveBatchRevision(batch);
     if (memory) saveMemory(memoryFile(), memory);
     const reviewed = publicReviewBatch(batch);
-    const result = { ok: true, revision: reviewed.revision, ready: reviewed.parseStats.ready };
+    const result = { ok: true, revision: reviewed.revision, ready: reviewed.parseStats.ready, reviewUndo: reviewed.reviewUndo };
     if (before) {
       const txs = reviewed.txs.filter((tx, index) => {
         const previous = before[index];

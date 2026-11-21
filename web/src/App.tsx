@@ -34,6 +34,7 @@ const STATUS_TABS: Array<{ key: ReviewFilter; label: string }> = [
   { key: "all", label: "全部" }, { key: "pending", label: "待确认" }, { key: "ready", label: "待入账" }, { key: "duplicate", label: "重复" },
   { key: "suspectedDuplicate", label: LEDGER_DUPLICATE_ISSUE }, { key: "excluded", label: "排除" },
 ];
+const REVIEW_UNDO_LABELS = { approve: "撤销入账标记", exclude: "撤销排除", deduplicate: "撤销剔除", update: "撤销状态变更" };
 
 function settingsRoute(): SettingsSection | null {
   if (window.location.hash === SETTINGS_LINKS.funding) return "funding";
@@ -253,6 +254,9 @@ export default function App() {
   const [batch, setBatch] = useState<ImportPreview | null>(null);
   const [batchId, setBatchId] = useState("");
   const [routedBatchId, setRoutedBatchId] = useState(batchIdFromUrl);
+  const reviewSessionId = useMemo(() => routedBatchId
+    ? Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("")
+    : "", [routedBatchId]);
   const [preview, setPreview] = useState<GeneratedPreview | null>(null);
   const [previewCheck, setPreviewCheck] = useState<PreviewCheck | null>(null);
   const [busy, setBusy] = useState(true);
@@ -269,6 +273,7 @@ export default function App() {
   const [detailTxId, setDetailTxId] = useState<string | null>(null);
   const [detailAsDrawer, setDetailAsDrawer] = useState(() => window.matchMedia(DETAIL_DRAWER_QUERY).matches);
   const [reviewFocus, setReviewFocus] = useState<ReviewTarget | null>(null);
+  const [undoFlashIds, setUndoFlashIds] = useState<ReadonlySet<string> | null>(null);
   const [categoryAdvance, setCategoryAdvance] = useState<CategoryAdvance | null>(null);
   const [drafts, setDrafts] = useState<Record<string, TransactionDraft>>({});
   const [detailSaveAttempt, setDetailSaveAttempt] = useState<{ id: string }>();
@@ -460,6 +465,8 @@ export default function App() {
   const accounts = ledger?.accounts ?? [];
   const posted = Boolean(batch?.committed);
   const readOnly = posted || Boolean(batch?.mergedInto);
+  const reviewUndo = !settings && !readOnly && batchId === routedBatchId && batch?.reviewUndo?.sessionId === reviewSessionId
+    ? batch.reviewUndo : undefined;
   const statementSources = useMemo(() => new Map(batch?.statementSources?.map((source) => [source.id, source])), [batch?.statementSources]);
   const sourcesFor = (entries: readonly ParsedTx[]) => [...new Set(entries.flatMap((tx) => tx.statementSourceIds ?? []))]
     .flatMap((id) => statementSources.get(id) ?? []);
@@ -473,6 +480,7 @@ export default function App() {
   const hasReviewDrafts = detailDraftIds.length > 0 || Object.keys(narrationDrafts).length > 0;
   const reviewIsSaving = pendingSaves.length > 0;
   const blockBatchChanges = hasReviewDrafts || reviewIsSaving;
+  const undoDisabled = !reviewUndo || editingDisabled || blockBatchChanges;
   const dateScopedRows = useMemo(() => dateRange.start || dateRange.end
     ? reviewRows.filter((row) => matchesReviewDateRange(row, dateRange)) : reviewRows, [dateRange, reviewRows]);
   const visible = useMemo(() => {
@@ -658,6 +666,41 @@ export default function App() {
     }
     setCategoryAdvance(null);
   }, [busy, categoryAdvance, currentPage, detailAsDrawer, detailTxId, drafts, readOnly, settings, visible]);
+
+  useLayoutEffect(() => {
+    if (!undoFlashIds || busy || settings || batchId !== routedBatchId) return;
+    const affected = ({ entries }: ReviewRow) => entries.some(({ id }) => undoFlashIds.has(id));
+    const index = visible.findIndex(affected);
+    if (index < 0) {
+      const affectedRows = reviewRows.filter(affected);
+      const query = filter.trim().toLowerCase();
+      const row = affectedRows.find((item) => matchesReviewDateRange(item, dateRange) && matchesReviewSearch(item, query)) ?? affectedRows[0];
+      if (!row) { setUndoFlashIds(null); return; }
+      if (!matchesReviewFilter(row, statusFilter)) setStatusFilter("all");
+      if (!matchesReviewDateRange(row, dateRange)) setDateRange(EMPTY_REVIEW_DATE_RANGE);
+      if (!matchesReviewSearch(row, query)) setFilter("");
+      return;
+    }
+    const pageStart = currentPage * PAGE_SIZE;
+    const affectedOnPage = visible.slice(pageStart, pageStart + PAGE_SIZE).filter(affected);
+    if (!affectedOnPage.length) { setPage(Math.floor(index / PAGE_SIZE)); return; }
+
+    const highlight = "color-mix(in srgb, var(--accent) 18%, var(--surface))";
+    const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    for (const [position, { tx }] of affectedOnPage.entries()) {
+      const row = document.getElementById(`review-row-${tx.id}`) as HTMLTableRowElement | null;
+      if (!row) continue;
+      if (position === 0) row.scrollIntoView({ block: "nearest", inline: "nearest" });
+      for (const cell of row.cells) {
+        cell.animate([
+          { backgroundColor: highlight },
+          { backgroundColor: highlight, offset: 0.35 },
+          { backgroundColor: reducedMotion ? highlight : getComputedStyle(cell).backgroundColor },
+        ], { duration: reducedMotion ? 650 : 900, easing: "ease-out" });
+      }
+    }
+    setUndoFlashIds(null);
+  }, [batchId, busy, currentPage, dateRange, filter, reviewRows, routedBatchId, settings, statusFilter, undoFlashIds, visible]);
   const suspectedEntries = active.filter(canExcludeSuspectedDuplicate);
 
   const selectTransactions = (transactions: ParsedTx[], checked: boolean) => {
@@ -691,6 +734,7 @@ export default function App() {
     replaceBatch(value, id);
     setPreviewCheck(null);
     setReviewFocus(null);
+    setUndoFlashIds(null);
     setDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null);
     setFilter(""); setDateRange(EMPTY_REVIEW_DATE_RANGE); setStatusFilter(value.committed || value.mergedInto ? "all" : "pending");
     setBulkScope("selected"); setBulkTags("");
@@ -848,12 +892,12 @@ export default function App() {
         discardNarrationDraft(savedNarration.id, savedNarration.value);
         return;
       }
-      const saved = await api.decide(id, current.revision ?? 0, changes, true);
+      const saved = await api.decide(id, current.revision ?? 0, changes, true, reviewSessionId);
       let next = saved.batch;
       if (!next && saved.changes) {
         const updated = new Map(saved.changes.txs.map((tx) => [tx.id, tx]));
         next = {
-          ...current, revision: saved.revision, parseStats: saved.changes.parseStats,
+          ...current, revision: saved.revision, parseStats: saved.changes.parseStats, reviewUndo: saved.reviewUndo,
           txs: current.txs.map((tx) => updated.get(tx.id) ?? tx),
         };
       }
@@ -1001,9 +1045,18 @@ export default function App() {
     if (blockBatchChanges || !suspectedEntries.length) return;
     const patches: ReviewPatches = new Map(suspectedEntries.map(({ id }) => [id, () => ({ status: "excluded", duplicateOf: undefined })]));
     enqueueReviewSave(async (id, current) => {
-      const result = await api.excludeSuspected(id, current.revision ?? 0);
+      const result = await api.excludeSuspected(id, current.revision ?? 0, reviewSessionId);
       return { batch: result.batch, notice: `已剔除 ${result.excluded} 笔疑似重复` };
     }, { patches });
+  };
+
+  const undoReviewStatus = () => {
+    if (undoDisabled) return;
+    enqueueReviewSave(async (id, current) => {
+      const result = await api.undoReviewStatus(id, current.revision ?? 0, reviewSessionId);
+      setUndoFlashIds(new Set(result.restoredIds));
+      return { batch: result.batch, notice: `已恢复 ${result.restoredIds.length} 笔交易的审批状态` };
+    }, { blocking: true });
   };
 
   const generate = () => void perform(async () => {
@@ -1042,6 +1095,7 @@ export default function App() {
     setPdfPreviewTx(null);
     setMappingTarget(null);
     setReviewFocus(null);
+    setUndoFlashIds(null);
     setBatchMergeOptions(null);
     setRenameStatementsOpen(false);
   };
@@ -1716,6 +1770,10 @@ export default function App() {
         <div className="toolbar review-header">
           <h2 id="review-heading">审批交易</h2>
           {!emptyImportFailed && <div className="toolbar review-actions" role="group" aria-label="批次操作">
+            <button type="button" className="btn small" disabled={undoDisabled} onClick={undoReviewStatus}
+              title={reviewUndo ? `恢复 ${reviewUndo.count} 笔交易的审批状态` : undefined}>
+              {reviewUndo ? `${REVIEW_UNDO_LABELS[reviewUndo.action]}（${reviewUndo.depth}）` : "撤销"}
+            </button>
             <ReviewMenu label="批次操作" title="批次操作">{(close) => <>
               <button className="menu-action" disabled={busy || blockBatchChanges} onClick={() => { close(); reloadBatch(); }}>重新载入</button>
               {Boolean(batch.statementSources?.length) && !batch.mergedInto && <button className="menu-action" disabled={busy || blockBatchChanges}

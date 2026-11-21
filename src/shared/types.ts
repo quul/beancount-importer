@@ -241,6 +241,13 @@ export interface BatchReviewConflict {
   choices: Array<{ batchId: string; file: string; txs: ParsedTx[] }>;
 }
 
+export interface ReviewStatusUndo {
+  sessionId: string;
+  action: "approve" | "exclude" | "deduplicate" | "update";
+  count: number;
+  depth: number;
+}
+
 export interface ImportPreview {
   file: string;
   source: SourceType;
@@ -256,6 +263,7 @@ export interface ImportPreview {
   mergedInto?: string;
   statementSources?: StatementSource[];
   reviewConflicts?: BatchReviewConflict[];
+  reviewUndo?: ReviewStatusUndo;
   committedAt?: string;
   written?: string[];
   parseStats?: { total: number; excluded: number; pending: number; duplicate: number; ready: number };

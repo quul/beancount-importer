@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import type { GenerateResult, ImportPreview } from "../../shared/types.js";
+import type { GenerateResult, ImportPreview, ReviewStatusUndo, TxStatus } from "../../shared/types.js";
 
 export type StoredPdfUpload = string | { archiveName: string };
 
@@ -15,6 +15,13 @@ export interface StoredBatch extends ImportPreview {
   /** Storage names of the original PDFs, keyed by their upload digest. */
   pdfUploads?: Record<string, StoredPdfUpload>;
   preview?: { revision: number; result: GenerateResult; opens: string[] };
+  reviewStatusHistory?: {
+    sessionId: string;
+    operations: Array<{
+      action: ReviewStatusUndo["action"];
+      entries: Array<{ id: string; before: TxStatus; after: TxStatus }>;
+    }>;
+  };
   mergedFrom?: string[];
 }
 

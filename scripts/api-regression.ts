@@ -22,6 +22,7 @@ import type { AppConfig, ImportPreview, ParsedTx } from "../src/shared/types.js"
 const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bean-api-regression-")));
 const python = process.env.ACCOUNT_IMPORT_PYTHON || discoverPython(discoverLedgerRoot());
 const applications = new Map<string, ReturnType<typeof createApp>>();
+const reviewSessionId = "1234567890abcdef1234567890abcdef";
 let checks = 0;
 const passed = (label: string) => { checks++; console.log(`✓ ${label}`); };
 const root = path.join(temporary, "ledger");
@@ -410,15 +411,24 @@ try {
     const statusRoute = `/api/batch/${sample.batchId}`;
     const withoutPython = await boot({ ...config, pythonPath: path.join(temporary, "missing-python.exe") }, statusData);
     const id = sample.txs[0].id;
-    const excluded = await request(withoutPython, statusRoute + "/decide", { revision: sample.revision, decisions: [{ id, status: "excluded" }], changesOnly: true });
+    const otherSession = "abcdef1234567890abcdef1234567890";
+    assert.equal(sample.reviewUndo, undefined);
+    const excluded = await request(withoutPython, statusRoute + "/decide", {
+      revision: sample.revision, decisions: [{ id, status: "excluded" }], changesOnly: true, reviewSessionId,
+    });
     assert.equal(excluded.batch, undefined);
     assert.deepEqual(excluded.changes.txs.map((tx: ParsedTx) => [tx.id, tx.status]), [[id, "excluded"]]);
     assert.equal(excluded.changes.parseStats.excluded, 2);
+    assert.deepEqual(excluded.reviewUndo, { sessionId: reviewSessionId, depth: 1, action: "exclude", count: 1 });
     await request(withoutPython, statusRoute + "/decide", { revision: sample.revision, decisions: [{ id, status: "ready" }] }, 409);
-    const ready = await request(withoutPython, statusRoute + "/decide", { revision: excluded.revision, decisions: [{ id, status: "ready" }] });
+    const ready = await request(withoutPython, statusRoute + "/decide", {
+      revision: excluded.revision, decisions: [{ id, status: "ready" }], reviewSessionId,
+    });
     assert.equal(ready.batch.txs[0].status, "ready");
     assert.equal(ready.ready, 1);
+    assert.deepEqual(ready.batch.reviewUndo, { sessionId: reviewSessionId, depth: 2, action: "approve", count: 1 });
     assert.deepEqual(ready.batch, await request(withoutPython, statusRoute));
+    assert.equal(ready.batch.reviewStatusHistory, undefined);
     assert.equal(fs.existsSync(path.join(statusData, "profiles")), false);
     const accountFailure = await request(withoutPython, statusRoute + "/decide", {
       revision: ready.revision, decisions: [{ id, account: "Expenses:Food:Meals:Dine" }],
@@ -429,11 +439,46 @@ try {
     assert.deepEqual(generationFailure, accountFailure);
     assert.equal((await request(withoutPython, statusRoute)).revision, ready.revision);
     const narrated = await request(withoutPython, statusRoute + "/decide", {
-      revision: ready.revision, decisions: [{ id, narration: "自动保存的摘要" }], changesOnly: true,
+      revision: ready.revision, decisions: [{ id, narration: "自动保存的摘要" }], changesOnly: true, reviewSessionId,
     });
     assert.equal(narrated.batch, undefined);
     assert.deepEqual(narrated.changes.txs.map((tx: ParsedTx) => [tx.id, tx.status, tx.narration]), [[id, "ready", "自动保存的摘要"]]);
     passed("posting decisions can return only changed rows without invoking Python, while account checks and generation still require it");
+
+    const updated = await request(statusBase, statusRoute + "/decide", {
+      revision: narrated.revision, decisions: [{ id, account: "Equity:Coupons:Payment", reviewNote: "保留审批备注", tags: ["keep"] }],
+      changesOnly: true, reviewSessionId,
+    });
+    assert.deepEqual(updated.reviewUndo, { sessionId: reviewSessionId, depth: 2, action: "approve", count: 1 });
+    const reopened = await boot({ ...config, pythonPath: path.join(temporary, "missing-python.exe") }, statusData);
+    const current = await request(reopened, statusRoute);
+    const undoRoute = statusRoute + "/undo-review-status";
+    await request(reopened, undoRoute, { revision: narrated.revision, reviewSessionId }, 409);
+    await request(reopened, undoRoute, { revision: current.revision, reviewSessionId: otherSession }, 409);
+    const undone = await request(reopened, undoRoute, { revision: current.revision, reviewSessionId });
+    assert.deepEqual(undone.restoredIds, [id]);
+    assert.equal(undone.batch.revision, current.revision + 1);
+    assert.deepEqual(undone.batch.txs, [{ ...current.txs[0], status: "excluded" }, current.txs[1]]);
+    assert.deepEqual(undone.batch.reviewUndo, excluded.reviewUndo);
+    const initialStatus = await request(reopened, undoRoute, { revision: undone.batch.revision, reviewSessionId });
+    assert.deepEqual(initialStatus.restoredIds, [id]);
+    assert.deepEqual(initialStatus.batch.txs, [{ ...current.txs[0], status: sample.txs[0].status }, current.txs[1]]);
+    assert.equal(initialStatus.batch.reviewUndo, undefined);
+    assert.equal(new BatchStore(path.join(statusData, "batches")).get(sample.batchId)?.reviewStatusHistory, undefined);
+    await request(reopened, undoRoute, { revision: initialStatus.batch.revision, reviewSessionId }, 409);
+    const excludedAgain = await request(reopened, statusRoute + "/decide", {
+      revision: initialStatus.batch.revision, decisions: [{ id, status: "excluded" }], reviewSessionId,
+    });
+    assert.deepEqual(excludedAgain.batch.reviewUndo, excluded.reviewUndo);
+    const newVisit = await request(reopened, statusRoute + "/decide", {
+      revision: excludedAgain.revision, decisions: [{ id, status: "ready" }], reviewSessionId: otherSession,
+    });
+    assert.deepEqual(newVisit.batch.reviewUndo, { sessionId: otherSession, depth: 1, action: "approve", count: 1 });
+    await request(reopened, undoRoute, { revision: newVisit.revision, reviewSessionId }, 409);
+    const restored = await request(reopened, undoRoute, { revision: newVisit.revision, reviewSessionId: otherSession });
+    assert.deepEqual(restored.batch.txs, excludedAgain.batch.txs);
+    assert.equal(restored.batch.reviewUndo, undefined);
+    passed("review status undo is last-in-first-out within a visit and preserves later category, narration, and review metadata edits");
   }
   {
     const catalogRoot = path.join(temporary, "account-catalog");
@@ -720,19 +765,30 @@ try {
     store.save({ ...saved, preview: { revision: saved.revision, result: { entries: "", monthFiles: {}, generated: [], opens: [] }, opens: [] } });
     const action = `/api/batch/${saved.batchId}/exclude-suspected`;
     await request(exclusionBase, action, { revision: saved.revision + 1 }, 409);
-    const excluded = await request(exclusionBase, action, { revision: saved.revision });
+    const excluded = await request(exclusionBase, action, { revision: saved.revision, reviewSessionId });
     assert.equal(excluded.excluded, suspects.length);
+    assert.deepEqual(excluded.batch.reviewUndo, { sessionId: reviewSessionId, depth: 1, action: "deduplicate", count: suspects.length });
     assert.equal(excluded.batch.revision, saved.revision + 1);
     assert.ok(excluded.batch.txs.slice(0, suspects.length).every((tx: ParsedTx) => tx.status === "excluded" && tx.reviewNote === "已核对备注"));
     assert.deepEqual(excluded.batch.txs.slice(suspects.length), other);
     const updated = store.get(saved.batchId)!;
     assert.equal(updated.preview, undefined);
-    const repeated = await request(exclusionBase, action, { revision: updated.revision });
+    const repeated = await request(exclusionBase, action, { revision: updated.revision, reviewSessionId });
     assert.equal(repeated.excluded, 0);
     assert.equal(repeated.batch.revision, updated.revision);
-    store.save({ ...updated, committed: true });
-    await request(exclusionBase, action, { revision: updated.revision }, 409);
-    passed("batch exclusion saves all eligible suspects atomically, preserves other rows, and guards revisions and committed batches");
+    assert.deepEqual(repeated.batch.reviewUndo, excluded.batch.reviewUndo);
+    const undo = `/api/batch/${saved.batchId}/undo-review-status`;
+    const restored = await request(exclusionBase, undo, { revision: repeated.batch.revision, reviewSessionId });
+    assert.deepEqual(restored.restoredIds, suspects.map(({ id }) => id));
+    assert.equal(restored.batch.revision, saved.revision + 2);
+    assert.equal(restored.batch.reviewUndo, undefined);
+    assert.deepEqual(restored.batch.txs, JSON.parse(JSON.stringify(txs)));
+    const excludedAgain = await request(exclusionBase, action, { revision: restored.batch.revision, reviewSessionId });
+    store.save({ ...store.get(saved.batchId)!, committed: true });
+    assert.equal((await request(exclusionBase, `/api/batch/${saved.batchId}`)).reviewUndo, undefined);
+    await request(exclusionBase, action, { revision: excludedAgain.batch.revision }, 409);
+    await request(exclusionBase, undo, { revision: excludedAgain.batch.revision, reviewSessionId }, 409);
+    passed("batch exclusion saves and undoes all eligible suspects atomically while preserving other rows");
   }
   {
     const mappingRoot = path.join(temporary, "mapping-ledger");
