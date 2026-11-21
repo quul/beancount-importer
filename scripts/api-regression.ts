@@ -1214,6 +1214,104 @@ try {
     passed("WeChat partial refunds net against the purchase category across funding accounts and respect manual review");
   }
   {
+    const refundRoot = path.join(temporary, "pdf-refund-ledger");
+    const refundData = path.join(temporary, "pdf-refund-data");
+    const cmb = "Liabilities:CreditCard:CMB", citic = "Liabilities:CreditCard:CITIC";
+    const category = "Expenses:Food:Meals:Dine";
+    const refundDefinitions = definitions + [cmb, citic].map((account) => `2025-01-01 open ${account} CNY\n`).join("");
+    fs.mkdirSync(refundRoot);
+    fs.writeFileSync(path.join(refundRoot, "main.bean"), refundDefinitions);
+    const refundBase = await boot({ ...config, ledgerRoot: refundRoot, assetMapping: [
+      ...config.assetMapping,
+      { keyword: "招商银行", cardSuffix: "4141", account: cmb, kind: "credit" },
+      { keyword: "中信银行", cardSuffix: "6363", account: citic, kind: "credit" },
+    ] }, refundData);
+    const columns = [43, 94, 140, 380, 479, 545];
+    const cmbRows = [
+      ["招商银行信用卡对账单（2026年5月）"], ["账单日", "", "2026年5月7日"],
+      ["交易日", "记账日", "交易摘要", "人民币金额", "卡号末四位", "原始金额"],
+      ["退款"], ["04/15", "04/17", "招行测试商户", "-17.00", "4141", "-17.00"],
+      ["消费"], ["04/15", "04/16", "招行测试商户", "17.00", "4141", "17.00"],
+    ];
+    const cmbPdf = await fixturePdf([cmbRows.map((row, index) => [760 - index * 14, row.map((value, col) => [columns[col], value])])]);
+    const cmbBatch = await upload(refundBase, cmbPdf, "招行退款测试.pdf");
+    assert.equal(cmbBatch.source, "bank-cmb");
+    assert.deepEqual(cmbBatch.errors, []);
+    const cmbOriginal = cmbBatch.txs.find((tx) => tx.eventType === "expense")!;
+    const cmbReturn = cmbBatch.txs.find((tx) => tx.eventType === "refund")!;
+    assert.equal(cmbOriginal.refundCounterpartId, cmbReturn.id);
+    assert.equal(cmbReturn.refundCounterpartId, cmbOriginal.id);
+    assert.equal(cmbOriginal.fundingAccount, cmb);
+
+    const store = new BatchStore(path.join(refundData, "batches"));
+    const older = store.get(cmbBatch.batchId)!;
+    older.txs = older.txs.map(({ refundEvidence, refundCounterpartId, ...tx }) => tx.id === cmbOriginal.id
+      ? { ...tx, status: "ready", finalAccount: category } : { ...tx, reviewNote: "保留旧备注" });
+    store.save(older);
+    const cmbRoute = `/api/batch/${older.batchId}`;
+    const resumed = await request(refundBase, cmbRoute) as ImportPreview;
+    assert.equal(resumed.txs.find((tx) => tx.id === cmbReturn.id)?.refundCounterpartId, cmbOriginal.id);
+    const reloaded = await request(refundBase, cmbRoute + "/recheck-ledger", { revision: older.revision });
+    assert.equal(reloaded.batch.parseStats.ready, 2);
+    assert.equal(reloaded.batch.txs.find((tx: ParsedTx) => tx.id === cmbReturn.id)?.reviewNote, "保留旧备注");
+    const cmbPreview = await request(refundBase, cmbRoute + "/generate", { revision: reloaded.batch.revision });
+    assert.equal(cmbPreview.generated, 2);
+    const cmbEntries = parseLedgerText(refundDefinitions + cmbPreview.entries, python);
+    assert.deepEqual(cmbEntries.errors, []);
+    assert.deepEqual(cmbEntries.transactions.map((entry) => entry.date), ["2026-04-15", "2026-04-15"]);
+    assert.deepEqual(cmbEntries.transactions.map((entry) => entry.postings.find((posting) => posting.account === category)?.amount).sort((a, b) => a! - b!), [-17, 17]);
+    assert.deepEqual(cmbEntries.transactions.map((entry) => Number(entry.metadata?.["source-row"])).sort((a, b) => a - b), [cmbReturn.row, cmbOriginal.row].sort((a, b) => a - b));
+
+    const merchant = "测试餐厅";
+    const citicLine = (y: number, booked: string, amount: string): PdfRow =>
+      [y, [[8, "20260513"], [74, booked], [159, "6363"], [214, "支付宝－" + merchant], [370, amount], [482, amount]]];
+    const citicPdf = await fixturePdf([[
+      [780, [[43, "中信银行信用卡对账单"]]],
+      [735, [[7, "交易日"], [78, "银行记账日"], [148, "卡号后四位"], [259, "交易描述"], [370, "交易货币/金额"], [482, "记账货币/金额"]]],
+      citicLine(700, "20260514", "CNY 38.50"), citicLine(670, "20260515", "CNY -38.50"),
+    ]]);
+    const alipayRefund = [csv().split("\n")[0], `2026-05-13 12:20:00,退款,${merchant},餐券退款,收入,38.50,中信银行信用卡(6363),退款成功,202605130000123456_7890`].join("\n");
+    const otherBatch = await upload(refundBase, alipayRefund, "支付宝独立退款.csv");
+    const otherRoute = `/api/batch/${otherBatch.batchId}`;
+    const otherApproved = await request(refundBase, otherRoute + "/decide", { revision: otherBatch.revision,
+      decisions: [{ id: otherBatch.txs[0].id, account: category, status: "ready" }] });
+    const otherPreview = await request(refundBase, otherRoute + "/generate", { revision: otherApproved.revision });
+    assert.equal(otherPreview.generated, 1);
+
+    const uploadResult = await postStatements(refundBase, [["中信退款测试.pdf", citicPdf], ["支付宝同一退款.csv", alipayRefund]]);
+    const uploaded = await uploadResult.json();
+    assert.equal(uploadResult.status, 200, JSON.stringify(uploaded));
+    const route = `/api/batch/${uploaded.batchId}`;
+    const mixed = await request(refundBase, route) as ImportPreview;
+    assert.deepEqual(mixed.errors, []);
+    const purchase = mixed.txs.find((tx) => tx.source === "bank-citic" && tx.eventType === "expense")!;
+    const refund = mixed.txs.find((tx) => tx.source === "bank-citic" && tx.eventType === "refund")!;
+    const copy = mixed.txs.find((tx) => tx.source === "alipay")!;
+    assert.equal(purchase.fundingAccount, citic);
+    assert.equal(purchase.refundCounterpartId, refund.id);
+    assert.equal(refund.refundCounterpartId, purchase.id);
+    assert.equal(copy.status, "duplicate");
+    assert.equal(copy.duplicateOf?.id, refund.id);
+    assert.equal(copy.duplicateOf?.refundCopy, "statement");
+    await request(refundBase, route + "/decide", { revision: mixed.revision, decisions: [{ id: copy.id, account: category, status: "ready" }] }, 422);
+    const approved = await request(refundBase, route + "/decide", { revision: mixed.revision, decisions: [{ id: purchase.id, account: category, status: "ready" }] });
+    assert.equal(approved.ready, 2);
+    assert.equal(approved.batch.txs.find((tx: ParsedTx) => tx.id === refund.id).finalAccount, category);
+    const preview = await request(refundBase, route + "/generate", { revision: approved.revision });
+    assert.equal(preview.generated, 2);
+    await request(refundBase, route + "/commit", { revision: preview.revision });
+    const stale = await request(refundBase, otherRoute + "/commit", { revision: otherPreview.revision }, 409);
+    assert.match(stale.error, /重复退款/);
+    const refreshed = await request(refundBase, otherRoute + "/recheck-ledger", { revision: otherApproved.revision });
+    assert.equal(refreshed.batch.txs[0].duplicateOf?.refundCopy, "ledger");
+    assert.equal(refreshed.batch.parseStats.ready, 0);
+    const ledger = parseLedger(refundRoot, "main.bean", python);
+    assert.deepEqual(ledger.errors, []);
+    assert.equal(ledger.transactions.length, 2);
+    assert.equal(ledger.transactions.filter((entry) => entry.metadata?.["import-event"] === "refund").length, 1);
+    passed("bank PDF refunds survive reload, follow the shared category, and post once across statements and batches");
+  }
+  {
     const walletData = path.join(temporary, "wallet-transfer-data");
     const walletBase = await boot(config, walletData);
     const input = ["交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号",

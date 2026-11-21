@@ -11,7 +11,7 @@ import { isAlipay, parseAlipay } from "../src/server/parsers/alipay.js";
 import { parseWechat } from "../src/server/parsers/wechat.js";
 import { parseDate, parseCsv, readSheet, readTextSmart, txId } from "../src/server/parsers/common.js";
 import { markDuplicates } from "../src/server/lib/dedup.js";
-import { matchWechatRefunds } from "../src/server/lib/refunds.js";
+import { matchStatementRefunds, syncStatementRefunds } from "../src/server/lib/refunds.js";
 import { pairTransfers, clearTransferSuggestion } from "../src/server/lib/transfers.js";
 import { generateEntries, suggestOpens } from "../src/server/lib/generate.js";
 import { inferFundingAccount } from "../src/server/lib/accounts.js";
@@ -134,17 +134,52 @@ try {
     const refund = tx({ ...purchase, id: "refund", sourceTxId: "refund-1", amount: 79.35, time: "17:06:42",
       eventType: "refund", direction: "in", sourceStatus: "已退款¥79.35", rawAccount: "中信银行信用卡（1778）" });
     const expected = new Map([["purchase", "refund"], ["refund", "purchase"]]);
-    assert.deepEqual(matchWechatRefunds([refund, purchase]), expected);
-    assert.deepEqual(matchWechatRefunds([purchase, { ...purchase, id: "duplicate-copy", status: "duplicate" }, refund]), expected);
-    assert.deepEqual(matchWechatRefunds([{ ...purchase, sourceStatus: "已全额退款" }, { ...refund, amount: 100 }]), expected);
+    assert.deepEqual(matchStatementRefunds([refund, purchase]), expected);
+    assert.deepEqual(matchStatementRefunds([purchase, { ...purchase, id: "duplicate-copy", status: "duplicate" }, refund]), expected);
+    assert.deepEqual(matchStatementRefunds([{ ...purchase, sourceStatus: "已全额退款" }, { ...refund, amount: 100 }]), expected);
     for (const unrelated of [
       { ...refund, amount: 79.36 }, { ...refund, payee: "别的商户" }, { ...refund, rawAccount: "中信银行信用卡(2222)" },
       { ...refund, time: "14:35:00" }, { ...refund, source: "alipay" as const }, { ...refund, excludedReason: "交易未完成" },
     ]) {
-      assert.equal(matchWechatRefunds([purchase, unrelated]).size, 0);
+      assert.equal(matchStatementRefunds([purchase, unrelated]).size, 0);
     }
-    assert.equal(matchWechatRefunds([purchase, { ...purchase, id: "other-purchase", sourceTxId: "pay-2" }, refund]).size, 0);
-    assert.equal(matchWechatRefunds([purchase, refund, { ...refund, id: "other-refund", sourceTxId: "refund-2" }]).size, 0);
+    assert.equal(matchStatementRefunds([purchase, { ...purchase, id: "other-purchase", sourceTxId: "pay-2" }, refund]).size, 0);
+    assert.equal(matchStatementRefunds([purchase, refund, { ...refund, id: "other-refund", sourceTxId: "refund-2" }]).size, 0);
+  });
+  check("the same card and amount fallback works across statement types and requires one candidate on both sides", () => {
+    const purchase = tx({ id: "purchase", source: "bank-future", time: undefined, sourceTxId: undefined, rawAccount: "未来银行(123456)" });
+    const refund = { ...purchase, id: "refund", eventType: "refund", direction: "in", status: "pending" } satisfies ParsedTx;
+    const expected = new Map([[purchase.id, refund.id], [refund.id, purchase.id]]);
+    assert.deepEqual(matchStatementRefunds([purchase, refund]), expected);
+    for (const source of ["wechat", "alipay"] as const) {
+      assert.deepEqual(matchStatementRefunds([{ ...purchase, source }, { ...refund, source, sourceStatus: "退款成功" }]), expected);
+    }
+    assert.deepEqual(matchStatementRefunds([purchase, refund].map((row) => ({ ...row, rawAccount: "", refundEvidence: { cardIdentity: "card-token" } }))), expected);
+    for (const unrelated of [
+      { ...refund, rawAccount: "未来银行(654321)" }, { ...refund, payee: "其他商户" }, { ...refund, currency: "USD" },
+      { ...refund, date: "2025-11-01" }, { ...refund, amount: refund.amount - 0.01 }, { ...refund, eventType: "income" as const },
+      { ...refund, refundEvidence: { originalSourceTxId: "different-order" } },
+    ]) assert.equal(matchStatementRefunds([purchase, unrelated]).size, 0);
+    assert.equal(matchStatementRefunds([{ ...purchase, rawAccount: "未来银行" }, { ...refund, rawAccount: "未来银行" }]).size, 0);
+    assert.equal(matchStatementRefunds([purchase, refund, { ...purchase, id: "another-purchase" }]).size, 0);
+    assert.equal(matchStatementRefunds([purchase, refund, { ...refund, id: "another-refund" }]).size, 0);
+  });
+  check("overlapping statements retain one refund and same-statement or ambiguous rows stay reviewable", () => {
+    const first = tx({ id: "first", source: "bank-future", sourceTxId: undefined, rawAccount: "未来银行(1234)",
+      sourceFile: "first.pdf", sourceFileHash: "a".repeat(64), eventType: "refund", direction: "in" });
+    const second = { ...first, id: "second", status: "pending", sourceFile: "second.pdf", sourceFileHash: "b".repeat(64) } satisfies ParsedTx;
+    const copies = [structuredClone(first), structuredClone(second)];
+    assert.equal(syncStatementRefunds(copies), true);
+    assert.equal(copies[1].status, "duplicate");
+    assert.equal(copies[1].duplicateOf?.id, first.id);
+    assert.equal(syncStatementRefunds(copies), false);
+    copies[0].status = "excluded";
+    assert.equal(syncStatementRefunds(copies), false);
+    assert.equal(copies[1].status, "duplicate");
+
+    const ambiguous = [structuredClone(first), structuredClone(second), { ...first, id: "third", row: 3 }];
+    assert.equal(syncStatementRefunds(ambiguous), false);
+    assert.equal(ambiguous.filter((row) => row.status === "duplicate").length, 0);
   });
   const ledger: LedgerTx[] = [{ id: "booked-1", date: "2025-10-31", payee: "商户甲", narration: "人工账本", file: "history.bean", line: 10, postings: [{ account: "Liabilities:CreditCard:ABC:9065", amount: -5, currency: "CNY" }, { account: "Expenses:Shopping", amount: 5, currency: "CNY" }] }];
   check("two same-value purchases do not disappear against one historical posting", () => {

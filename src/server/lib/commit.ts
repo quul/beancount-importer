@@ -9,6 +9,7 @@ import { discoverPython, parseLedger } from "./ledger.js";
 import { generateEntries } from "./generate.js";
 import { importDirectoryError } from "./import-paths.js";
 import { markDuplicates } from "./dedup.js";
+import { syncStatementRefunds } from "./refunds.js";
 
 export class ImportError extends Error {
   constructor(public readonly status: number, message: string, public readonly details?: unknown) {
@@ -237,7 +238,18 @@ export function commitBatch(batch: StoredBatch, config: AppConfig, root: string,
     // Both baseline and duplicate identity come from the same byte snapshot that
     // is later checked against the original tree. No pre-snapshot race window.
     const ledger = parseLedger(stage, mainRelative, python);
-    const ready = structuredClone(activeTransactions(batch.txs).filter((tx) => tx.status === "ready"));
+    const active = activeTransactions(batch.txs);
+    const reviewed = structuredClone(active);
+    if (syncStatementRefunds(reviewed, ledger.transactions)) {
+      const alreadyRefunded = reviewed.some((tx, index) => tx.duplicateOf?.refundCopy && active[index].status === "ready");
+      if (alreadyRefunded) throw new ImportError(409, "发现重复退款。请重新载入批次核对，再生成预览。");
+      const postingChanged = reviewed.some((tx, index) => {
+        const previous = active[index];
+        return (tx.status === "ready") !== (previous.status === "ready") || (tx.status === "ready" && tx.finalAccount !== previous.finalAccount);
+      });
+      if (postingChanged) throw new ImportError(409, "退款配对已更新。请重新载入批次核对，再生成预览。");
+    }
+    const ready = reviewed.filter((tx) => tx.status === "ready");
     const rechecked = markDuplicates(ready, ledger.transactions);
     if (rechecked.txs.some((tx) => tx.status === "duplicate")) {
       throw new ImportError(409, "账本已包含此批次的部分交易，请重新导入对账后再提交");

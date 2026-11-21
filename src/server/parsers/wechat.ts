@@ -2,6 +2,7 @@
 import type { EventType, RawTx } from "../../shared/types.js";
 import { col, findHeader, parseAmount, parseDate, readSheet, txId, parseFundingParts, UNREADABLE_TRANSACTION, type ParseResult } from "./common.js";
 import { loadWechatRules, recognizeWechatTransaction, wechatExclusionReason } from "./wechat-rules.js";
+import { statementRefundEvidence } from "./refund-evidence.js";
 
 export function isWechat(name: string): boolean { return /微信|wechat|weixin/i.test(name); }
 
@@ -53,6 +54,8 @@ export function parseWechat(file: string, rules = loadWechatRules()): ParseResul
     tx.excludedReason ??= wechatExclusionReason(tx, rules);
     const recognition = recognizeWechatTransaction(tx, rules);
     if (recognition) tx.recognition = recognition;
+    const evidence = statementRefundEvidence(tx);
+    if (evidence) tx.refundEvidence = evidence;
     txs.push(tx);
   }
   return { source: "wechat", txs, errors };

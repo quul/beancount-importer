@@ -1,6 +1,6 @@
 /** Only durable source identity proves a duplicate; amount matches are review candidates. */
 import type { DraftPosting, LedgerMatch, LedgerTx, ParsedTx } from "../../shared/types.js";
-import { CROSS_SOURCE_ISSUE, ledgerDuplicateReviewIssue, LEDGER_DUPLICATE_ISSUE } from "../../shared/types.js";
+import { CROSS_SOURCE_ISSUE, CROSS_SOURCE_MATCH_REASON, ledgerDuplicateReviewIssue, LEDGER_DUPLICATE_ISSUE } from "../../shared/types.js";
 import { isFundingAccount } from "../../shared/funding.js";
 import { fundingPostingSign } from "../../shared/postings.js";
 import { sourceKey } from "../../shared/transactionMerge.js";
@@ -138,7 +138,7 @@ export function markDuplicates(allTxs: ParsedTx[], ledgerTxs: LedgerTx[]): Dedup
       addIssue(tx, CROSS_SOURCE_ISSUE);
       tx.matches ??= [];
       for (const sibling of siblings) tx.matches.push({ id: sibling.id, date: sibling.date, payee: sibling.payee, narration: sibling.note,
-        file: sibling.sourceFile, line: sibling.row, reason: "跨来源同日同金额", postings: sibling.postings ?? [] });
+        file: sibling.sourceFile, line: sibling.row, reason: CROSS_SOURCE_MATCH_REASON, postings: sibling.postings ?? [] });
     }
   }
   // Merchant history is useful even while wallet identity or transaction amount

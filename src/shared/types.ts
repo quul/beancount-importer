@@ -52,6 +52,14 @@ export function hasPdfSource(tx: Pick<RawTx, "sourceFile" | "sourceFileHash">): 
   return /\.pdf$/i.test(tx.sourceFile) && /^[a-f0-9]{64}$/.test(tx.sourceFileHash ?? "");
 }
 
+export interface RefundEvidence {
+  cardIdentity?: string;
+  originalSourceTxId?: string;
+  reportedRefundAmount?: number;
+  unconfirmed?: boolean;
+  restoreWhenFullyRefunded?: boolean;
+}
+
 /** One normalized transaction parsed from a statement file. */
 export interface RawTx {
   /** stable hash for dedup: date|amount|direction|payee-normalized */
@@ -86,6 +94,7 @@ export interface RawTx {
   /** row number in the original file, for troubleshooting */
   row: number;
   eventType?: EventType;
+  refundEvidence?: RefundEvidence;
   sourceStatus?: string;
   originalDirection?: string;
   /** Reason to retain this source row for reference and exclude it from posting. */
@@ -109,8 +118,10 @@ export interface TransactionMerge {
 
 export const LEDGER_DUPLICATE_ISSUE = "疑似重复入账";
 export const CROSS_SOURCE_ISSUE = "跨来源疑似重复";
+export const CROSS_SOURCE_MATCH_REASON = "跨来源同日同金额";
 export const ledgerDuplicateReviewIssue = (issue: string) => issue === LEDGER_DUPLICATE_ISSUE || issue.startsWith("可能和账本中的");
-export const duplicateReviewIssue = (issue: string) => ledgerDuplicateReviewIssue(issue) || issue === CROSS_SOURCE_ISSUE || issue.startsWith("不同来源的流水可能是");
+export const crossSourceDuplicateReviewIssue = (issue: string) => issue === CROSS_SOURCE_ISSUE || issue.startsWith("不同来源的流水可能是");
+export const duplicateReviewIssue = (issue: string) => ledgerDuplicateReviewIssue(issue) || crossSourceDuplicateReviewIssue(issue);
 
 export interface ParsedTx extends RawTx {
   status: TxStatus;
@@ -132,6 +143,7 @@ export interface ParsedTx extends RawTx {
     id: string;
     where: string;
     label: string;
+    refundCopy?: "statement" | "ledger";
   };
   /** multi-leg info: e.g. alipay paid with ICBC card → alipay is a pass-through */
   passThrough?: string;
@@ -165,7 +177,7 @@ export function isSuspectedDuplicate(tx: ParsedTx): boolean {
 }
 
 export function canFollowPurchaseRefund(refund: ParsedTx): boolean {
-  if ((refund.source !== "wechat" && refund.source !== "alipay") || refund.eventType !== "refund" || refund.excludedReason
+  if (refund.eventType !== "refund" || refund.direction !== "in" || refund.excludedReason
     || refund.status === "excluded" || refund.status === "duplicate"
     || refund.reviewConflictId || refund.postings || refund.fundingAccount2 || refund.refundReviewMode === "manual") return false;
   return refund.refundReviewMode === "follow-purchase"

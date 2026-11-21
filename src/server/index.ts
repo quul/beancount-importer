@@ -15,7 +15,7 @@ import { hasFundingPosting, isFundingAccount, isStatementOnlyPayment, reusablePa
 import { configWithDefaults, defaultActiveLedgerFile, loadConfig, readLedgerSettings, saveConfig } from "./config.js";
 import { discoverPython, LedgerAccessError, parseLedger, parseLedgerAsync, validateLedgerFile } from "./lib/ledger.js";
 import { markDuplicates, refreshLedgerDuplicateHints, sourceKey } from "./lib/dedup.js";
-import { matchStatementRefunds, restoreAlipayFullRefundPurchases, syncStatementRefunds } from "./lib/refunds.js";
+import { matchStatementRefunds, restoreFullRefundPurchases, syncStatementRefunds } from "./lib/refunds.js";
 import { availableReviewUndo, rememberReviewStatusChange, reviewStatuses } from "./lib/review-undo.js";
 import { classifyLocal, classifyWithLlm, loadMemory, saveMemory, suggestRefundsFromBatch } from "./lib/classify.js";
 import {
@@ -161,8 +161,8 @@ function needsFundingAccount(tx: ParsedTx): boolean {
     && tx.status !== "excluded" && tx.status !== "duplicate";
 }
 
-function restoreAlipayPurchases(txs: readonly ParsedTx[], config: AppConfig, ledger: LedgerInfo): ParsedTx[] {
-  const restored = restoreAlipayFullRefundPurchases(txs);
+function restoreRefundedPurchases(txs: readonly ParsedTx[], config: AppConfig, ledger: LedgerInfo): ParsedTx[] {
+  const restored = restoreFullRefundPurchases(txs);
   for (const tx of restored) {
     if (tx.fundingAccount) continue;
     const guess = inferFundingAccount(tx, config, ledger);
@@ -270,9 +270,9 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   const publicBatch = (batch: StoredBatch) => {
     const active = activeTransactions(batch.txs);
     const counterparts = matchStatementRefunds(active);
-    const txs = counterparts.size ? batch.txs.map((tx) => {
+    const txs = counterparts.size || batch.txs.some((tx) => tx.refundCounterpartId) ? batch.txs.map((tx) => {
       const refundCounterpartId = counterparts.get(tx.id);
-      return refundCounterpartId ? { ...tx, refundCounterpartId } : tx;
+      return refundCounterpartId !== tx.refundCounterpartId ? { ...tx, refundCounterpartId } : tx;
     }) : batch.txs;
     const undo = availableReviewUndo(batch, active);
     return { ...batch, file: batchFileLabel(batch), txs, errors: publicParseErrors(batch.errors),
@@ -356,6 +356,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       if (tx.reviewConflictId) tx.status = "pending";
       else if (approved.has(tx.id) && !tx.excludedReason && tx.status !== "duplicate") tx.status = "ready";
     }
+    syncStatementRefunds(active, currentLedger.transactions);
     return { ...deduped.stats, transferPairs: transfers.pairs.length, familyCardPairs: transfers.familyCardPairs };
   };
 
@@ -405,7 +406,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
         return tx;
       };
       const combined = combineBatchReviews(selected, new Set(keep), resetReview);
-      restoreAlipayPurchases(activeTransactions(combined.txs), config, currentLedger);
+      restoreRefundedPurchases(activeTransactions(combined.txs), config, currentLedger);
       const ledgerProfile = profile();
       const previous = batches.list().filter((item) => item.ledgerProfile === ledgerProfile && !selectedIds.has(item.batchId));
       const dedup = reviewMergedTransactions(combined.txs, currentLedger, previous);
@@ -502,7 +503,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       }
       if (!importedFiles.size) throw new ImportError(422, "未导入任何账单。", errors.map(({ message }) => message));
 
-      restoreAlipayPurchases(txs, uploadConfig, currentLedger);
+      restoreRefundedPurchases(txs, uploadConfig, currentLedger);
       const llm = await classifyWithLlm(txs.filter((tx) => tx.status !== "excluded" && tx.confidence < 0.7), uploadConfig, currentLedger);
       for (const tx of txs) {
         const hit = llm.get(tx.id);
@@ -515,6 +516,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       const deduped = markDuplicates(txs, currentLedger.transactions), paired = pairTransfers(deduped.txs);
       if (profile() !== uploadProfile) throw new ImportError(409, "上传期间账本配置已切换，请在目标账本重新上传");
       referenceUncommittedBatches(deduped.txs, batches.list().filter((previous) => previous.ledgerProfile === uploadProfile));
+      syncStatementRefunds(txs, currentLedger.transactions);
       const batch = batches.create({ file: [...importedFiles.values()].join(", "), source: sources.size === 1 ? [...sources][0] : "unknown",
         txCount: txs.length, txs: deduped.txs, errors,
         accountsDetected: detectAccounts(deduped.txs),
@@ -555,13 +557,13 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       requireRevision(batch, requested.revision);
       const txs = activeTransactions(batch.txs).filter((tx) => !tx.merge && !tx.reviewConflictId);
       const exclusionsChanged = applyWechatExclusions(txs, wechatRulesFor(txs));
-      const restored = restoreAlipayPurchases(txs, config, currentLedger);
+      const restored = restoreRefundedPurchases(txs, config, currentLedger);
       if (restored.length) {
         markDuplicates(restored, currentLedger.transactions);
         batch.accountsDetected = detectAccounts(batch.txs);
       }
       const result = refreshLedgerDuplicateHints(txs, currentLedger.transactions);
-      const refundsChanged = syncStatementRefunds(txs);
+      const refundsChanged = syncStatementRefunds(txs, currentLedger.transactions);
       if (exclusionsChanged || restored.length || result.changed || refundsChanged) saveBatchRevision(batch);
       res.json({ batch: publicReviewBatch(batch), suspected: result.suspected });
     } finally {
@@ -755,7 +757,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     } else if (fundingChanged && currentLedger) {
       refreshLedgerDuplicateHints(txs, currentLedger.transactions);
     }
-    const refundsChanged = syncStatementRefunds(txs);
+    const refundsChanged = syncStatementRefunds(txs, currentLedger?.transactions);
     if (!fundingChanged && !exclusionsChanged && !refundsChanged) { res.json({ groups: [] }); return; }
     const release = lockBatch(batch.batchId);
     try {
@@ -804,7 +806,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       other.issues = other.issues?.filter((issue) => !fundingMappingIssue(issue));
     }
     refreshLedgerDuplicateHints(affected, currentLedger.transactions);
-    syncStatementRefunds(txs);
+    syncStatementRefunds(txs, currentLedger.transactions);
     batch.accountsDetected = detectAccounts(batch.txs.filter((entry) => !entry.merge));
     const candidate = { ...config, assetMapping: setExactFundingMapping(config.assetMapping, tx.source, payment, accountName) };
     saveConfig(candidate, { activeLedgerFile: options.activeLedgerFile });
@@ -849,6 +851,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       if (decision.status !== undefined && !STATUSES.has(decision.status)) throw new ImportError(400, "无效的审阅状态");
       const nextStatus = decision.status ?? (decision.account === undefined ? undefined : "ready");
       if (tx.excludedReason && nextStatus && nextStatus !== "excluded") throw new ImportError(422, `这笔交易已排除（${tx.excludedReason}）`);
+      if (tx.duplicateOf?.refundCopy && nextStatus && nextStatus !== "excluded") throw new ImportError(422, tx.duplicateOf.label);
       if (decision.account !== undefined && (typeof decision.account !== "string" || !hasAccount(decision.account))) throw new ImportError(400, "分类账户必须来自当前账本");
       if (decision.funding !== undefined && (typeof decision.funding !== "string" || !isFundingAccount(decision.funding) || !hasAccount(decision.funding))) throw new ImportError(400, "资金账户必须来自当前账本的资产、负债或收入账户");
       if (decision.tags !== undefined && (!Array.isArray(decision.tags) || decision.tags.length > 40 || decision.tags.some((tag) => typeof tag !== "string" || tag.length > 64 || !TAG_RE.test(tag)))) throw new ImportError(400, "标签格式无效");
@@ -866,7 +869,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     let memory: ReturnType<typeof loadMemory> | undefined;
     for (const decision of decisions) {
       const tx = txById.get(decision.id)!;
-      if ((tx.source === "wechat" || tx.source === "alipay") && tx.eventType === "refund"
+      if (tx.eventType === "refund"
         && (decision.account !== undefined || decision.status !== undefined || decision.postings !== undefined)) tx.refundReviewMode = "manual";
       if (decision.account !== undefined) {
         const account = decision.account;
@@ -915,12 +918,18 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     if (batch.committed) throw new ImportError(409, "该批次已经写入");
     const directoryError = importDirectoryError(config.monthlyDir);
     if (directoryError) throw new ImportError(400, directoryError);
-    const currentLedger = ledger(), result = generateEntries(batch.txs, batch.batchId, config);
+    const currentLedger = ledger();
+    const active = activeTransactions(batch.txs);
+    if (syncStatementRefunds(active, currentLedger.transactions)) {
+      saveBatchRevision(batch);
+      throw new ImportError(409, "退款配对已更新。请核对批次后重新生成预览。");
+    }
+    const result = generateEntries(batch.txs, batch.batchId, config);
     const defined = new Set(currentLedger.accounts.map((account) => account.account));
     const opens = suggestOpens(batch.txs, defined);
     // Accounts in the opens list will be created when the preview is committed.
     const opening = new Set(opens.map((line) => line.split(" open ")[1]));
-    const draft = draftProblems(activeTransactions(batch.txs), currentLedger, opening);
+    const draft = draftProblems(active, currentLedger, opening);
     const errors = [...draft.errors, ...(result.errors ?? [])];
     if (!result.generated.length && !errors.length) errors.push("没有标记入账的交易，请先审批");
     if (errors.length) {

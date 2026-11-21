@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { alipayRefundOrderId } from "../../shared/alipay.js";
 import type { EventType, RawTx } from "../../shared/types.js";
 import { col, parseAmount, parseDate, readTextSmart, parseCsv, txId, parseFundingParts, UNREADABLE_TRANSACTION, type ParseResult } from "./common.js";
+import { statementRefundEvidence } from "./refund-evidence.js";
 
 const requiredColumns = {
   date: ["交易时间", "交易创建时间", "记录时间"],
@@ -69,10 +70,13 @@ export function parseAlipay(file: string): ParseResult {
     if (familyCard) issues.push("对方付款");
     const split = parseFundingParts(rawAccount); issues.push(...split.issues);
     const date = parsed?.date ?? "";
-    txs.push({ id: txId(date, Math.abs(amount ?? 0), direction, payee, `${parsed?.time ?? ""}|${note}|${rawAccount}`, "alipay", sourceTxId),
+    const tx: RawTx = { id: txId(date, Math.abs(amount ?? 0), direction, payee, `${parsed?.time ?? ""}|${note}|${rawAccount}`, "alipay", sourceTxId),
       date, time: parsed?.time, amount: Math.abs(amount ?? 0), direction, currency: "CNY", payee, note,
       rawCategory: cell("tag") || category, rawAccount, sourceTxId, source: "alipay", sourceFile: file, row: r + 1,
-      eventType, sourceStatus, originalDirection, excludedReason, issues, fundingParts: split.fundingParts });
+      eventType, sourceStatus, originalDirection, excludedReason, issues, fundingParts: split.fundingParts };
+    const evidence = statementRefundEvidence(tx);
+    if (evidence) tx.refundEvidence = evidence;
+    txs.push(tx);
   }
   return { source: "alipay", txs, errors };
 }

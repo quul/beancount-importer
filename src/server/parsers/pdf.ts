@@ -266,13 +266,15 @@ function parseTableStatement(file: string, pages: TextLine[][], title: string, r
     const date = (applicable.some((action) => action.date === "bookDate") ? postedDate ?? transactionDate : transactionDate ?? postedDate)!;
     const eventType = applicable.find((action) => action.event)?.event ?? (direction === "in" ? "income" : "expense");
     const suffix = compactPdfText(cell(line, columns, "cardSuffix"));
-    const rawAccount = rule.account ? rule.account.label + (rule.account.suffixPattern.test(suffix) ? `(${suffix})` : "") : file;
+    const cardIdentity = suffix && rule.account?.suffixPattern.test(suffix) ? `${rule.account.label}(${suffix})` : undefined;
+    const rawAccount = cardIdentity ?? rule.account?.label ?? file;
     const original = cell(line, columns, "originalAmount");
     const note = original && compactPdfText(original).replaceAll("−", "-") !== settled ? `${description} · 原交易 ${original}` : description;
     txs.push({
       id: txId(date, Math.abs(amount), direction, description, row, source), date, amount: Math.abs(amount),
       direction, currency, payee: description, note, rawCategory: section || rule.category,
       rawAccount, source, sourceFile: file, row, eventType, pdfRegions: sourceRegions(evidence), issues: [PDF_REVIEW_ISSUE],
+      ...(cardIdentity && (eventType === "expense" || eventType === "refund") ? { refundEvidence: { cardIdentity } } : {}),
     });
   }
   if (!rows.length) errors.push({ row: 0, message: `未找到${rule.name}账单的交易明细` });

@@ -17,7 +17,7 @@ export function reviewPatches(decisions: readonly TxDecision[]): Map<string, Rev
       const edited = { ...tx, ...fields };
       const nextStatus = status === "ready" && missingPostingAccount(edited) ? undefined
         : status ?? (account === undefined ? undefined : statusAfterCategorization(edited));
-      const manualRefund = (tx.source === "wechat" || tx.source === "alipay") && tx.eventType === "refund"
+      const manualRefund = tx.eventType === "refund"
         && (account !== undefined || status !== undefined);
       return {
         ...fields,

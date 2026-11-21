@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import type { AppConfig, EventType, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerMatch, ParsedTx, ReviewProblem, StatementName, TxDecision, TxStatus } from "../../src/shared/types.js";
-import { isClosedAlipayPurchase } from "../../src/shared/alipay.js";
 import {
   canExcludeSuspectedDuplicate, canFollowPurchaseRefund, CROSS_SOURCE_ISSUE, defaultNarration, hasPdfSource, isSuspectedDuplicate,
   LEDGER_DUPLICATE_ISSUE, MAX_NARRATION_LENGTH, PDF_REVIEW_ISSUE,
@@ -744,7 +743,7 @@ export default function App() {
   const prepareReview = async (id: string, value: ImportPreview, opening: ReviewOpening, mappings?: FundingMappingChoice[]) => {
     if (batchIdFromUrl() !== id) return;
     const editable = !value.committed && !value.mergedInto;
-    const restoringRefund = editable && value.txs.some((tx) => tx.refundCounterpartId && isClosedAlipayPurchase(tx));
+    const restoringRefund = editable && value.txs.some((tx) => tx.refundCounterpartId && tx.eventType === "expense" && tx.status === "excluded" && tx.excludedReason);
     if (restoringRefund) {
       const result = await api.recheckLedger(id, value.revision ?? 0);
       if (batchIdFromUrl() !== id) return;
@@ -1233,7 +1232,7 @@ export default function App() {
 
   const renderAccountFields = (tx: ParsedTx, disabled: boolean, refund?: ParsedTx, detail = false) => {
     const payee = tx.payee || "（无商户）";
-    const accountDisabled = disabled || Boolean(tx.postings || refund?.postings);
+    const accountDisabled = disabled || Boolean(tx.postings || refund?.postings || tx.duplicateOf?.refundCopy);
     const isTransfer = tx.eventType === "transfer" && !tx.fundingAccount2;
     const categoryLabel = isTransfer ? "对方账户" : "分类账户";
     const categoryError = fieldProblem(tx.id, "category");
@@ -1284,7 +1283,7 @@ export default function App() {
     const exclude = entries.filter(isEditablePostingStatus);
     const excludeLabel = tx.merge && tx.excludedReason ? "确认不入账" : refund || tx.merge ? "排除此组" : "排除此笔";
     const emphasizeExclude = !compact || Boolean(tx.excludedReason) || entries.some(isSuspectedDuplicate);
-    const canInclude = tx.status !== "ready" && !tx.excludedReason && (!refund || (tx.status === "pending"
+    const canInclude = tx.status !== "ready" && !tx.excludedReason && !tx.duplicateOf?.refundCopy && (!refund || (tx.status === "pending"
       && !tx.postings && refund.status === "pending" && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund)));
     const category = tx.finalAccount || tx.suggestedAccount || "";
     const needsExpenseCategory = Boolean(refund) && !category.startsWith("Expenses:");
@@ -1356,7 +1355,7 @@ export default function App() {
 
   const renderPostingEditor = (tx: ParsedTx, showValidation: boolean, leg?: string) => {
     const error = fieldProblem(tx.id, "postings");
-    if (tx.reviewConflictId || (tx.merge && !error)) return null;
+    if (tx.reviewConflictId || tx.duplicateOf?.refundCopy || (tx.merge && !error)) return null;
     return <div className="detail-posting-editor" key={tx.id}>
       {leg && <h4>{leg}</h4>}
       <ReviewPostingFields tx={tx} accounts={accounts} draft={drafts[tx.id]?.value ?? makeDraft(tx)}
