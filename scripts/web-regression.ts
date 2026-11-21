@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { api, ApiError, IncompleteReviewError } from "../web/src/api.js";
-import { draftDecision, invalidTags, makeDraft, parseTags } from "../web/src/ReviewEditor.js";
+import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, validatePostingDraft } from "../web/src/ReviewEditor.js";
+import { calculatePostingAmount } from "../web/src/postingCalculator.js";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
 import { buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch } from "../web/src/reviewRows.js";
 import { LEDGER_DUPLICATE_ISSUE } from "../src/shared/types.js";
@@ -41,12 +42,15 @@ try {
 
   const refund = { id: "refund", direction: "in", amount: 8.5, currency: "CNY", fundingAccount: "Assets:Wallet", finalAccount: "Expenses:Food", flag: "!", tags: ["refund"], reviewNote: "复核" } as ParsedTx;
   const draft = makeDraft(refund);
-  assert.equal(draft.flag, "!"); assert.equal(draft.postings[0].amount, "-8.5"); assert.equal(draft.postings[1].amount, "8.5");
+  assert.equal(draft.flag, "!");
+  assert.deepEqual(draftPostings(refund, draft).map(({ amount }) => amount), ["-8.5", "8.5"]);
   draft.split = true;
-  const decision = draftDecision(refund, draft);
+  const refundPostings = draftPostings(refund, draft);
+  const refundAccounts = refundPostings.map(({ account }) => ({ account }));
+  const decision = draftDecision(refund, draft, undefined, validatePostingDraft(refundPostings, refundAccounts).postings);
   assert.equal(decision.postings?.[0].amount, -8.5); assert.deepEqual(decision.tags, ["refund"]);
   const splitRefund = { ...refund, postings: decision.postings! };
-  const splitNote = draftDecision(splitRefund, { ...makeDraft(splitRefund), reviewNote: "退款单已核实" });
+  const splitNote = draftDecision(splitRefund, { ...makeDraft(splitRefund), reviewNote: "退款单已核实" }, undefined, decision.postings!);
   assert.ok(!Object.hasOwn(splitNote, "postings"));
   draft.split = false;
   assert.equal(draftDecision(splitRefund, draft).postings, null);
@@ -101,7 +105,7 @@ try {
   const signedIncome = planCategoryAllocations(income, signed.map((part) => ({ ...part, account: part.account.replace("Expenses:", "Income:") })));
   assert.deepEqual(signedIncome.postings?.map(({ amount }) => amount), [0.30, -0.40, 0.10, 0]);
   const gift = { ...income, id: "gift", fundingAccount: "Income:Gifts", finalAccount: "Assets:Wallet" };
-  assert.deepEqual(makeDraft(gift).postings.map(({ amount }) => amount), ["0.3", "-0.3"]);
+  assert.deepEqual(draftPostings(gift, makeDraft(gift)).map(({ amount }) => amount), ["0.3", "-0.3"]);
   const giftPlan = planCategoryAllocations(gift, [{ account: "Assets:Wallet", amount: "0.10" }, { account: "Assets:Bank", amount: "0.20" }]);
   assert.deepEqual(giftPlan.postings?.map(({ amount }) => amount), [-0.30, 0.10, 0.20]);
   assert.deepEqual(savedCategoryAllocations({ ...gift, postings: giftPlan.postings }), [{ account: "Assets:Wallet", amount: "0.10" }, { account: "Assets:Bank", amount: "0.20" }]);
@@ -111,7 +115,42 @@ try {
   assert.deepEqual(giftMerge.errors, []);
   assert.deepEqual(giftMerge.funds, ["Income:Gifts"]);
   assert.equal(giftMerge.skipsPosting, false);
-  console.log("✓ signed category allocations reconcile exactly and preserve both posting directions");
+  const savedPurpose = { ...expense, postings: expensePlan.postings };
+  const savedPurposeDraft = makeDraft(savedPurpose);
+  const existingPostings = draftPostings(savedPurpose, savedPurposeDraft);
+  assert.deepEqual(existingPostings.map(({ account, amount }) => [account, amount]),
+    [["Assets:Wallet", "-0.3"], ["Expenses:Food", "0.1"], ["Expenses:Snacks", "0.2"]]);
+  assert.deepEqual(draftDecision(savedPurpose, { ...savedPurposeDraft, flag: "*" }, savedPurposeDraft, expensePlan.postings),
+    { id: expense.id, flag: "*" });
+  const manualFunding = [
+    { ...existingPostings[0], amount: "-0.3/2" },
+    { account: "Assets:Bank", amount: "-.15", currency: "cny" },
+    ...existingPostings.slice(1),
+  ];
+  const accountChoices = manualFunding.map(({ account }) => ({ account }));
+  const manualValidation = validatePostingDraft(manualFunding, accountChoices);
+  assert.deepEqual(manualValidation.postings?.map(({ amount, currency }) => [amount, currency]),
+    [[-0.15, "CNY"], [-0.15, "CNY"], [0.10, "CNY"], [0.20, "CNY"]]);
+  assert.deepEqual(draftDecision(savedPurpose, savedPurposeDraft, savedPurposeDraft, manualValidation.postings),
+    { id: expense.id, postings: manualValidation.postings });
+  const invalidPosting = validatePostingDraft([...existingPostings, { account: "", amount: "", currency: "" }], accountChoices);
+  assert.deepEqual(invalidPosting.errors.at(-1), { account: "请选择账户", amount: "请输入金额", currency: "请输入币种" });
+  assert.equal(invalidPosting.postings, undefined);
+  const differentCurrency = validatePostingDraft([{ ...existingPostings[0], currency: "USD" }, ...existingPostings.slice(1)], accountChoices);
+  assert.deepEqual([...differentCurrency.imbalances].map(([currency, total]) => [currency, Number(total.toFixed(2))]),
+    [["USD", -0.30], ["CNY", 0.30]]);
+  assert.equal(differentCurrency.postings, undefined);
+  console.log("✓ saved splits reopen as manual postings and only balanced complete edits can be saved");
+
+  assert.deepEqual(calculatePostingAmount("100/4"), { value: "25" });
+  assert.deepEqual(calculatePostingAmount("100/3"), { value: "33.33" });
+  assert.deepEqual(calculatePostingAmount("（100+20）÷（5-2）-3×2"), { value: "34" });
+  assert.deepEqual(calculatePostingAmount("-(1.005+0)"), { value: "-1.01" });
+  assert.deepEqual(calculatePostingAmount("1.23456789"), { value: "1.23456789" });
+  assert.deepEqual(calculatePostingAmount("2/(3-3)"), { error: "除数不能为 0" });
+  assert.deepEqual(calculatePostingAmount("2/(3-1"), { error: "请配对括号" });
+  assert.deepEqual(calculatePostingAmount("2/hello"), { error: "金额或算式无效" });
+  console.log("✓ posting amounts calculate with precedence, parentheses and exact two-place rounding");
   const grouped = buildReviewRows([credit, purchase]);
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].amount, 20.65);
@@ -177,5 +216,5 @@ try {
   await assert.rejects(() => api.upload([]), (error: unknown) => error instanceof ApiError && error.temporary
     && error.message === "服务连接中断，请重试");
   console.log("✓ empty responses, proxy pages and network exceptions get friendly retry messages");
-  console.log("Web contract regression passed (10 groups).");
+  console.log("Web contract regression passed (11 groups).");
 } finally { globalThis.fetch = originalFetch; }

@@ -1,18 +1,17 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import type { AppConfig, CategoryAllocation, EventType, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerMatch, ParsedTx, ReviewProblem, TxDecision, TxStatus } from "../../src/shared/types.js";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import type { AppConfig, EventType, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerMatch, ParsedTx, ReviewProblem, TxDecision, TxStatus } from "../../src/shared/types.js";
 import {
   canExcludeSuspectedDuplicate, canFollowPurchaseRefund, CROSS_SOURCE_ISSUE, defaultNarration, hasPdfSource, isSuspectedDuplicate,
   LEDGER_DUPLICATE_ISSUE, MAX_NARRATION_LENGTH, PDF_REVIEW_ISSUE,
 } from "../../src/shared/types.js";
-import { MAX_CATEGORY_ALLOCATIONS, savedCategoryAllocations, supportsCategoryAllocations } from "../../src/shared/categoryAllocations.js";
+import { savedCategoryAllocations } from "../../src/shared/categoryAllocations.js";
 import { amountText, missingPostingAccount, missingPostingAccountMessage } from "../../src/shared/postings.js";
-import { accountIsActive, hasFundingPosting, isFundingAccount, reusablePaymentMethod } from "../../src/shared/funding.js";
+import { accountIsActive, hasFundingPosting, isCombinedPayment, isFundingAccount, reusablePaymentMethod } from "../../src/shared/funding.js";
 import { activeTransactions } from "../../src/shared/transactionMerge.js";
 import { api, ApiError, IncompleteReviewError, type BatchSummary, type ConfigResponse, type GeneratedPreview, type LedgerSummary, type MergeDraft } from "./api";
-import ReviewEditor, { draftDecision, invalidTags, makeDraft, parseTags, TransactionSourceDetails, type ReviewDraft } from "./ReviewEditor";
+import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, ReviewMetadataFields, ReviewPostingFields, shakeInvalidFields, TransactionSourceDetails, validatePostingDraft, type ReviewDraft } from "./ReviewEditor";
 import AccountSelect from "./AccountSelect";
 import BeancountCode from "./BeancountCode";
-import CategoryAllocationEditor from "./CategoryAllocationEditor";
 import ConfigPanel, { SETTINGS_LINKS, type SettingsSection } from "./ConfigPanel";
 import DateRangeFilter from "./DateRangeFilter";
 import EntryPreview from "./EntryPreview";
@@ -52,6 +51,10 @@ const operationMessage = (failure: unknown) => failure instanceof ApiError ? fai
 const EVENT_LABELS: Record<EventType, string> = { expense: "支出", income: "收入", refund: "退款", transfer: "转账", familyCard: "亲情卡", unknown: "待识别" };
 const PAGE_SIZE = 50;
 const DETAIL_DRAWER_QUERY = "(max-width: 1360px)";
+const FUNDING_ALLOCATION_ISSUE = "组合支付，分摊待确认";
+const COMBINED_PAYMENT_ISSUE = "组合支付，核对分录";
+const DIRECTION_REVIEW_ISSUE = "收支待确认";
+const legacyDirectionIssue = /^(不计收支流水|交易收支方向不明确|按金额正负推断方向)/;
 const fmt = (amount: number) => amount.toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const batchTime = (createdAt: number) => new Date(createdAt).toLocaleString("zh-CN");
 const postingStatusLabel = (tx: ParsedTx, readOnly: boolean) => readOnly && tx.status === "ready" ? "已入账" : DECISION_LABELS[tx.status];
@@ -68,7 +71,11 @@ const reviewIcons = {
   info: <><circle cx="10" cy="10" r="7.6" /><path d="M10 9.5v4" /><circle cx="10" cy="6.8" r=".9" fill="currentColor" stroke="none" /></>,
   check: <path d="M2.8 10.5 7.6 16.5 17.2 3.5" />,
   cross: <path d="M3.2 3.2 16.8 16.8M16.8 3.2 3.2 16.8" />,
-  question: <><path d="M7 7.3a3 3 0 1 1 5 2.2c-1.2 1-2 .8-2 2.3" /><circle cx="10" cy="15" r=".9" fill="currentColor" stroke="none" /></>,
+  question: <>
+    <circle cx="10" cy="10" r="8.6" fill="currentColor" stroke="none" />
+    <path d="M7.6 7.6a2.5 2.5 0 1 1 3.9 2.1c-1 .7-1.5.9-1.5 2" stroke="var(--surface)" />
+    <circle cx="10" cy="14.4" r=".95" fill="var(--surface)" stroke="none" />
+  </>,
 };
 
 function ReviewIcon({ name }: { name: keyof typeof reviewIcons }) {
@@ -83,7 +90,8 @@ function pendingCategory(row: ReviewRow) {
 }
 
 function fundingMatchReason(tx: ParsedTx): string | undefined {
-  if (tx.fundingConfidence === undefined || tx.fundingConfidence >= 1) return undefined;
+  if (tx.fundingConfidence === undefined) return !tx.fundingAccount && !tx.postings && !tx.merge && !tx.excludedReason ? "资金账户尚未匹配" : undefined;
+  if (tx.fundingConfidence >= 1) return undefined;
   if (tx.fundingReason) return tx.fundingReason;
   if (!tx.fundingAccount) return "资金账户尚未匹配";
   const raw = tx.recognition?.fundingMethod || tx.rawAccount;
@@ -95,10 +103,10 @@ const oldIssueLabels: Array<[RegExp, string]> = [
   [/未绑定账本账户/, "账户未映射"],
   [/^支付方式对应 \d+ 个账户/, "账户映射冲突"],
   [/^账单未注明支付方式/, "支付方式缺失"],
-  [/^组合付款含优惠/, "组合支付，分摊待确认"],
-  [/^(组合支付，请|混合支付，请)/, "组合支付，核对分录"],
+  [/^组合付款含优惠/, FUNDING_ALLOCATION_ISSUE],
+  [/^(组合支付，请|混合支付，请)/, COMBINED_PAYMENT_ISSUE],
   [/亲[情属]卡.*(对方|资金出自)/, "对方付款"],
-  [/^(不计收支流水|交易收支方向不明确|按金额正负推断方向)/, "收支待确认"],
+  [legacyDirectionIssue, DIRECTION_REVIEW_ISSUE],
   [/^退款应冲回/, "冲回原费用"],
   [/^原(消费|交易)已退款/, "已退款，核对退款流水"],
   [/^可能和账本中的/, LEDGER_DUPLICATE_ISSUE],
@@ -110,12 +118,28 @@ const oldIssueLabels: Array<[RegExp, string]> = [
 
 function reviewIssues(tx: ParsedTx): string[] {
   const issues = new Set(tx.issues?.map((issue) => oldIssueLabels.find(([pattern]) => pattern.test(issue))?.[1] ?? issue));
-  if (issues.has("组合支付，分摊待确认") || issues.has("组合支付，核对分录")) issues.delete("组合支付");
+  if (issues.has(FUNDING_ALLOCATION_ISSUE) || issues.has(COMBINED_PAYMENT_ISSUE)) issues.delete("组合支付");
   if (tx.eventType === "transfer" || tx.fundingAccount || tx.postings?.length) {
     for (const issue of ["账户未映射", "账户映射冲突", "支付方式缺失"]) issues.delete(issue);
   }
   if (tx.eventType === "transfer") issues.delete("转账");
   return [...issues];
+}
+
+function combinedPaymentIssue(tx: ParsedTx): string | undefined {
+  const issues = reviewIssues(tx);
+  if (issues.includes(FUNDING_ALLOCATION_ISSUE) || tx.fundingParts?.some(({ amount }) => amount == null)) return FUNDING_ALLOCATION_ISSUE;
+  if (isCombinedPayment(tx) || issues.includes(COMBINED_PAYMENT_ISSUE) || issues.includes("组合支付")) return COMBINED_PAYMENT_ISSUE;
+}
+
+function directionReviewReason(tx: ParsedTx): string | undefined {
+  const issue = tx.issues?.find((item) => item === DIRECTION_REVIEW_ISSUE || legacyDirectionIssue.test(item));
+  if (!issue) return;
+  if (issue !== DIRECTION_REVIEW_ISSUE) return issue;
+  const direction = tx.originalDirection?.trim();
+  if (direction && !/^[\/—-]+$/.test(direction)) return `账单的收支字段标为「${direction}」。请核对实际收支方向。`;
+  if (tx.source.startsWith("bank-")) return "账单缺少明确的收支列，当前方向按金额正负推断。";
+  return `账单未提供明确的收支方向，列表暂按${tx.direction === "in" ? "收入" : "支出"}显示。`;
 }
 
 function batchDisplayName(batch: ImportPreview): string {
@@ -163,6 +187,24 @@ function HeaderDetails({ config, ledger, batch }: { config: ConfigResponse | nul
 
 function duplicateEvidence(tx: ParsedTx): LedgerMatch | undefined {
   return isSuspectedDuplicate(tx) ? tx.matches?.find(({ reason }) => !/^(历史分类参考|转账配对建议|未提交批次已有此交易)/.test(reason)) : undefined;
+}
+
+function FundingAllocationDetails({ tx, issue, leg, readOnly }: { tx: ParsedTx; issue: string; leg?: string; readOnly: boolean }) {
+  const heading = `funding-allocation-${tx.id}`;
+  return <section className="detail-review-warning" aria-labelledby={heading}>
+    <h4 id={heading}>{leg && `${leg} · `}{issue}</h4>
+    <p>{issue === FUNDING_ALLOCATION_ISSUE ? "账单列出了多种支付方式，部分分摊金额无法从账单确定。" : "账单列出了多种支付方式。"}</p>
+    {tx.fundingParts?.length ? <dl>
+      {tx.fundingParts.map(({ rawAccount, amount }, index) => <div key={index}>
+        <dt>{rawAccount}</dt>
+        <dd>{amount == null ? "金额待确认" : `${amountText(amount)} ${tx.currency}`}</dd>
+      </div>)}
+    </dl> : tx.rawAccount && <p>{tx.rawAccount}</p>}
+    {tx.fundingAccount && tx.fundingConfidence !== undefined && tx.fundingConfidence < 1 &&
+      <p>已预填资金账户 <code>{tx.fundingAccount}</code></p>}
+    {!readOnly && !tx.postings && !tx.excludedReason &&
+      <p>核对后可在「拆分分录」中录入实际金额。</p>}
+  </section>;
 }
 
 function HistoryMatch({ match, disabled, onApply, onAdopt, onExclude, counterpart, hasPostings, duplicate }: {
@@ -218,7 +260,7 @@ export default function App() {
   const [reviewFocus, setReviewFocus] = useState<ReviewTarget | null>(null);
   const [categoryAdvance, setCategoryAdvance] = useState<CategoryAdvance | null>(null);
   const [drafts, setDrafts] = useState<Record<string, TransactionDraft>>({});
-  const [allocationDrafts, setAllocationDrafts] = useState<Record<string, CategoryAllocation[]>>({});
+  const [detailSaveAttempt, setDetailSaveAttempt] = useState<{ id: string }>();
   const [narrationDrafts, setNarrationDrafts] = useState<Record<string, string>>({});
   const [bulkTags, setBulkTags] = useState("");
   const [bulkScope, setBulkScope] = useState<"selected" | "filtered">("selected");
@@ -233,6 +275,7 @@ export default function App() {
   const searchInput = useRef<HTMLInputElement>(null);
   const tableScroll = useRef<HTMLDivElement>(null);
   const detailHeading = useRef<HTMLHeadingElement>(null);
+  const detailPanel = useRef<HTMLElement>(null);
   const detailDialog = useRef<HTMLDialogElement>(null);
   const focusDetailHeading = useRef(false);
   const previewHeading = useRef<HTMLHeadingElement>(null);
@@ -409,7 +452,7 @@ export default function App() {
   const rowErrors = batch?.errors.filter(({ row }) => row > 0) ?? [];
   const emptyImportFailed = !!batch?.errors.length && batch.txs.length === 0;
   const editingDisabled = busy || readOnly;
-  const detailDraftIds = [...new Set([...Object.keys(drafts), ...Object.keys(allocationDrafts)])];
+  const detailDraftIds = Object.keys(drafts);
   const hasReviewDrafts = detailDraftIds.length > 0 || Object.keys(narrationDrafts).length > 0;
   const reviewIsSaving = pendingSaves.length > 0;
   const blockBatchChanges = hasReviewDrafts || reviewIsSaving;
@@ -444,6 +487,13 @@ export default function App() {
   const readyCount = active.filter((tx) => tx.status === "ready").length;
   const showDecisionStatus = statusFilter === "all";
 
+  const closeDetails = useCallback(() => {
+    detailDialog.current?.close();
+    setDetailTxId(null);
+    const trigger = document.getElementById(`detail-toggle-${detailTxId}`) ?? searchInput.current;
+    trigger?.focus({ preventScroll: true });
+  }, [detailTxId]);
+
   useLayoutEffect(() => {
     // A repair request chooses its own page after any filters change.
     if (!reviewFocus) setPage(0);
@@ -472,6 +522,45 @@ export default function App() {
       detailHeading.current?.focus({ preventScroll: true });
     }
   }, [detailAsDrawer, detailRow, settings]);
+
+  useLayoutEffect(() => {
+    const panel = detailPanel.current;
+    if (!detailSaveAttempt || !panel || panel.dataset.reviewId !== detailSaveAttempt.id) return;
+    const fields = [...panel.querySelectorAll<HTMLElement>('.posting-editor [aria-invalid="true"], .review-editor input[aria-invalid="true"]')];
+    const first = fields[0];
+    const disclosure = first?.closest("details");
+    if (disclosure) disclosure.open = true;
+    first?.focus();
+    return shakeInvalidFields(fields);
+  }, [detailSaveAttempt]);
+
+  useEffect(() => {
+    if (!detailTxId || settings) return;
+
+    const isOutside = (event: Event) => {
+      const panel = detailPanel.current;
+      if (!panel) return false;
+      const dialog = detailDialog.current;
+      if (dialog?.open) return event.target === dialog;
+      return !event.composedPath().some((node) => node === panel
+        || (node instanceof Element && node.matches("[data-detail-trigger], dialog")));
+    };
+    let startedOutside = false;
+    const trackPointer = (event: PointerEvent) => {
+      startedOutside = event.button === 0 && isOutside(event);
+    };
+    const dismiss = (event: globalThis.MouseEvent) => {
+      if ((event.detail !== 0 && !startedOutside) || !isOutside(event)) return;
+      if (detailDialog.current?.open) closeDetails();
+      else setDetailTxId((id) => id === detailTxId ? null : id);
+    };
+    document.addEventListener("pointerdown", trackPointer, true);
+    document.addEventListener("click", dismiss);
+    return () => {
+      document.removeEventListener("pointerdown", trackPointer, true);
+      document.removeEventListener("click", dismiss);
+    };
+  }, [closeDetails, detailTxId, settings]);
 
   useLayoutEffect(() => {
     if (preview) previewHeading.current?.focus();
@@ -521,7 +610,7 @@ export default function App() {
     const active = document.activeElement;
     if (!settings && !readOnly && (active === document.body || active === categoryAdvance.origin || active === detailHeading.current)) {
       for (const [index, row] of visible.entries()) {
-        if (!categoryAdvance.rowIds.has(row.tx.id) || row.entries.some((entry) => drafts[entry.id] || allocationDrafts[entry.id])) continue;
+        if (!categoryAdvance.rowIds.has(row.tx.id) || row.entries.some((entry) => drafts[entry.id])) continue;
         const target = pendingCategory(row);
         if (!target) continue;
         const targetPage = Math.floor(index / PAGE_SIZE);
@@ -541,7 +630,7 @@ export default function App() {
       }
     }
     setCategoryAdvance(null);
-  }, [allocationDrafts, busy, categoryAdvance, currentPage, detailAsDrawer, detailTxId, drafts, readOnly, settings, visible]);
+  }, [busy, categoryAdvance, currentPage, detailAsDrawer, detailTxId, drafts, readOnly, settings, visible]);
   const suspectedEntries = active.filter(canExcludeSuspectedDuplicate);
 
   const selectTransactions = (transactions: ParsedTx[], checked: boolean) => {
@@ -551,13 +640,6 @@ export default function App() {
       for (const tx of transactions) checked ? next.add(tx.id) : next.delete(tx.id);
       return next;
     });
-  };
-
-  const closeDetails = () => {
-    detailDialog.current?.close();
-    setDetailTxId(null);
-    const trigger = document.getElementById(`detail-toggle-${detailTxId}`) ?? searchInput.current;
-    trigger?.focus({ preventScroll: true });
   };
 
   const revealReviewTarget = (targets: ReviewTarget[]) => {
@@ -580,7 +662,7 @@ export default function App() {
     replaceBatch(value, id);
     setPreviewCheck(null);
     setReviewFocus(null);
-    setDrafts({}); setAllocationDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null);
+    setDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null);
     setFilter(""); setDateRange(EMPTY_REVIEW_DATE_RANGE); setStatusFilter(value.committed ? "all" : "pending");
     setBulkScope("selected"); setBulkTags("");
     invalidate(); setNotice(value.committed ? "已提交" : resumed && value.txs.length > 0 ? "已恢复审批进度" : "");
@@ -824,19 +906,32 @@ export default function App() {
     setDrafts((previous) => ({ ...previous, [tx.id]: { value, original: previous[tx.id]?.original ?? makeDraft(tx) } }));
   };
 
-  const discardReviewDraft = (id: string, draft?: TransactionDraft) => setDrafts((previous) => {
-    if (draft && previous[id] !== draft) return previous;
-    const next = { ...previous };
-    delete next[id];
-    return next;
-  });
+  const discardDetailEdits = (entries: ParsedTx[]) => {
+    setDetailSaveAttempt((attempt) => attempt?.id === detailTxId ? undefined : attempt);
+    setDrafts((previous) => {
+      const next = { ...previous };
+      for (const { id } of entries) if (previous[id] === drafts[id]) delete next[id];
+      return next;
+    });
+  };
 
-  const saveReviewDraft = (tx: ParsedTx, draft: TransactionDraft) => {
-    const decision = draftDecision(tx, draft.value, draft.original);
-    const discard = () => discardReviewDraft(tx.id, draft);
-    if (decision.postings !== undefined) {
-      saveDecisions([decision], { onSaved: discard });
-    } else if (Object.keys(decision).length === 1 || saveReviewDecisions([decision])) discard();
+  const saveDetailEdits = (entries: ParsedTx[], detailId: string) => {
+    const decisions: TxDecision[] = [];
+    for (const tx of entries) {
+      const draft = drafts[tx.id];
+      if (!draft) continue;
+      const validation = draft.value.split && !tx.merge ? validatePostingDraft(draftPostings(tx, draft.value), accounts) : undefined;
+      if (invalidTags(draft.value.tags).length || (validation && !validation.postings)) {
+        setDetailSaveAttempt({ id: detailId });
+        return;
+      }
+      const decision = draftDecision(tx, draft.value, draft.original, validation?.postings);
+      if (Object.keys(decision).length > 1) decisions.push(decision);
+    }
+    const discard = () => discardDetailEdits(entries);
+    if (decisions.some(({ postings }) => postings !== undefined)) {
+      saveDecisions(decisions, { onSaved: discard });
+    } else if (!decisions.length || saveReviewDecisions(decisions)) discard();
   };
 
   const bulkFlag = (flag: "*" | "!") => saveFlags(targets, flag);
@@ -893,7 +988,7 @@ export default function App() {
   });
 
   const clearReview = () => {
-    replaceBatch(null, ""); setDrafts({}); setAllocationDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null); setMergeIds(null); invalidate();
+    replaceBatch(null, ""); setDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null); setMergeIds(null); invalidate();
     setFundingTarget(null);
     setPdfPreviewTx(null);
     setMappingTarget(null);
@@ -978,61 +1073,37 @@ export default function App() {
     return saved;
   };
 
+  const renderFundingAccount = (tx: ParsedTx, disabled: boolean, detail: boolean, refund?: ParsedTx) => {
+    const fundingError = fieldProblem(tx.id, "funding");
+    const matchReason = fundingMatchReason(tx);
+    const fundingRows = refund ? [tx, refund] : [tx];
+    return <AccountSelect value={tx.fundingAccount} accounts={fundingError ? accounts.filter((account) => accountIsActive(account, tx.date, tx.currency)) : accounts}
+      funding label={`${tx.payee || "（无商户）"} · 资金账户`} inputId={fundingInputId(tx.id, detail)} placeholder="选择资金账户" validationMessage={fundingError}
+      matchReason={matchReason} confirmCurrent={Boolean(matchReason && tx.fundingAccount)} autoHighlight={Boolean(fundingError)}
+      disabled={disabled} onChange={(funding) => saveReviewDecisions(fundingRows.map(({ id }) => ({ id, funding })))} />;
+  };
+
   const renderAccountFields = (tx: ParsedTx, disabled: boolean, refund?: ParsedTx, detail = false) => {
     const payee = tx.payee || "（无商户）";
-    const fundingRows = refund ? [tx, refund] : [tx];
     const accountDisabled = disabled || Boolean(tx.postings || refund?.postings);
     const isTransfer = tx.eventType === "transfer" && !tx.fundingAccount2;
     const categoryLabel = isTransfer ? "对方账户" : "分类账户";
     const categoryError = fieldProblem(tx.id, "category");
-    const fundingError = fieldProblem(tx.id, "funding");
     const category = tx.finalAccount || (categoryError ? "" : tx.suggestedAccount);
     const categoryOptions = refund || isTransfer || categoryError ? accounts.filter((option) =>
       (!refund || option.account.startsWith("Expenses:") || option.account === tx.finalAccount)
       && (!isTransfer || /^(Assets|Liabilities):/.test(option.account))
       && (!categoryError || (option.account !== tx.fundingAccount && accountIsActive(option, tx.date, tx.currency)))) : accounts;
-    const matchReason = fundingMatchReason(tx);
-    const paymentMethod = matchReason ? reusablePaymentMethod(tx) : "";
-    const mappingDisabledReason = !paymentMethod ? "账单缺少可保存的单一付款方式"
-      : !hasFundingPosting(tx) ? "请先在拆分分录中核对资金账户" : "";
-    const saved = savedCategoryAllocations(tx);
-    const draft = allocationDrafts[tx.id];
-    const allocations = draft ?? saved;
-    const canAdd = !readOnly && supportsCategoryAllocations(tx) && (!tx.postings || Boolean(saved));
-    const changeAllocations = (value: CategoryAllocation[]) => {
-      invalidate();
-      setAllocationDrafts((previous) => ({ ...previous, [tx.id]: value }));
-    };
-    const discardAllocations = () => setAllocationDrafts((previous) => {
-      const next = { ...previous };
-      delete next[tx.id];
-      return next;
-    });
-    const saveAllocations = () => {
-      if (!draft) return;
-      const status = tx.status === "pending" ? "ready" : tx.status;
-      const decisions: TxDecision[] = [{ id: tx.id, categoryAllocations: draft, status }];
-      if (status !== "ready") { saveDecisions(decisions, { onSaved: discardAllocations }); return; }
-      savePostingDecisions(decisions, {
-        advanceAfter: tx.status === "pending" && (!refund || draft.length === 1) ? tx.id : undefined,
-        blocking: true,
-        onSaved: discardAllocations,
-      });
-    };
-    const addButton = canAdd && <button className="btn category-icon" type="button" aria-label={`添加分类账户 · ${payee}`}
-      title="添加分类账户" disabled={disabled || (allocations?.length ?? 1) >= MAX_CATEGORY_ALLOCATIONS} onClick={() => {
-        const current = allocations ?? [{ account: tx.finalAccount || tx.suggestedAccount, amount: amountText(tx.amount) }];
-        changeAllocations([...current, { account: "", amount: "" }]);
-      }}>＋</button>;
+    const allocations = savedCategoryAllocations(tx);
     return <>
       <div className={detail ? "account-fields" : "account-fields account-fields-compact"}>
         <div className={allocations ? "account-field has-allocations" : "account-field"}>
-          <div className="account-caption">{detail || allocations ? categoryLabel : isTransfer ? "对方" : "分类"}{detail && tx.refundReviewMode === "follow-purchase" && <small>沿用原消费</small>}{allocations && addButton}</div>
-          {allocations ? <div className="account-allocation-fields">
-            {refund && <small className="muted">按原消费金额分配</small>}
-            <CategoryAllocationEditor tx={tx} allocations={allocations} accounts={accounts} dirty={Boolean(draft)} disabled={disabled}
-              readOnly={readOnly} onChange={changeAllocations} onSave={saveAllocations} onDiscard={discardAllocations} />
-          </div> : <div className="category-field">
+          <div className="account-caption">{detail || allocations ? categoryLabel : isTransfer ? "对方" : "分类"}{detail && tx.refundReviewMode === "follow-purchase" && <small>沿用原消费</small>}</div>
+          {allocations ? <ul className="category-allocation-summary">
+            {allocations.map(({ account, amount }, index) => <li key={index}>
+              <code title={account}>{account}</code><span>{amount} {tx.currency}</span>
+            </li>)}
+          </ul> :
             <AccountSelect value={category} inputId={categoryInputId(tx.id, detail)}
               accounts={categoryOptions} placeholder={isTransfer ? "选择对方账户" : "选择分类"} validationMessage={categoryError}
               label={`${payee} · ${categoryLabel}`} disabled={accountDisabled} autoHighlight={tx.status === "pending" || Boolean(categoryError)}
@@ -1045,21 +1116,11 @@ export default function App() {
                   followedRefundIds: follows ? [refund.id] : [], advanceAfter: tx.status === "pending" ? tx.id : undefined,
                 });
               }} />
-            {addButton}
-          </div>}
+          }
         </div>
         <div className="account-field">
           <div className="account-caption">{detail ? "资金账户" : "资金"}</div>
-          <div className="funding-control-row">
-            <AccountSelect value={tx.fundingAccount} accounts={fundingError ? accounts.filter((account) => accountIsActive(account, tx.date, tx.currency)) : accounts}
-              funding label={`${payee} · 资金账户`} inputId={fundingInputId(tx.id, detail)} placeholder="选择资金账户" validationMessage={fundingError}
-              matchReason={matchReason} confirmCurrent={Boolean(matchReason && tx.fundingAccount)} autoHighlight={Boolean(fundingError)}
-              disabled={accountDisabled} onChange={(funding) => saveReviewDecisions(fundingRows.map(({ id }) => ({ id, funding })))} />
-            {matchReason && !readOnly && <button type="button" className="btn small quiet review-icon-button funding-map-button" aria-haspopup="dialog"
-              aria-label={`添加映射 · ${payee}`} disabled={disabled || Boolean(mappingDisabledReason)}
-              title={mappingDisabledReason ? `添加映射\n${mappingDisabledReason}` : "添加映射"}
-              onClick={() => { setError(""); setMappingTarget(tx); }}><ReviewIcon name="question" /></button>}
-          </div>
+          <div className="funding-control-row">{renderFundingAccount(tx, accountDisabled, detail, refund)}</div>
         </div>
       </div>
       {tx.postings && !allocations && <div className="account-hint">{tx.postings.length} 条分录</div>}
@@ -1145,17 +1206,70 @@ export default function App() {
       }} /></div>;
   };
 
-  const renderEditor = (tx: ParsedTx, editFlag = false) => {
-    const draft = drafts[tx.id];
-    return <ReviewEditor tx={tx}
-      draft={draft?.value ?? makeDraft(tx)} dirty={Boolean(draft)} accounts={accounts} editFlag={editFlag} disabled={editingDisabled || Boolean(allocationDrafts[tx.id])}
-      postingError={fieldProblem(tx.id, "postings")} tagError={fieldProblem(tx.id, "tags")}
-      onChange={(next) => changeDraft(tx, next)} onSave={() => { if (draft) saveReviewDraft(tx, draft); }}
-      onDiscard={() => discardReviewDraft(tx.id)} />;
+  const renderPostingEditor = (tx: ParsedTx, showValidation: boolean, leg?: string) => {
+    const error = fieldProblem(tx.id, "postings");
+    if (tx.merge && !error) return null;
+    return <div className="detail-posting-editor" key={tx.id}>
+      {leg && <h4>{leg}</h4>}
+      <ReviewPostingFields tx={tx} accounts={accounts} draft={drafts[tx.id]?.value ?? makeDraft(tx)}
+        disabled={editingDisabled} postingError={error} showValidation={showValidation && Boolean(drafts[tx.id])} onChange={(next) => changeDraft(tx, next)} />
+    </div>;
   };
 
-  const pdfPreviewButton = (tx: ParsedTx) => <button type="button" className="pdf-preview-button" aria-haspopup="dialog"
-    aria-label={`查看 PDF 原文 · ${tx.payee || "无商户"}`} onClick={() => setPdfPreviewTx(tx)}>查看 PDF 原文</button>;
+  const renderDetailFlag = (entries: ParsedTx[], label: string, disabled: boolean) => <TransactionFlag label={label}
+    value={entries.some((entry) => (drafts[entry.id]?.value.flag ?? entry.flag) === "!") ? "!" : "*"}
+    disabled={disabled} onChange={(flag) => {
+      for (const entry of entries) {
+        const draft = drafts[entry.id]?.value ?? makeDraft(entry);
+        if (draft.flag !== flag) changeDraft(entry, { ...draft, flag });
+      }
+    }} />;
+
+  const renderMetadataEditor = (tx: ParsedTx) => <ReviewMetadataFields tx={tx}
+    draft={drafts[tx.id]?.value ?? makeDraft(tx)} disabled={editingDisabled}
+    tagError={fieldProblem(tx.id, "tags")} onChange={(next) => changeDraft(tx, next)} />;
+
+  const renderFundingReview = (tx: ParsedTx, disabled: boolean, leg?: string) => {
+    const combined = combinedPaymentIssue(tx);
+    const reason = fundingMatchReason(tx);
+    if (combined) return <FundingAllocationDetails key={tx.id} tx={tx} issue={combined} readOnly={readOnly} leg={leg} />;
+    if (!reason) return null;
+    return <section key={tx.id} className="detail-review-warning" aria-label={`${leg ? `${leg} · ` : ""}资金账户待核对`}>
+      <h4>{leg && `${leg} · `}资金账户待核对</h4>
+      <p>{reason}</p>
+      {!readOnly && !leg && !tx.postings && renderFundingAccount(tx, disabled, true)}
+      {!readOnly && reusablePaymentMethod(tx) && hasFundingPosting(tx) && <div>
+        <button type="button" className="btn small" aria-haspopup="dialog" disabled={disabled}
+          onClick={() => { setError(""); setMappingTarget(tx); }}>添加映射</button>
+      </div>}
+    </section>;
+  };
+
+  const renderPdfSource = (tx: ParsedTx) => {
+    const needsCheck = reviewIssues(tx).includes(PDF_REVIEW_ISSUE);
+    const available = hasPdfSource(tx);
+    if (!needsCheck && !available) return null;
+    return <div className="detail-pdf-source">
+      {needsCheck && <span>{PDF_REVIEW_ISSUE}</span>}
+      {available && <button type="button" className="pdf-preview-button" aria-haspopup="dialog"
+        aria-label={`查看 PDF 原文 · ${tx.payee || "无商户"}`} onClick={() => setPdfPreviewTx(tx)}>查看 PDF 原文</button>}
+    </div>;
+  };
+
+  const renderDirectionReview = (tx: ParsedTx) => {
+    const reason = directionReviewReason(tx);
+    if (!reason) return null;
+    return <section className="detail-review-warning" aria-label={DIRECTION_REVIEW_ISSUE}>
+      <h4>{DIRECTION_REVIEW_ISSUE}</h4>
+      <p>{reason}</p>
+    </section>;
+  };
+
+  const renderStatementSource = (tx: ParsedTx, counterpart?: ParsedTx) => <>
+    {renderDirectionReview(tx)}
+    {renderPdfSource(tx)}
+    <TransactionSourceDetails tx={tx} counterpart={counterpart} />
+  </>;
 
   const renderMergedOriginals = (originals: ParsedTx[]) => <div className="merge-originals">
     {originals.map((tx) => <article className="refund-leg" key={tx.id}>
@@ -1173,7 +1287,8 @@ export default function App() {
         <div><dt>账本摘要</dt><dd>{tx.narration ?? defaultNarration(tx)}</dd></div>
         {tx.reviewNote && <div><dt>审批备注</dt><dd>{tx.reviewNote}</dd></div>}
       </dl>
-      {hasPdfSource(tx) && pdfPreviewButton(tx)}
+      {renderDirectionReview(tx)}
+      {renderPdfSource(tx)}
     </article>)}
   </div>;
 
@@ -1195,12 +1310,13 @@ export default function App() {
   };
 
   const renderTransactionDetails = ({ tx, entries, refund, originals, amount }: ReviewRow) => {
-    const fieldsDisabled = editingDisabled || entries.some((entry) => Boolean(drafts[entry.id]));
-    const rowDisabled = editingDisabled || entries.some((entry) => Boolean(drafts[entry.id] || allocationDrafts[entry.id]));
+    const hasEdits = entries.some(({ id }) => Boolean(drafts[id]));
+    const fieldsDisabled = editingDisabled || hasEdits;
+    const rowDisabled = fieldsDisabled;
     const status = refund && refund.status !== tx.status ? "分别核对" : postingStatusLabel(tx, readOnly);
     const counterpart = tx.refundCounterpartId ? txs.find(({ id }) => id === tx.refundCounterpartId) : undefined;
     const timestamp = tx.time ? `${tx.date} ${tx.time}` : tx.date;
-    const panel = <aside key={tx.id} className="transaction-detail" id="transaction-detail" data-review-id={tx.id} aria-labelledby="transaction-detail-heading"
+    const panel = <aside key={tx.id} ref={detailPanel} className="transaction-detail" id="transaction-detail" data-review-id={tx.id} aria-labelledby="transaction-detail-heading"
       onKeyDown={(event) => {
         if (event.key === "Escape" && !event.defaultPrevented) {
           event.preventDefault();
@@ -1208,22 +1324,44 @@ export default function App() {
         }
       }}>
       <header className="transaction-detail-head">
-        <div>
-          <h3 id="transaction-detail-heading" ref={detailHeading} tabIndex={-1}>{tx.payee || "（无商户）"}</h3>
+        <div className="detail-heading">
+          <div className="detail-payee-line">
+            {renderDetailFlag(entries, refund ? "整组账本标记" : "账本标记", editingDisabled)}
+            <h3 id="transaction-detail-heading" ref={detailHeading} tabIndex={-1}>{tx.payee || "（无商户）"}</h3>
+          </div>
           <div className="detail-meta">
             <time dateTime={tx.time ? `${tx.date}T${tx.time}` : tx.date}>{timestamp}</time>
             {!tx.merge && <span>{refund ? "净支出" : tx.direction === "in" ? "收入" : "支出"} {fmt(amount)} {tx.currency}</span>}
             {showDecisionStatus && <span>{status}</span>}
           </div>
         </div>
-        <button type="button" className="btn small quiet close-detail" aria-label="关闭详情" title="关闭详情" onClick={closeDetails}>×</button>
+        {!readOnly && <div className="toolbar detail-edit-actions" role="group" aria-label="审批编辑">
+          <button type="button" className="btn small" disabled={busy || !hasEdits} onClick={() => discardDetailEdits(entries)}>放弃</button>
+          <button type="button" className="btn primary small" disabled={busy || !hasEdits}
+            onClick={() => saveDetailEdits(entries, tx.id)}>保存</button>
+        </div>}
       </header>
       <div className="transaction-detail-body">
+        {entries.map((entry) => renderPostingEditor(entry, detailSaveAttempt?.id === tx.id, refund ? entry === refund ? "退款" : "原消费" : undefined))}
+        {entries.map((entry) => renderFundingReview(entry, fieldsDisabled, refund ? entry === refund ? "退款" : "原消费" : undefined))}
         {entries.map((entry) => {
           const match = duplicateEvidence(entry);
           const label = refund ? `${entry === refund ? "退款" : "原消费"} · 疑似重复` : "疑似重复核对";
           return match ? renderHistoryMatch(entry, match, rowDisabled, label) : null;
         })}
+        {originals ? <details className="detail-section" open>
+          <summary>原交易（{originals.length}）</summary>
+          {renderMergedOriginals(originals)}
+        </details> : <details className="detail-section" open>
+          <summary>账单原始信息</summary>
+          {refund ? <div className="refund-sources">
+            {entries.map((entry) => <section key={entry.id}>
+              <h4>{entry === refund ? "退款" : "原消费"}</h4>
+              {renderStatementSource(entry)}
+            </section>)}
+          </div> : renderStatementSource(tx, counterpart)}
+        </details>}
+        <EntryPreview entries={entries} batchId={batchId} />
         {refund ? entries.map((entry) => {
           const label = entry === refund ? "退款" : "原消费";
           return <section className="refund-leg" id={`refund-leg-${entry.id}`} tabIndex={-1} aria-label={label} key={entry.id}>
@@ -1231,33 +1369,21 @@ export default function App() {
               <strong className={`amt ${entry.direction}`}>{fmt(entry.amount)} {entry.currency}</strong>
               {showDecisionStatus && <span className={`decision-status ${entry.status}`}>{postingStatusLabel(entry, readOnly)}</span>}</div>
             <time className="tx-date" dateTime={entry.time ? `${entry.date}T${entry.time}` : entry.date}>{entry.date}{entry.time && ` ${entry.time}`}</time>
-            <dl className="tx-meta">
-              {entry.sourceTxId && <div><dt>交易号</dt><dd><code>{entry.sourceTxId}</code></dd></div>}
-              {entry.reviewNote && <div><dt>审批备注</dt><dd>{entry.reviewNote}</dd></div>}
-            </dl>
+            {entry.reviewNote && <dl className="tx-meta"><div><dt>审批备注</dt><dd>{entry.reviewNote}</dd></div></dl>}
             <details className="refund-leg-actions">
               <summary>{readOnly ? "单笔详情" : "单笔审批与备注"}</summary>
               <div className="refund-leg-review">
+                {renderDetailFlag([entry], `${label}账本标记`, editingDisabled)}
                 {renderAccountFields(entry, fieldsDisabled, undefined, true)}
                 {renderPostingActions(entry, rowDisabled)}
-                {renderEditor(entry, true)}
+                {renderMetadataEditor(entry)}
                 {renderHistory(entry, rowDisabled)}
-                <details className="detail-section"><summary>账单原始信息</summary>
-                  <TransactionSourceDetails tx={entry} />
-                  {hasPdfSource(entry) && pdfPreviewButton(entry)}
-                </details>
               </div>
             </details>
           </section>;
-        }) : renderEditor(tx)}
-        <EntryPreview entries={entries} batchId={batchId} />
-        {originals && <details className="detail-section"><summary>原交易（{originals.length}）</summary>{renderMergedOriginals(originals)}</details>}
-        {!refund && !originals && <>
-          {renderHistory(tx, rowDisabled)}
-          <details className="detail-section"><summary>账单原始信息</summary>
-            <TransactionSourceDetails tx={tx} counterpart={counterpart} />
-            {hasPdfSource(tx) && pdfPreviewButton(tx)}
-          </details>
+        }) : <>
+          {!originals && renderHistory(tx, rowDisabled)}
+          {renderMetadataEditor(tx)}
         </>}
       </div>
     </aside>;
@@ -1272,11 +1398,14 @@ export default function App() {
     const partlySelected = !isSelected && entries.some((entry) => selected.has(entry.id));
     const mixedStatus = refund && refund.status !== tx.status;
     const statusLabel = mixedStatus ? "分别核对" : postingStatusLabel(tx, readOnly);
-    const fieldsDisabled = editingDisabled || entries.some((entry) => Boolean(drafts[entry.id]));
-    const hasDraft = entries.some((entry) => Boolean(drafts[entry.id] || allocationDrafts[entry.id]));
-    const rowDisabled = editingDisabled || hasDraft;
+    const hasDraft = entries.some((entry) => Boolean(drafts[entry.id]));
+    const fieldsDisabled = editingDisabled || hasDraft;
+    const rowDisabled = fieldsDisabled;
     const detailsOpen = detailTxId === tx.id;
-    const detailsLabel = detailsOpen ? "收起详情" : readOnly ? "查看详情" : "详情与备注";
+    const issues = entries.flatMap(reviewIssues).filter((issue) => issue !== PDF_REVIEW_ISSUE);
+    const needsDetails = issues.includes(DIRECTION_REVIEW_ISSUE) || entries.some((entry) =>
+      combinedPaymentIssue(entry) || fundingMatchReason(entry) || isSuspectedDuplicate(entry) || entry.status === "duplicate" || entry.duplicateOf);
+    const detailsLabel = detailsOpen ? "收起详情" : needsDetails ? "核对交易详情" : readOnly ? "查看详情" : "详情与备注";
     const tags = [...new Set(entries.flatMap((entry) => entry.tags ?? []))];
     const shownTags = detailRow && !detailAsDrawer ? 1 : 2;
     const remainingTags = tags.slice(shownTags);
@@ -1293,10 +1422,7 @@ export default function App() {
       const message = fieldProblem(id, undefined);
       return message ? [message] : [];
     }))].join(" · ");
-    const issues = entries.flatMap(reviewIssues);
     const warnings = new Set([...issues.filter((issue) => issue === LEDGER_DUPLICATE_ISSUE || issue === CROSS_SOURCE_ISSUE), ...issues]);
-    const pdfEntries = entries.filter(hasPdfSource);
-    if (pdfEntries.length) warnings.delete(PDF_REVIEW_ISSUE);
     const refundCounterpart = tx.refundCounterpartId ? txs.find((row) => row.id === tx.refundCounterpartId) : undefined;
     if (refundCounterpart) warnings.delete("已退款，核对退款流水");
     if (refund) warnings.delete("冲回原费用");
@@ -1317,41 +1443,38 @@ export default function App() {
         </label>
       </td>}
       <td role="cell" className="tx-summary-cell">
-        <div className="tx-payee-line">
-          <TransactionFlag value={entries.some((entry) => entry.flag === "!") ? "!" : "*"}
-            label={`${payee} · 账本标记`} disabled={rowDisabled} onChange={(flag) => saveFlags(entries, flag)} />
-          <div className="payee" title={payee}>{payee}</div>
+        <div className="tx-summary-content">
+            <div className="payee" title={payee}>{payee}</div>
+            <div className="tx-secondary">
+              <time className="tx-date" dateTime={tx.time ? `${tx.date}T${tx.time}` : tx.date}
+                title={tx.time ? `${tx.date} ${tx.time}` : tx.date}>
+                <span>{tx.date}</span>{tx.time && <>{" "}<span className="tx-time">{tx.time}</span></>}
+              </time>
+              {tags.length > 0 && <div className="tag-list">
+                {tags.slice(0, shownTags).map((tag) => <button type="button" className="tag-chip" title={`#${tag}`} key={tag} onClick={() => setFilter(tag)}>#{tag}</button>)}
+                {remainingTags.length > 0 && <ReviewMenu label={`其余标签 · ${payee}`} title={`+${remainingTags.length}`}>{(close) =>
+                  remainingTags.map((tag) => <button className="menu-action" key={tag} type="button"
+                    onClick={() => { close(); setFilter(tag); }}>#{tag}</button>)
+                }</ReviewMenu>}
+              </div>}
+            </div>
+            {warnings.size > 0 && <ul role="list" aria-label="审批提示" className="tx-warnings">
+              {[...warnings].map((warning) => <li key={warning}>{warning}</li>)}
+            </ul>}
+            {rowProblem && <p id={`review-row-error-${tx.id}`} className="review-field-error">{rowProblem}</p>}
+            {renderNarration(tx, payee)}
         </div>
-        <div className="tx-secondary">
-          <time className="tx-date" dateTime={tx.time ? `${tx.date}T${tx.time}` : tx.date}
-            title={tx.time ? `${tx.date} ${tx.time}` : tx.date}>
-            <span>{tx.date}</span>{tx.time && <>{" "}<span className="tx-time">{tx.time}</span></>}
-          </time>
-          {tags.length > 0 && <div className="tag-list">
-            {tags.slice(0, shownTags).map((tag) => <button type="button" className="tag-chip" title={`#${tag}`} key={tag} onClick={() => setFilter(tag)}>#{tag}</button>)}
-            {remainingTags.length > 0 && <ReviewMenu label={`其余标签 · ${payee}`} title={`+${remainingTags.length}`}>{(close) =>
-              remainingTags.map((tag) => <button className="menu-action" key={tag} type="button"
-                onClick={() => { close(); setFilter(tag); }}>#{tag}</button>)
-            }</ReviewMenu>}
-          </div>}
-        </div>
-        {(warnings.size > 0 || pdfEntries.length > 0) && <ul role="list" aria-label="审批提示" className="tx-warnings">
-          {[...warnings].map((warning) => <li key={warning}>{warning}</li>)}
-          {pdfEntries.map((entry) => <li className="pdf-preview-item" key={entry.id}>{pdfPreviewButton(entry)}</li>)}
-        </ul>}
-        {rowProblem && <p id={`review-row-error-${tx.id}`} className="review-field-error">{rowProblem}</p>}
-        {renderNarration(tx, payee)}
       </td>
       <td role="cell" className="tx-type-cell">
         <div className="tx-event">
-          {eventText && <span title={eventText}>{eventText}</span>}
-          <button id={`detail-toggle-${tx.id}`} type="button" className="btn small quiet review-icon-button detail-toggle"
+          <button id={`detail-toggle-${tx.id}`} type="button" className={`btn small quiet review-icon-button detail-toggle${needsDetails ? " detail-warning" : ""}`} data-detail-trigger
             aria-label={`${detailsLabel} · ${payee}`} title={detailsLabel} aria-expanded={detailsOpen}
             aria-controls={detailsOpen ? "transaction-detail" : undefined} onClick={() => {
               if (detailsOpen) { closeDetails(); return; }
               focusDetailHeading.current = true;
               setDetailTxId(tx.id);
-            }}><ReviewIcon name="info" /></button>
+            }}><ReviewIcon name={needsDetails ? "question" : "info"} /></button>
+          {eventText && <span title={eventText}>{eventText}</span>}
         </div>
       </td>
       <td role="cell" className={`tx-amount-cell${tx.merge ? "" : ` amt ${tx.direction}`}`}>

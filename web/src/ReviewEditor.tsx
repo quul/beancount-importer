@@ -1,14 +1,17 @@
+import { useState } from "react";
 import type { DraftPosting, ParsedAccount, ParsedTx, TxDecision } from "../../src/shared/types.js";
-import { amountText, fundingPostingSign, transactionPostings } from "../../src/shared/postings.js";
+import { accountPattern, amountText, currencyPattern, fundingPostingSign, transactionPostings } from "../../src/shared/postings.js";
 import AccountSelect from "./AccountSelect";
-import TransactionFlag from "./TransactionFlag";
+import { calculatePostingAmount } from "./postingCalculator";
+
+type PostingInput = Omit<DraftPosting, "amount"> & { amount: string };
 
 export interface ReviewDraft {
   tags: string;
   flag: "*" | "!";
   reviewNote: string;
   split: boolean;
-  postings: Array<{ account: string; amount: string; currency: string }>;
+  postings?: PostingInput[];
 }
 
 export function parseTags(value: string): string[] {
@@ -19,85 +22,168 @@ export function invalidTags(value: string): string[] {
   return parseTags(value).filter((tag) => !/^[A-Za-z0-9][A-Za-z0-9_./-]*$/.test(tag));
 }
 
-export function makeDraft(tx: ParsedTx): ReviewDraft {
+export function draftPostings(tx: ParsedTx, draft: ReviewDraft): PostingInput[] {
+  if (draft.postings) return draft.postings;
   const amount = -fundingPostingSign(tx) * tx.amount;
   const postings: DraftPosting[] = tx.postings || tx.fundingAccount2 ? transactionPostings(tx) : [
     { account: tx.finalAccount || tx.suggestedAccount, amount, currency: tx.currency },
     { account: tx.fundingAccount, amount: -amount, currency: tx.currency },
   ];
+  return postings.map((posting) => ({ ...posting, amount: String(posting.amount) }));
+}
+
+export function makeDraft(tx: ParsedTx): ReviewDraft {
   return {
     tags: (tx.tags ?? []).join(" "), flag: tx.flag ?? "*", reviewNote: tx.reviewNote ?? "", split: Boolean(tx.postings),
-    postings: postings.map((posting) => ({ ...posting, amount: String(posting.amount) })),
   };
 }
 
-export function draftDecision(tx: ParsedTx, draft: ReviewDraft, original?: ReviewDraft): TxDecision {
+export function draftDecision(tx: ParsedTx, draft: ReviewDraft, original?: ReviewDraft, postings?: DraftPosting[]): TxDecision {
   const decision: TxDecision = { id: tx.id };
   if (draft.tags !== original?.tags) decision.tags = parseTags(draft.tags);
   if (draft.flag !== original?.flag) decision.flag = draft.flag;
   if (draft.reviewNote !== original?.reviewNote) decision.reviewNote = draft.reviewNote;
-  if (draft.split) {
-    const postings = draft.postings.map((posting) => ({ ...posting, amount: Number(posting.amount), currency: posting.currency.trim().toUpperCase() }));
+  if (postings) {
     const previous = tx.postings;
     if (!previous || postings.length !== previous.length || postings.some((posting, index) => (
       posting.account !== previous[index].account || posting.amount !== previous[index].amount || posting.currency !== previous[index].currency
     ))) decision.postings = postings;
-  } else if (tx.postings) {
+  } else if (!draft.split && tx.postings) {
     decision.postings = null;
   }
   return decision;
 }
 
-export default function ReviewEditor({ tx, draft, dirty, accounts, disabled, editFlag, postingError, tagError, onChange, onSave, onDiscard }: {
-  tx: ParsedTx; draft: ReviewDraft; dirty: boolean; accounts: ParsedAccount[]; disabled: boolean;
-  editFlag?: boolean;
-  postingError?: string;
-  tagError?: string;
-  onChange: (draft: ReviewDraft) => void; onSave: () => void; onDiscard: () => void;
-}) {
+const postingCurrency = (value: string) => value.normalize("NFKC").trim().toUpperCase();
+
+export function shakeInvalidFields(fields: readonly HTMLElement[]) {
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  const animations = fields.map((field) => (field.closest(".account-select-field") ?? field).animate(
+    [0, -3, 3, -2, 0].map((offset) => ({ transform: `translateX(${offset}px)` })),
+    { duration: 240, easing: "ease-out" },
+  ));
+  return () => { for (const animation of animations) animation.cancel(); };
+}
+
+export function validatePostingDraft(inputs: PostingInput[], accounts: Pick<ParsedAccount, "account">[]) {
+  const names = new Set(accounts.map(({ account }) => account));
+  const postings: DraftPosting[] = [];
   const totals = new Map<string, number>();
-  let invalid = false;
-  for (const posting of draft.postings) {
-    const amount = Number(posting.amount);
-    if (!posting.account || !posting.currency.trim() || posting.amount.trim() === "" || !Number.isFinite(amount)) invalid = true;
-    const currency = posting.currency.trim().toUpperCase();
-    totals.set(currency, (totals.get(currency) ?? 0) + amount);
+  const errors = inputs.map(({ account, amount, currency: rawCurrency }) => {
+    const calculation = calculatePostingAmount(amount);
+    const currency = postingCurrency(rawCurrency);
+    const error: Partial<Record<keyof PostingInput, string>> = {};
+    if (!account) error.account = "请选择账户";
+    else if (!accountPattern.test(account) || !names.has(account)) error.account = "请选择有效的账本账户";
+    if (!currency) error.currency = "请输入币种";
+    else if (!currencyPattern.test(currency) || currency.length > 24) error.currency = "币种代码无效";
+    if (calculation.error !== undefined) error.amount = calculation.error;
+    else {
+      const value = Number(calculation.value);
+      postings.push({ account, amount: value, currency });
+      totals.set(currency, (totals.get(currency) ?? 0) + Number(value.toFixed(8)));
+    }
+    return error;
+  });
+  const tooFew = inputs.length < 2;
+  if (!tooFew && !errors.some(({ account }) => account) && inputs.every(({ account }) => account === inputs[0].account)) {
+    errors[1].account = "请选择不同的账户";
   }
-  const imbalances = [...totals].filter(([, amount]) => Math.abs(amount) > 0.000001);
-  const splitError = !tx.merge && draft.split && (invalid || draft.postings.length < 2 || imbalances.length > 0);
+  const imbalances = new Map(errors.some(({ amount, currency }) => amount || currency) || tooFew
+    ? [] : [...totals].filter(([, total]) => Math.abs(total) > 0.0000001));
+  const valid = !tooFew && !imbalances.size && !errors.some(({ account, amount, currency }) => account || amount || currency);
+  return { postings: valid ? postings : undefined, errors, imbalances, tooFew };
+}
+
+export function ReviewMetadataFields({ tx, draft, disabled, tagError, onChange }: {
+  tx: ParsedTx; draft: ReviewDraft; disabled: boolean; tagError?: string;
+  onChange: (draft: ReviewDraft) => void;
+}) {
   const badTags = invalidTags(draft.tags);
   const tagMessage = badTags.length > 0 ? `标签格式无效：${badTags.join("、")}` : tagError;
-  const tagsId = `review-tags-${tx.id}`, postingsId = `review-postings-${tx.id}`;
-  const setPosting = (index: number, patch: Partial<ReviewDraft["postings"][number]>) => onChange({ ...draft, postings: draft.postings.map((posting, i) => i === index ? { ...posting, ...patch } : posting) });
+  const tagsId = `review-tags-${tx.id}`;
 
-  return <div className="review-editor">
-    <fieldset disabled={disabled}>
-      <div className="editor-grid">
-        <label className="wide">审批备注<textarea rows={3} maxLength={2000} value={draft.reviewNote} onChange={(event) => onChange({ ...draft, reviewNote: event.target.value })} /></label>
-        <label>标签<input id={tagsId} value={draft.tags} placeholder="trip2026 reimbursement" aria-invalid={Boolean(tagMessage) || undefined}
-          aria-describedby={`${tagsId}-hint`} onChange={(event) => onChange({ ...draft, tags: event.target.value })} />
-          <small id={`${tagsId}-hint`} className={tagMessage ? "review-field-error" : undefined}>{tagMessage || "英文标签，空格分隔。"}</small></label>
-        {editFlag && <div className="editor-flag"><span>账本标记</span>
-          <TransactionFlag label="单笔账本标记" value={draft.flag} onChange={(flag) => onChange({ ...draft, flag })} />
-        </div>}
-      </div>
-      {!tx.merge && <label className="check-label"><input id={postingsId} type="checkbox" checked={draft.split} aria-describedby={postingError ? `${postingsId}-error` : undefined}
-        onChange={(event) => onChange({ ...draft, split: event.target.checked })} />拆分分录</label>}
-      {postingError && <p className="review-field-error" id={`${postingsId}-error`}>{postingError}{tx.merge && "。请先撤销合并，再修正原交易。"}</p>}
-      {!tx.merge && draft.split && <div className="posting-editor">
-        <p className="muted">每种币种合计须为 0。</p>
-        {draft.postings.map((posting, index) => <div className="posting-row" key={index}>
-          <AccountSelect value={posting.account} accounts={accounts} label={`第 ${index + 1} 条分录的账户`} onChange={(account) => setPosting(index, { account })} />
-          <input inputMode="decimal" aria-label={`第 ${index + 1} 条 posting 金额`} value={posting.amount} onChange={(event) => setPosting(index, { amount: event.target.value })} placeholder="带正负号的金额" />
-          <input aria-label={`第 ${index + 1} 条 posting 币种`} value={posting.currency} onChange={(event) => setPosting(index, { currency: event.target.value })} placeholder="CNY" />
-          <button className="btn small" onClick={() => onChange({ ...draft, postings: draft.postings.filter((_, i) => i !== index) })}>移除</button>
-        </div>)}
-        <button className="btn small" onClick={() => onChange({ ...draft, postings: [...draft.postings, { account: "", amount: "0", currency: tx.currency }] })}>＋ 添加分录</button>
-        {splitError && <p className="error-line" role="alert">{invalid ? "请补全账户、金额和币种。" : draft.postings.length < 2 ? "至少两条分录。" : `尚未平衡：${imbalances.map(([currency, amount]) => `${amount.toFixed(2)} ${currency}`).join("；")}`}</p>}
-      </div>}
-      <div className="toolbar editor-actions"><button className="btn primary small" disabled={!dirty || Boolean(splitError) || badTags.length > 0} onClick={onSave}>保存编辑</button><button className="btn small" disabled={!dirty} onClick={onDiscard}>放弃编辑</button>{dirty && <span className="muted">未保存</span>}</div>
-    </fieldset>
-  </div>;
+  return <fieldset className="review-editor" disabled={disabled}>
+    <div className="editor-grid">
+      <label className="wide">审批备注<textarea rows={3} maxLength={2000} value={draft.reviewNote} onChange={(event) => onChange({ ...draft, reviewNote: event.target.value })} /></label>
+      <label>标签<input id={tagsId} value={draft.tags} placeholder="trip2026 reimbursement" aria-invalid={Boolean(tagMessage) || undefined}
+        aria-describedby={`${tagsId}-hint`} onChange={(event) => onChange({ ...draft, tags: event.target.value })} />
+        <small id={`${tagsId}-hint`} className={tagMessage ? "review-field-error" : undefined}>{tagMessage || "英文标签，空格分隔。"}</small></label>
+    </div>
+  </fieldset>;
+}
+
+export function ReviewPostingFields({ tx, draft, accounts, disabled, postingError, showValidation, onChange }: {
+  tx: ParsedTx; draft: ReviewDraft; accounts: ParsedAccount[]; disabled: boolean; postingError?: string;
+  showValidation: boolean;
+  onChange: (draft: ReviewDraft) => void;
+}) {
+  const [calculationError, setCalculationError] = useState<{ index: number; input: string; message: string }>();
+  const showPostings = !tx.merge && draft.split;
+  const postings = showPostings ? draftPostings(tx, draft) : [];
+  const validation = showPostings && showValidation ? validatePostingDraft(postings, accounts) : undefined;
+  const postingsId = `review-postings-${tx.id}`;
+  const setPosting = (index: number, patch: Partial<PostingInput>) => {
+    if (patch.amount !== undefined && calculationError?.index === index) setCalculationError(undefined);
+    onChange({ ...draft, postings: postings.map((posting, i) => i === index ? { ...posting, ...patch } : posting) });
+  };
+
+  return <fieldset disabled={disabled}>
+    {!tx.merge && <label className="split-postings-toggle">
+      <span>拆分分录</span>
+      <input id={postingsId} className="checkbox" type="checkbox" checked={draft.split} aria-describedby={postingError ? `${postingsId}-error` : undefined}
+        onChange={(event) => { setCalculationError(undefined); onChange({ ...draft, split: event.target.checked }); }} />
+    </label>}
+    {postingError && <p className="review-field-error" id={`${postingsId}-error`}>{postingError}{tx.merge && "。请先撤销合并，再修正原交易。"}</p>}
+    {showPostings && <div className="posting-editor">
+      {postings.map((posting, index) => {
+        const errors = validation?.errors[index];
+        const calculatorMessage = calculationError?.index === index && calculationError.input === posting.amount ? calculationError.message : undefined;
+        const amountMessage = calculatorMessage || errors?.amount;
+        const currency = postingCurrency(posting.currency);
+        const unbalanced = validation?.imbalances.has(currency);
+        const amountErrorId = `${postingsId}-${index}-amount-error`;
+        const currencyErrorId = `${postingsId}-${index}-currency-error`;
+        return <div className="posting-row" key={index}>
+          <AccountSelect value={posting.account} accounts={accounts} label={`第 ${index + 1} 条分录的账户`}
+            validationMessage={errors?.account} onChange={(account) => setPosting(index, { account })} />
+          <div className="posting-input-group">
+            <input inputMode="decimal" aria-label={`第 ${index + 1} 条分录的金额`} value={posting.amount} placeholder="金额"
+              title="支持四则运算，按 Enter 计算"
+              aria-invalid={Boolean(amountMessage || unbalanced) || undefined}
+              aria-describedby={amountMessage ? amountErrorId : unbalanced ? `${postingsId}-balance` : undefined}
+              onChange={(event) => setPosting(index, { amount: event.target.value })}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
+                event.preventDefault();
+                if (event.repeat) return;
+                const result = calculatePostingAmount(posting.amount);
+                if (result.error !== undefined) {
+                  setCalculationError({ index, input: posting.amount, message: result.error });
+                  shakeInvalidFields([event.currentTarget]);
+                } else if (result.value !== posting.amount) setPosting(index, { amount: result.value });
+              }} />
+            {amountMessage && <small id={amountErrorId} className="review-field-error" role={calculatorMessage ? "alert" : undefined}>{amountMessage}</small>}
+          </div>
+          <div className="posting-input-group">
+            <input aria-label={`第 ${index + 1} 条分录的币种`} value={posting.currency} placeholder="币种"
+              aria-invalid={Boolean(errors?.currency) || undefined} aria-describedby={errors?.currency ? currencyErrorId : undefined}
+              onChange={(event) => setPosting(index, { currency: event.target.value })} />
+            {errors?.currency && <small id={currencyErrorId} className="review-field-error">{errors.currency}</small>}
+          </div>
+          <button type="button" className="btn small posting-remove" aria-label={`移除第 ${index + 1} 条分录`} title="移除分录"
+            onClick={() => { setCalculationError(undefined); onChange({ ...draft, postings: postings.filter((_, i) => i !== index) }); }}>−</button>
+        </div>;
+      })}
+      <button type="button" className="btn small posting-add" disabled={postings.length >= 40}
+        aria-invalid={validation?.tooFew || undefined} aria-describedby={validation?.tooFew ? `${postingsId}-minimum` : undefined}
+        onClick={() => onChange({ ...draft, postings: [...postings, { account: "", amount: "", currency: tx.currency }] })}>＋ 添加一行</button>
+      {validation?.tooFew && <small id={`${postingsId}-minimum`} className="review-field-error">至少需要两条分录</small>}
+      {validation && validation.imbalances.size > 0 && <ul id={`${postingsId}-balance`} className="posting-balance review-field-error">
+        {[...validation.imbalances].map(([currency, total]) => <li key={currency}>{currency} 未平衡，差额 {total > 0 ? "+" : ""}{amountText(total)}</li>)}
+      </ul>}
+    </div>}
+  </fieldset>;
 }
 
 export function TransactionSourceDetails({ tx, counterpart }: { tx: ParsedTx; counterpart?: ParsedTx }) {
