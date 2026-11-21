@@ -7,7 +7,8 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
 import type { AppConfig, BatchRevision, FundingMappingChoice, FundingMappingGroup, ImportPreview, ParsedTx, ReviewProblem, TxDecision, LedgerInfo } from "../shared/types.js";
-import { canExcludeSuspectedDuplicate, duplicateReviewIssue, MAX_NARRATION_LENGTH } from "../shared/types.js";
+import { duplicateReviewIssue, MAX_NARRATION_LENGTH } from "../shared/types.js";
+import { planSuspectedDuplicateExclusions } from "../shared/duplicateExclusions.js";
 import { MAX_CATEGORY_ALLOCATIONS, planCategoryAllocations, savedCategoryAllocations } from "../shared/categoryAllocations.js";
 import { activeTransactions, mergeSource, planTransactionMerge } from "../shared/transactionMerge.js";
 import { missingPostingAccount, missingPostingAccountMessage, statusAfterCategorization, validDate } from "../shared/postings.js";
@@ -592,7 +593,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     requireRevision(batch, req.body?.revision);
     const sessionId = readReviewSessionId(req.body?.reviewSessionId);
     const txs = activeTransactions(batch.txs);
-    const targets = txs.filter(canExcludeSuspectedDuplicate);
+    const targets = planSuspectedDuplicateExclusions(txs);
     if (targets.length) {
       const previous = reviewStatuses(txs);
       for (const tx of targets) {

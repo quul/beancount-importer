@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import type { AppConfig, EventType, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerMatch, ParsedTx, ReviewProblem, StatementName, TxDecision, TxStatus } from "../../src/shared/types.js";
 import {
-  canExcludeSuspectedDuplicate, canFollowPurchaseRefund, CROSS_SOURCE_ISSUE, defaultNarration, hasPdfSource, isSuspectedDuplicate,
+  canFollowPurchaseRefund, CROSS_SOURCE_ISSUE, defaultNarration, hasPdfSource, isSuspectedDuplicate,
   LEDGER_DUPLICATE_ISSUE, MAX_NARRATION_LENGTH, PDF_REVIEW_ISSUE,
 } from "../../src/shared/types.js";
+import { planSuspectedDuplicateExclusions } from "../../src/shared/duplicateExclusions.js";
 import { savedCategoryAllocations } from "../../src/shared/categoryAllocations.js";
 import { amountText, missingPostingAccount, missingPostingAccountMessage } from "../../src/shared/postings.js";
 import { accountIsActive, hasFundingPosting, isCombinedPayment, isFundingAccount, reusablePaymentMethod } from "../../src/shared/funding.js";
@@ -700,7 +701,7 @@ export default function App() {
     }
     setUndoFlashIds(null);
   }, [batchId, busy, currentPage, dateRange, filter, reviewRows, routedBatchId, settings, statusFilter, undoFlashIds, visible]);
-  const suspectedEntries = active.filter(canExcludeSuspectedDuplicate);
+  const suspectedExclusions = useMemo(() => planSuspectedDuplicateExclusions(active), [active]);
 
   const selectTransactions = (transactions: ParsedTx[], checked: boolean) => {
     if (!selected.size) setBulkScope("selected");
@@ -1041,8 +1042,8 @@ export default function App() {
   };
 
   const excludeSuspected = () => {
-    if (blockBatchChanges || !suspectedEntries.length) return;
-    const patches: ReviewPatches = new Map(suspectedEntries.map(({ id }) => [id, () => ({ status: "excluded", duplicateOf: undefined })]));
+    if (blockBatchChanges || !suspectedExclusions.length) return;
+    const patches: ReviewPatches = new Map(suspectedExclusions.map(({ id }) => [id, () => ({ status: "excluded", duplicateOf: undefined })]));
     enqueueReviewSave(async (id, current) => {
       const result = await api.excludeSuspected(id, current.revision ?? 0, reviewSessionId);
       return { batch: result.batch, notice: `已剔除 ${result.excluded} 笔疑似重复` };
@@ -1775,8 +1776,10 @@ export default function App() {
                   onClick={() => { close(); saveReviewDecisions(pendingHigh.map((tx) => ({ id: tx.id, account: tx.suggestedAccount, status: "ready" }))); }}>
                   接受高置信度（{pendingHigh.length}）
                 </button>
-                <button className="menu-action danger-text" disabled={editingDisabled || blockBatchChanges || !suspectedEntries.length}
-                  title="批量排除当前批次中仍可入账的疑似重复交易" onClick={() => { close(); excludeSuspected(); }}>剔除疑似重复（{suspectedEntries.length}）</button>
+                <button className="menu-action danger-text" disabled={editingDisabled || blockBatchChanges || !suspectedExclusions.length}
+                  title="跨来源唯一匹配时保留一份。其他跨来源疑似记录需逐笔核对。" onClick={() => { close(); excludeSuspected(); }}>
+                  剔除疑似重复（{suspectedExclusions.length}）
+                </button>
               </>}
             </>}</ReviewMenu>
             {!readOnly && <button className="btn primary" disabled={busy || blockBatchChanges || readyCount === 0} onClick={generate}>生成预览（{readyCount}）</button>}

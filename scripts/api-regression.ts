@@ -850,24 +850,54 @@ try {
     const fixture = batch.txs[0];
     const suspects = Array.from({ length: 5001 }, (_, index): ParsedTx => ({
       ...fixture, id: `suspect-${index}`, status: index % 2 ? "pending" : "ready",
-      issues: [index % 2 ? "不同来源的流水可能是同一笔" : "疑似重复入账"], reviewNote: "已核对备注",
+      issues: [index % 2 ? "可能和账本中的流水重复" : "疑似重复入账"], reviewNote: "已核对备注",
     }));
     const other: ParsedTx[] = [
       { ...fixture, id: "regular", status: "ready", issues: [] },
       { ...fixture, id: "confirmed", status: "duplicate", issues: ["疑似重复入账"], duplicateOf: { id: "existing", where: "ledger", label: "已确认重复" } },
       { ...fixture, id: "already-excluded", status: "excluded", issues: ["疑似重复入账"] },
+      { ...fixture, id: "legacy-cross-source", status: "pending", issues: ["不同来源的流水可能是同一笔"], matches: [] },
     ];
-    const txs = [...suspects, ...other];
+    const refund = (id: string, source: ParsedTx["source"], amount: number, payee: string, time?: string): ParsedTx => ({
+      ...fixture, id, source, amount, payee, time, date: "2026-11-06", eventType: "refund", direction: "in",
+      sourceTxId: source.startsWith("bank-") ? undefined : `order-${id}`, sourceFileHash: undefined,
+      status: "pending", finalAccount: "", suggestedAccount: "", issues: [], matches: [],
+    });
+    const copies = markDuplicates([
+      refund("bank-refund", "bank-citic", 100, "支付宝－测试餐厅"),
+      refund("alipay-refund", "alipay", 100, "测试餐厅", "22:07:08"),
+      refund("reviewed-bank", "bank-citic", 200, "微信支付-测试餐厅"),
+      refund("unreviewed-wechat", "wechat", 200, "测试餐厅"),
+      refund("ambiguous-bank", "bank-citic", 300, "支付宝－测试餐厅"),
+      refund("ambiguous-first", "alipay", 300, "测试餐厅"),
+      refund("ambiguous-second", "alipay", 300, "测试餐厅"),
+      refund("manually-excluded", "bank-citic", 400, "支付宝－测试餐厅"),
+      refund("already-kept", "alipay", 400, "测试餐厅"),
+      refund("first-merchant", "bank-citic", 500, "支付宝－甲餐厅"),
+      refund("other-merchant", "alipay", 500, "乙餐厅"),
+      refund("morning-refund", "wechat", 600, "测试餐厅", "09:00:00"),
+      refund("evening-refund", "alipay", 600, "测试餐厅", "22:00:00"),
+    ], []).txs;
+    copies.find(({ id }) => id === "manually-excluded")!.status = "excluded";
+    const reviewed = copies.find(({ id }) => id === "reviewed-bank")!;
+    reviewed.status = "ready";
+    reviewed.finalAccount = "Expenses:Food:Meals:Dine";
+    // Ledger review hints on both copies are still only suspected matches.
+    for (const tx of copies.filter(({ amount }) => amount === 200)) tx.issues!.push("疑似重复入账");
+    const txs = [...suspects, ...other, ...copies];
     const saved = store.create({ file: "batch.csv", source: "alipay", txs, txCount: txs.length, errors: [], accountsDetected: [], ledgerProfile: profileId(root, "main.bean") });
     store.save({ ...saved, preview: { revision: saved.revision, result: { entries: "", monthFiles: {}, generated: [], opens: [] }, opens: [] } });
     const action = `/api/batch/${saved.batchId}/exclude-suspected`;
     await request(exclusionBase, action, { revision: saved.revision + 1 }, 409);
     const excluded = await request(exclusionBase, action, { revision: saved.revision, reviewSessionId });
-    assert.equal(excluded.excluded, suspects.length);
-    assert.deepEqual(excluded.batch.reviewUndo, { sessionId: reviewSessionId, depth: 1, action: "deduplicate", count: suspects.length });
+    assert.equal(excluded.excluded, suspects.length + 2);
+    assert.deepEqual(excluded.batch.reviewUndo, { sessionId: reviewSessionId, depth: 1, action: "deduplicate", count: suspects.length + 2 });
     assert.equal(excluded.batch.revision, saved.revision + 1);
     assert.ok(excluded.batch.txs.slice(0, suspects.length).every((tx: ParsedTx) => tx.status === "excluded" && tx.reviewNote === "已核对备注"));
-    assert.deepEqual(excluded.batch.txs.slice(suspects.length), other);
+    assert.deepEqual(excluded.batch.txs.slice(suspects.length, suspects.length + other.length), other);
+    const removedCopies = new Set(["bank-refund", "unreviewed-wechat"]);
+    const expectedCopies = copies.map((tx) => removedCopies.has(tx.id) ? { ...tx, status: "excluded" } : tx);
+    assert.deepEqual(excluded.batch.txs.slice(suspects.length + other.length), JSON.parse(JSON.stringify(expectedCopies)));
     const updated = store.get(saved.batchId)!;
     assert.equal(updated.preview, undefined);
     const repeated = await request(exclusionBase, action, { revision: updated.revision, reviewSessionId });
@@ -876,7 +906,7 @@ try {
     assert.deepEqual(repeated.batch.reviewUndo, excluded.batch.reviewUndo);
     const undo = `/api/batch/${saved.batchId}/undo-review-status`;
     const restored = await request(exclusionBase, undo, { revision: repeated.batch.revision, reviewSessionId });
-    assert.deepEqual(restored.restoredIds, suspects.map(({ id }) => id));
+    assert.deepEqual(restored.restoredIds, [...suspects.map(({ id }) => id), ...removedCopies]);
     assert.equal(restored.batch.revision, saved.revision + 2);
     assert.equal(restored.batch.reviewUndo, undefined);
     assert.deepEqual(restored.batch.txs, JSON.parse(JSON.stringify(txs)));
@@ -885,7 +915,7 @@ try {
     assert.equal((await request(exclusionBase, `/api/batch/${saved.batchId}`)).reviewUndo, undefined);
     await request(exclusionBase, action, { revision: excludedAgain.batch.revision }, 409);
     await request(exclusionBase, undo, { revision: excludedAgain.batch.revision, reviewSessionId }, 409);
-    passed("batch exclusion saves and undoes all eligible suspects atomically while preserving other rows");
+    passed("batch exclusion keeps one reviewable cross-source copy, skips ambiguous matches, and saves all changes atomically");
   }
   {
     const mappingRoot = path.join(temporary, "mapping-ledger");
