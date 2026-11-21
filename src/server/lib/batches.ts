@@ -15,6 +15,7 @@ export interface StoredBatch extends ImportPreview {
   /** Storage names of the original PDFs, keyed by their upload digest. */
   pdfUploads?: Record<string, StoredPdfUpload>;
   preview?: { revision: number; result: GenerateResult; opens: string[] };
+  mergedFrom?: string[];
 }
 
 export const isBatchId = (id: string) => /^b\d+-[a-f0-9]{12}$/.test(id);
@@ -48,7 +49,26 @@ export class BatchStore {
     return path.join(this.directory, `${id}.json`);
   }
 
-  create(input: Omit<StoredBatch, "batchId" | "createdAt" | "revision" | "committed">): StoredBatch {
+  private archivePointer(id: string): string {
+    return path.join(path.dirname(this.file(id)), "merged-into", `${id}.json`);
+  }
+
+  private removedMerge(id: string): string {
+    return path.join(path.dirname(this.file(id)), "removed-merges", `${id}.json`);
+  }
+
+  mergedInto(id: string): string | undefined {
+    if (!isBatchId(id)) return undefined;
+    try {
+      const target: unknown = JSON.parse(fs.readFileSync(this.archivePointer(id), "utf8"));
+      if (typeof target === "string" && isBatchId(target)
+        && (this.has(target) || fs.existsSync(this.removedMerge(target)))) return target;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+
+  create(input: Omit<StoredBatch, "batchId" | "createdAt" | "revision" | "committed" | "mergedInto">): StoredBatch {
     const batch: StoredBatch = {
       ...input,
       batchId: `b${Date.now()}-${crypto.randomBytes(6).toString("hex")}`,
@@ -56,13 +76,17 @@ export class BatchStore {
       revision: 1,
       committed: false,
     };
+    // Pointers become active together when the new batch is atomically published.
+    for (const id of batch.mergedFrom ?? []) atomicJson(this.archivePointer(id), batch.batchId);
     this.save(batch);
     return batch;
   }
 
   get(id: string): StoredBatch | undefined {
     try {
-      return JSON.parse(fs.readFileSync(this.file(id), "utf8")) as StoredBatch;
+      const batch = JSON.parse(fs.readFileSync(this.file(id), "utf8")) as StoredBatch;
+      const mergedInto = this.mergedInto(id);
+      return mergedInto ? { ...batch, mergedInto } : batch;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
       throw error;
@@ -74,6 +98,7 @@ export class BatchStore {
   }
 
   remove(id: string): void {
+    if (this.get(id)?.mergedFrom?.length) atomicJson(this.removedMerge(id), true);
     fs.unlinkSync(this.file(id));
   }
 

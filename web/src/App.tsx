@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import type { AppConfig, EventType, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerMatch, ParsedTx, ReviewProblem, TxDecision, TxStatus } from "../../src/shared/types.js";
+import type { AppConfig, EventType, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerMatch, ParsedTx, ReviewProblem, StatementName, TxDecision, TxStatus } from "../../src/shared/types.js";
+import { isClosedAlipayPurchase } from "../../src/shared/alipay.js";
 import {
   canExcludeSuspectedDuplicate, canFollowPurchaseRefund, CROSS_SOURCE_ISSUE, defaultNarration, hasPdfSource, isSuspectedDuplicate,
   LEDGER_DUPLICATE_ISSUE, MAX_NARRATION_LENGTH, PDF_REVIEW_ISSUE,
@@ -8,9 +9,10 @@ import { savedCategoryAllocations } from "../../src/shared/categoryAllocations.j
 import { amountText, missingPostingAccount, missingPostingAccountMessage } from "../../src/shared/postings.js";
 import { accountIsActive, hasFundingPosting, isCombinedPayment, isFundingAccount, reusablePaymentMethod } from "../../src/shared/funding.js";
 import { activeTransactions } from "../../src/shared/transactionMerge.js";
-import { api, ApiError, IncompleteReviewError, type BatchSummary, type ConfigResponse, type GeneratedPreview, type LedgerSummary, type MergeDraft } from "./api";
+import { api, ApiError, IncompleteReviewError, type BatchMergeOptions, type BatchSummary, type ConfigResponse, type GeneratedPreview, type LedgerSummary, type MergeDraft } from "./api";
 import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, ReviewMetadataFields, ReviewPostingFields, shakeInvalidFields, TransactionSourceDetails, validatePostingDraft, type ReviewDraft } from "./ReviewEditor";
 import AccountSelect from "./AccountSelect";
+import BatchReviewDialog from "./BatchReviewDialog";
 import BeancountCode from "./BeancountCode";
 import ConfigPanel, { SETTINGS_LINKS, type SettingsSection } from "./ConfigPanel";
 import DateRangeFilter from "./DateRangeFilter";
@@ -19,6 +21,8 @@ import FundingDialog from "./FundingDialog";
 import MergeDialog from "./MergeDialog";
 import PdfPreviewDialog from "./PdfPreviewDialog";
 import ReviewMenu from "./ReviewMenu";
+import ReviewConflictPanel from "./ReviewConflictPanel";
+import StatementSources from "./StatementSources";
 import TransactionFlag from "./TransactionFlag";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "./reviewChanges";
 import {
@@ -76,6 +80,10 @@ const reviewIcons = {
     <path d="M7.6 7.6a2.5 2.5 0 1 1 3.9 2.1c-1 .7-1.5.9-1.5 2" stroke="var(--surface)" />
     <circle cx="10" cy="14.4" r=".95" fill="var(--surface)" stroke="none" />
   </>,
+  settings: <>
+    <path d="M8.3 2.5h3.4l.4 2 1.5.87 1.95-.67 1.7 2.94-1.55 1.33v1.74l1.55 1.33-1.7 2.94-1.95-.67-1.5.87-.4 2H8.3l-.4-2-1.5-.87-1.95.67-1.7-2.94 1.55-1.33V8.97L2.75 7.64l1.7-2.94 1.95.67 1.5-.87z" />
+    <circle cx="10" cy="9.84" r="2.55" />
+  </>,
 };
 
 function ReviewIcon({ name }: { name: keyof typeof reviewIcons }) {
@@ -83,7 +91,7 @@ function ReviewIcon({ name }: { name: keyof typeof reviewIcons }) {
 }
 
 function pendingCategory(row: ReviewRow) {
-  const canClassify = (tx: ParsedTx) => tx.status === "pending" && !tx.postings && !tx.excludedReason;
+  const canClassify = (tx: ParsedTx) => tx.status === "pending" && !tx.postings && !tx.excludedReason && !tx.reviewConflictId;
   if (canClassify(row.tx) && !row.refund?.postings) return { id: row.tx.id, detail: false };
   const entry = row.refund && row.entries.find(canClassify);
   return entry ? { id: entry.id, detail: true } : undefined;
@@ -202,7 +210,7 @@ function FundingAllocationDetails({ tx, issue, leg, readOnly }: { tx: ParsedTx; 
     </dl> : tx.rawAccount && <p>{tx.rawAccount}</p>}
     {tx.fundingAccount && tx.fundingConfidence !== undefined && tx.fundingConfidence < 1 &&
       <p>已预填资金账户 <code>{tx.fundingAccount}</code></p>}
-    {!readOnly && !tx.postings && !tx.excludedReason &&
+    {!readOnly && !tx.postings && !tx.excludedReason && !tx.reviewConflictId &&
       <p>核对后可在「拆分分录」中录入实际金额。</p>}
   </section>;
 }
@@ -234,6 +242,9 @@ export default function App() {
   const [config, setConfig] = useState<ConfigResponse | null>(null);
   const [ledger, setLedger] = useState<LedgerSummary | null>(null);
   const [batches, setBatches] = useState<BatchSummary[]>([]);
+  const [selectedBatchIds, setSelectedBatchIds] = useState(new Set<string>());
+  const [batchMergeOptions, setBatchMergeOptions] = useState<BatchMergeOptions | null>(null);
+  const [renameStatementsOpen, setRenameStatementsOpen] = useState(false);
   const [batchesRefreshing, setBatchesRefreshing] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
@@ -268,7 +279,6 @@ export default function App() {
   const [pdfPreviewTx, setPdfPreviewTx] = useState<ParsedTx | null>(null);
   const [page, setPage] = useState(0);
   const [dragOver, setDragOver] = useState(false);
-  const [help, setHelp] = useState(false);
   const [validation, setValidation] = useState("");
   const [favaMessage, setFavaMessage] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
@@ -447,7 +457,13 @@ export default function App() {
     previewProblems.get(id)?.find((problem) => problem.field === field)?.message;
   const active = useMemo(() => activeTransactions(txs), [txs]);
   const accounts = ledger?.accounts ?? [];
-  const readOnly = Boolean(batch?.committed);
+  const posted = Boolean(batch?.committed);
+  const readOnly = posted || Boolean(batch?.mergedInto);
+  const statementSources = useMemo(() => new Map(batch?.statementSources?.map((source) => [source.id, source])), [batch?.statementSources]);
+  const sourcesFor = (entries: readonly ParsedTx[]) => [...new Set(entries.flatMap((tx) => tx.statementSourceIds ?? []))]
+    .flatMap((id) => statementSources.get(id) ?? []);
+  const selectedBatches = batches.filter((item) => !item.committed && !item.mergedInto && selectedBatchIds.has(item.batchId));
+  const archivedBatches = batches.filter((item) => item.mergedInto);
   const fileErrors = batch?.errors.filter(({ row }) => row === 0) ?? [];
   const rowErrors = batch?.errors.filter(({ row }) => row > 0) ?? [];
   const emptyImportFailed = !!batch?.errors.length && batch.txs.length === 0;
@@ -468,7 +484,8 @@ export default function App() {
   const focusedRowIndex = rowFocusedDuringSave ? visible.findIndex(({ tx }) => tx.id === rowFocusedDuringSave) : -1;
   const currentPage = focusedRowIndex < 0 ? Math.min(page, totalPages - 1) : Math.floor(focusedRowIndex / PAGE_SIZE);
   const rows = visible.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
-  const visibleEntries = visible.flatMap((row) => row.entries);
+  const visibleEntries = visible.flatMap((row) => row.entries).filter((tx) => !tx.reviewConflictId);
+  const selectableRows = visible.filter((row) => row.entries.some((tx) => !tx.reviewConflictId)).length;
   const selectedVisible = visibleEntries.filter((tx) => selected.has(tx.id)).length;
   const selectedRows = reviewRows.filter((row) => row.entries.some((tx) => selected.has(tx.id))).length;
   const hiddenSelection = selectedRows - visible.filter((row) => row.entries.some((tx) => selected.has(tx.id))).length;
@@ -482,7 +499,7 @@ export default function App() {
   const bulkTagErrors = invalidTags(bulkTags);
   const bulkEditDisabled = editingDisabled || detailDraftIds.length > 0 || !targets.length;
   const bulkTagDisabled = bulkEditDisabled || !parseTags(bulkTags).length || Boolean(bulkTagErrors.length);
-  const pendingHigh = active.filter((tx) => tx.status === "pending" && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 1) >= 0.9
+  const pendingHigh = active.filter((tx) => tx.status === "pending" && !tx.reviewConflictId && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 1) >= 0.9
     && !tx.issues?.length && tx.suggestedAccount && !missingPostingAccount({ ...tx, finalAccount: tx.suggestedAccount }));
   const readyCount = active.filter((tx) => tx.status === "ready").length;
   const showDecisionStatus = statusFilter === "all";
@@ -658,19 +675,28 @@ export default function App() {
     setFundingTarget(null);
     setMappingTarget(null);
     setMergeIds(null);
+    setBatchMergeOptions(null);
+    setRenameStatementsOpen(false);
     setPdfPreviewTx(null);
     replaceBatch(value, id);
     setPreviewCheck(null);
     setReviewFocus(null);
     setDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null);
-    setFilter(""); setDateRange(EMPTY_REVIEW_DATE_RANGE); setStatusFilter(value.committed ? "all" : "pending");
+    setFilter(""); setDateRange(EMPTY_REVIEW_DATE_RANGE); setStatusFilter(value.committed || value.mergedInto ? "all" : "pending");
     setBulkScope("selected"); setBulkTags("");
-    invalidate(); setNotice(value.committed ? "已提交" : resumed && value.txs.length > 0 ? "已恢复审批进度" : "");
+    invalidate(); setNotice(value.mergedInto ? "已合并" : value.committed ? "已提交" : resumed && value.txs.length > 0 ? "已恢复审批进度" : "");
   };
 
   const prepareReview = async (id: string, value: ImportPreview, opening: ReviewOpening, mappings?: FundingMappingChoice[]) => {
     if (batchIdFromUrl() !== id) return;
-    if (!value.committed && activeTransactions(value.txs).some((tx) => !tx.merge
+    const editable = !value.committed && !value.mergedInto;
+    const restoringRefund = editable && value.txs.some((tx) => tx.refundCounterpartId && isClosedAlipayPurchase(tx));
+    if (restoringRefund) {
+      const result = await api.recheckLedger(id, value.revision ?? 0);
+      if (batchIdFromUrl() !== id) return;
+      value = result.batch;
+    }
+    if (editable && !value.statementSources?.length && activeTransactions(value.txs).some((tx) => !tx.merge
       && (tx.source === "wechat" || (!tx.fundingAccount && tx.status !== "excluded" && tx.status !== "duplicate")))) {
       const result = await api.funding(id, value.revision ?? 0, mappings);
       if (batchIdFromUrl() !== id) return;
@@ -682,10 +708,12 @@ export default function App() {
       if (result.batch) value = result.batch;
     }
     startReview(id, value, opening !== "import");
-    if (opening === "reload" && !value.committed) {
-      const result = await api.recheckLedger(id, value.revision ?? 0);
-      if (batchIdFromUrl() !== id) return;
-      replaceBatch(result.batch, id);
+    if (opening === "reload" && editable) {
+      if (!restoringRefund) {
+        const result = await api.recheckLedger(id, value.revision ?? 0);
+        if (batchIdFromUrl() !== id) return;
+        replaceBatch(result.batch, id);
+      }
       setNotice("已重新载入并复查疑似重复");
     }
   };
@@ -993,6 +1021,8 @@ export default function App() {
     setPdfPreviewTx(null);
     setMappingTarget(null);
     setReviewFocus(null);
+    setBatchMergeOptions(null);
+    setRenameStatementsOpen(false);
   };
 
   useEffect(() => {
@@ -1051,6 +1081,48 @@ export default function App() {
     setNotice("已删除批次");
   });
 
+  const closeBatchDialog = () => {
+    setBatchMergeOptions(null);
+    setRenameStatementsOpen(false);
+    setError("");
+  };
+
+  const openBatchMerge = () => void perform(async () => {
+    if (selectedBatches.length < 2) return;
+    const plan = await api.batchMergeOptions(selectedBatches.map(({ batchId, revision }) => ({ batchId, revision })));
+    if (!batchIdFromUrl() && !settingsRoute()) setBatchMergeOptions(plan);
+  });
+
+  const mergeBatches = (keepProgress: string[], names: StatementName[]) => void perform(async () => {
+    if (!batchMergeOptions) return;
+    const selection = batchMergeOptions.batches.map(({ batchId, revision }) => ({ batchId, revision }));
+    const result = await api.mergeBatches(selection, keepProgress, names);
+    setBatches(result.batches);
+    setSelectedBatchIds(new Set());
+    closeBatchDialog();
+    navigateBatch(result.batch.batchId, { hash: "" });
+    startReview(result.batch.batchId, result.batch, false);
+    setNotice(`已合并 ${selection.length} 个批次`);
+  });
+
+  const renameStatements = (names: StatementName[]) => void perform(async () => {
+    if (blockBatchChanges || !batchRef.current) return;
+    const result = await api.renameStatements(batchIdRef.current, batchRef.current.revision ?? 0, names);
+    invalidate();
+    replaceBatch(result.batch);
+    closeBatchDialog();
+    setNotice("已保存账单显示名");
+  });
+
+  const resolveConflict = (conflictId: string, sourceBatchId: string | null) => void perform(async () => {
+    const current = batchRef.current;
+    if (blockBatchChanges || !current || current.committed || current.mergedInto) return;
+    const result = await api.resolveReviewConflict(batchIdRef.current, current.revision ?? 0, conflictId, sourceBatchId);
+    invalidate();
+    replaceBatch(result.batch);
+    setNotice(sourceBatchId ? "已沿用所选批次的审批进度" : "已恢复为待确认");
+  });
+
   const saveConfig = async (values: Partial<AppConfig>) => {
     if (blockBatchChanges) return;
     let saved: ConfigResponse | undefined;
@@ -1063,6 +1135,7 @@ export default function App() {
         navigateBatch("", { replace: true });
         setLedger(null);
         setBatches([]);
+        setSelectedBatchIds(new Set());
       } else invalidate();
       setNotice("已保存设置");
       await Promise.all([
@@ -1131,7 +1204,7 @@ export default function App() {
   };
 
   const renderPostingActions = (tx: ParsedTx, disabled: boolean, refund?: ParsedTx, compact = false) => {
-    if (readOnly) return null;
+    if (readOnly || tx.reviewConflictId) return null;
     const payee = tx.payee || "（无商户）";
     const entries = refund ? [tx, refund] : [tx];
     const exclude = entries.filter(isEditablePostingStatus);
@@ -1177,6 +1250,7 @@ export default function App() {
     const automatic = defaultNarration(tx);
     const draft = narrationDrafts[tx.id];
     const value = draft ?? tx.narration ?? "";
+    const lockedNarration = readOnly || Boolean(tx.reviewConflictId);
     const canComplete = !value && automatic.length > 0 && automatic.length <= MAX_NARRATION_LENGTH;
     const edit = (next: string) => {
       invalidate();
@@ -1184,15 +1258,15 @@ export default function App() {
     };
     return <div className="tx-narration"><input type="text" aria-label={`账本摘要 · ${payee}`} value={value}
       maxLength={MAX_NARRATION_LENGTH} placeholder={automatic || "输入账本摘要"}
-      title={!readOnly && canComplete ? "Tab 填入账单摘要" : value || "账本摘要"}
-      readOnly={readOnly} disabled={busy} onChange={(event) => edit(event.target.value)}
+      title={!lockedNarration && canComplete ? "Tab 填入账单摘要" : value || "账本摘要"}
+      readOnly={lockedNarration} disabled={busy} onChange={(event) => edit(event.target.value)}
       onBlur={() => {
-        if (readOnly || draft === undefined) return;
+        if (lockedNarration || draft === undefined) return;
         void saveDecisions([{ id: tx.id, narration: draft.trim() ? draft : null }], {
           savedNarration: { id: tx.id, value: draft },
         });
       }} onKeyDown={(event) => {
-        if (editingDisabled || event.nativeEvent.isComposing) return;
+        if (busy || lockedNarration || event.nativeEvent.isComposing) return;
         if (event.key === "Tab" && canComplete && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
           event.preventDefault();
           edit(automatic);
@@ -1208,7 +1282,7 @@ export default function App() {
 
   const renderPostingEditor = (tx: ParsedTx, showValidation: boolean, leg?: string) => {
     const error = fieldProblem(tx.id, "postings");
-    if (tx.merge && !error) return null;
+    if (tx.reviewConflictId || (tx.merge && !error)) return null;
     return <div className="detail-posting-editor" key={tx.id}>
       {leg && <h4>{leg}</h4>}
       <ReviewPostingFields tx={tx} accounts={accounts} draft={drafts[tx.id]?.value ?? makeDraft(tx)}
@@ -1226,7 +1300,7 @@ export default function App() {
     }} />;
 
   const renderMetadataEditor = (tx: ParsedTx) => <ReviewMetadataFields tx={tx}
-    draft={drafts[tx.id]?.value ?? makeDraft(tx)} disabled={editingDisabled}
+    draft={drafts[tx.id]?.value ?? makeDraft(tx)} disabled={editingDisabled || Boolean(tx.reviewConflictId)}
     tagError={fieldProblem(tx.id, "tags")} onChange={(next) => changeDraft(tx, next)} />;
 
   const renderFundingReview = (tx: ParsedTx, disabled: boolean, leg?: string) => {
@@ -1268,7 +1342,7 @@ export default function App() {
   const renderStatementSource = (tx: ParsedTx, counterpart?: ParsedTx) => <>
     {renderDirectionReview(tx)}
     {renderPdfSource(tx)}
-    <TransactionSourceDetails tx={tx} counterpart={counterpart} />
+    <TransactionSourceDetails tx={tx} counterpart={counterpart} sources={sourcesFor([tx])} />
   </>;
 
   const renderMergedOriginals = (originals: ParsedTx[]) => <div className="merge-originals">
@@ -1310,10 +1384,12 @@ export default function App() {
   };
 
   const renderTransactionDetails = ({ tx, entries, refund, originals, amount }: ReviewRow) => {
-    const hasEdits = entries.some(({ id }) => Boolean(drafts[id]));
-    const fieldsDisabled = editingDisabled || hasEdits;
-    const rowDisabled = fieldsDisabled;
-    const status = refund && refund.status !== tx.status ? "分别核对" : postingStatusLabel(tx, readOnly);
+    const fieldsDisabled = editingDisabled || entries.some(({ id }) => Boolean(drafts[id]));
+    const rowDisabled = editingDisabled || entries.some((entry) => Boolean(entry.reviewConflictId || drafts[entry.id]));
+    const editableEntries = entries.filter((entry) => !entry.reviewConflictId);
+    const hasEdits = editableEntries.some(({ id }) => Boolean(drafts[id]));
+    const status = refund && refund.status !== tx.status ? "分别核对" : postingStatusLabel(tx, posted);
+    const conflict = tx.reviewConflictId ? batch?.reviewConflicts?.find(({ id }) => id === tx.reviewConflictId) : undefined;
     const counterpart = tx.refundCounterpartId ? txs.find(({ id }) => id === tx.refundCounterpartId) : undefined;
     const timestamp = tx.time ? `${tx.date} ${tx.time}` : tx.date;
     const panel = <aside key={tx.id} ref={detailPanel} className="transaction-detail" id="transaction-detail" data-review-id={tx.id} aria-labelledby="transaction-detail-heading"
@@ -1326,7 +1402,7 @@ export default function App() {
       <header className="transaction-detail-head">
         <div className="detail-heading">
           <div className="detail-payee-line">
-            {renderDetailFlag(entries, refund ? "整组账本标记" : "账本标记", editingDisabled)}
+            {renderDetailFlag(editableEntries.length ? editableEntries : entries, refund ? "整组账本标记" : "账本标记", editingDisabled || !editableEntries.length)}
             <h3 id="transaction-detail-heading" ref={detailHeading} tabIndex={-1}>{tx.payee || "（无商户）"}</h3>
           </div>
           <div className="detail-meta">
@@ -1335,15 +1411,15 @@ export default function App() {
             {showDecisionStatus && <span>{status}</span>}
           </div>
         </div>
-        {!readOnly && <div className="toolbar detail-edit-actions" role="group" aria-label="审批编辑">
-          <button type="button" className="btn small" disabled={busy || !hasEdits} onClick={() => discardDetailEdits(entries)}>放弃</button>
+        {!readOnly && editableEntries.length > 0 && <div className="toolbar detail-edit-actions" role="group" aria-label="审批编辑">
+          <button type="button" className="btn small" disabled={busy || !hasEdits} onClick={() => discardDetailEdits(editableEntries)}>放弃</button>
           <button type="button" className="btn primary small" disabled={busy || !hasEdits}
-            onClick={() => saveDetailEdits(entries, tx.id)}>保存</button>
+            onClick={() => saveDetailEdits(editableEntries, tx.id)}>保存</button>
         </div>}
       </header>
       <div className="transaction-detail-body">
         {entries.map((entry) => renderPostingEditor(entry, detailSaveAttempt?.id === tx.id, refund ? entry === refund ? "退款" : "原消费" : undefined))}
-        {entries.map((entry) => renderFundingReview(entry, fieldsDisabled, refund ? entry === refund ? "退款" : "原消费" : undefined))}
+        {entries.map((entry) => renderFundingReview(entry, fieldsDisabled || Boolean(entry.reviewConflictId), refund ? entry === refund ? "退款" : "原消费" : undefined))}
         {entries.map((entry) => {
           const match = duplicateEvidence(entry);
           const label = refund ? `${entry === refund ? "退款" : "原消费"} · 疑似重复` : "疑似重复核对";
@@ -1362,18 +1438,20 @@ export default function App() {
           </div> : renderStatementSource(tx, counterpart)}
         </details>}
         <EntryPreview entries={entries} batchId={batchId} />
+        {conflict && <ReviewConflictPanel conflict={conflict} disabled={editingDisabled || blockBatchChanges} readOnly={readOnly}
+          onResolve={(sourceBatchId) => resolveConflict(conflict.id, sourceBatchId)} />}
         {refund ? entries.map((entry) => {
           const label = entry === refund ? "退款" : "原消费";
           return <section className="refund-leg" id={`refund-leg-${entry.id}`} tabIndex={-1} aria-label={label} key={entry.id}>
             <div className="refund-leg-heading"><h3>{label}</h3>
               <strong className={`amt ${entry.direction}`}>{fmt(entry.amount)} {entry.currency}</strong>
-              {showDecisionStatus && <span className={`decision-status ${entry.status}`}>{postingStatusLabel(entry, readOnly)}</span>}</div>
+              {showDecisionStatus && <span className={`decision-status ${entry.status}`}>{postingStatusLabel(entry, posted)}</span>}</div>
             <time className="tx-date" dateTime={entry.time ? `${entry.date}T${entry.time}` : entry.date}>{entry.date}{entry.time && ` ${entry.time}`}</time>
             {entry.reviewNote && <dl className="tx-meta"><div><dt>审批备注</dt><dd>{entry.reviewNote}</dd></div></dl>}
             <details className="refund-leg-actions">
               <summary>{readOnly ? "单笔详情" : "单笔审批与备注"}</summary>
               <div className="refund-leg-review">
-                {renderDetailFlag([entry], `${label}账本标记`, editingDisabled)}
+                {renderDetailFlag([entry], `${label}账本标记`, editingDisabled || Boolean(entry.reviewConflictId))}
                 {renderAccountFields(entry, fieldsDisabled, undefined, true)}
                 {renderPostingActions(entry, rowDisabled)}
                 {renderMetadataEditor(entry)}
@@ -1383,7 +1461,7 @@ export default function App() {
           </section>;
         }) : <>
           {!originals && renderHistory(tx, rowDisabled)}
-          {renderMetadataEditor(tx)}
+          {!conflict && renderMetadataEditor(tx)}
         </>}
       </div>
     </aside>;
@@ -1391,16 +1469,41 @@ export default function App() {
       onCancel={(event) => { event.preventDefault(); closeDetails(); }}>{panel}</dialog> : panel;
   };
 
-  const renderReviewRow = ({ tx, refund, entries, amount }: ReviewRow) => {
+  const renderBatchRow = (item: BatchSummary) => {
+    const selectable = !item.committed && !item.mergedInto;
+    const label = item.mergedInto ? "查看原批次" : item.committed ? "查看批次" : "继续审批";
+    return <div className={`batch-row${selectable && selectedBatchIds.has(item.batchId) ? " is-selected" : ""}`} key={item.batchId}>
+      {selectable && <label className="batch-select">
+        <input type="checkbox" className="checkbox" aria-label={`选择批次 · ${item.file}`} disabled={busy}
+          checked={selectedBatchIds.has(item.batchId)} onChange={(event) => {
+            const next = new Set(selectedBatchIds);
+            if (event.target.checked) next.add(item.batchId);
+            else next.delete(item.batchId);
+            setSelectedBatchIds(next);
+          }} />
+      </label>}
+      <div className="batch-info"><b title={item.file}>{item.file}</b>
+        <small>{batchTime(item.createdAt)} · {item.txCount} 笔{item.committed && " · 已提交"}{item.mergedInto && " · 已合并"}</small></div>
+      <div className="batch-actions">
+        <button type="button" className={`btn${selectable ? " primary" : ""}`} disabled={busy}
+          aria-label={`${label} · ${item.file}`} onClick={() => navigateBatch(item.batchId)}>{label}</button>
+        {selectable && <button type="button" className="btn batch-delete" disabled={busy}
+          aria-label={`删除批次 ${item.file}（${batchTime(item.createdAt)}）`} onClick={() => setDeleteTarget(item)}>删除</button>}
+      </div>
+    </div>;
+  };
+
+  const renderReviewRow = ({ tx, refund, entries, amount, originals }: ReviewRow) => {
     const payee = tx.payee || "（无商户）";
     const ready = tx.status === "ready";
     const isSelected = entries.every((entry) => selected.has(entry.id));
     const partlySelected = !isSelected && entries.some((entry) => selected.has(entry.id));
     const mixedStatus = refund && refund.status !== tx.status;
-    const statusLabel = mixedStatus ? "分别核对" : postingStatusLabel(tx, readOnly);
+    const statusLabel = mixedStatus ? "分别核对" : postingStatusLabel(tx, posted);
+    const conflicted = Boolean(tx.reviewConflictId);
+    const fieldsDisabled = editingDisabled || conflicted || entries.some(({ id }) => Boolean(drafts[id]));
     const hasDraft = entries.some((entry) => Boolean(drafts[entry.id]));
-    const fieldsDisabled = editingDisabled || hasDraft;
-    const rowDisabled = fieldsDisabled;
+    const rowDisabled = editingDisabled || conflicted || hasDraft;
     const detailsOpen = detailTxId === tx.id;
     const issues = entries.flatMap(reviewIssues).filter((issue) => issue !== PDF_REVIEW_ISSUE);
     const needsDetails = issues.includes(DIRECTION_REVIEW_ISSUE) || entries.some((entry) =>
@@ -1416,7 +1519,8 @@ export default function App() {
     if (sourceType && sourceType !== eventLabel) {
       typeLabel = eventLabel === directionLabel ? sourceType : `${eventLabel} · ${sourceType}`;
     }
-    const eventText = tx.merge ? `合并 ${tx.merge.originals.length} 笔` : refund ? "含退款" : typeLabel === directionLabel ? "" : typeLabel;
+    const eventText = tx.merge ? `合并 ${tx.merge.originals.length} 笔`
+      : refund ? amount === 0 ? "全额退款" : "含退款" : typeLabel === directionLabel ? "" : typeLabel;
     const hasPreviewProblem = entries.some(({ id }) => previewProblems.has(id));
     const rowProblem = [...new Set(entries.flatMap(({ id }) => {
       const message = fieldProblem(id, undefined);
@@ -1436,7 +1540,7 @@ export default function App() {
       className={`tx-row${detailsOpen ? " details-open" : ""}${isSelected ? " is-selected" : ""}${hasPreviewProblem ? " has-review-problem" : ""}`}>
       {!readOnly && <td role="cell" className="tx-select-cell">
         <label className="row-selection">
-          <input type="checkbox" className="checkbox" aria-label={`批量选择 ${payee}`} checked={isSelected}
+          <input type="checkbox" className="checkbox" aria-label={`批量选择 ${payee}`} checked={isSelected} disabled={conflicted}
             ref={(input) => { if (input) input.indeterminate = partlySelected; }}
             onChange={(event) => selectTransactions(entries, event.target.checked)} />
           <span>批量选择</span>
@@ -1463,6 +1567,7 @@ export default function App() {
             </ul>}
             {rowProblem && <p id={`review-row-error-${tx.id}`} className="review-field-error">{rowProblem}</p>}
             {renderNarration(tx, payee)}
+            {statementSources.size > 0 && <StatementSources sources={sourcesFor(originals ?? entries)} />}
         </div>
       </td>
       <td role="cell" className="tx-type-cell">
@@ -1497,6 +1602,8 @@ export default function App() {
         {showDecisionStatus && <span className={`decision-status ${mixedStatus ? "pending" : tx.status}`}>{statusLabel}</span>}
         {ready && tx.duplicateOf && <div className="account-hint">人工解除重复</div>}
         {renderPostingActions(tx, rowDisabled, refund, true)}
+        {conflicted && <button type="button" className="btn small conflict-trigger" aria-label={`核对审批冲突 · ${payee}`} data-detail-trigger
+          onClick={() => { focusDetailHeading.current = true; setDetailTxId(tx.id); }}>核对冲突</button>}
         {hasDraft && <span className="unsaved-edit">未保存</span>}
       </td>
     </tr>;
@@ -1519,13 +1626,12 @@ export default function App() {
         {reviewNotice && <span className="notice" role="status">{reviewNotice}</span>}
       </div>
       <div className="masthead-actions">
-        <button className="btn help-toggle" aria-expanded={help} onClick={() => setHelp(!help)}>使用说明</button>
         {settings ? routedBatchId && <a className="btn settings-entry" href="#">返回审批</a> :
-          <a className="btn settings-entry" href={SETTINGS_LINKS.ledger}>设置</a>}
+          <a className="btn settings-entry settings-icon" href={SETTINGS_LINKS.ledger} aria-label="设置" title="设置"><ReviewIcon name="settings" /></a>}
       </div>
     </header>
-    {help && <div className="help-body"><p>上传账单 → 确认账户和分类 → 预览并写入账本。</p><p>重复交易默认不入账。</p></div>}
-    {error && !fundingTarget && !mappingTarget && !mergeIds && <div className="card alert" role="alert"><b>操作未完成</b><p>{error}</p><button className="btn small" onClick={() => setError("")}>关闭</button></div>}
+    {error && !fundingTarget && !mappingTarget && !mergeIds && !batchMergeOptions && !renameStatementsOpen
+      && <div className="card alert" role="alert"><b>操作未完成</b><p>{error}</p><button className="btn small" onClick={() => setError("")}>关闭</button></div>}
     {!settings && fundingTarget && fundingTarget.id === routedBatchId && <FundingDialog key={fundingTarget.id} groups={fundingTarget.groups} busy={busy} error={error}
       onCancel={() => {
         setFundingTarget(null);
@@ -1537,6 +1643,10 @@ export default function App() {
       onCancel={() => { setMappingTarget(null); setError(""); }} onConfirm={([{ account }]) => confirmMapping(mappingTarget, account)} />}
     {mergeIds && <MergeDialog members={active.filter((tx) => mergeIds.includes(tx.id))} accounts={new Set(accounts.map(({ account }) => account))}
       busy={busy} error={error} onClose={() => { setMergeIds(null); setError(""); }} onConfirm={createMerge} />}
+    {!settings && !routedBatchId && batchMergeOptions && <BatchReviewDialog batches={batchMergeOptions.batches} sources={batchMergeOptions.sources}
+      busy={busy} error={error} onClose={closeBatchDialog} onConfirm={mergeBatches} />}
+    {!settings && renameStatementsOpen && batch?.statementSources && <BatchReviewDialog sources={batch.statementSources}
+      busy={busy} error={error} onClose={closeBatchDialog} onConfirm={(_keep, names) => renameStatements(names)} />}
     {!settings && pdfPreviewTx && <PdfPreviewDialog key={pdfPreviewTx.id} batchId={batchId} tx={pdfPreviewTx} onClose={() => setPdfPreviewTx(null)} />}
     <dialog className="delete-dialog" ref={deleteDialog} aria-labelledby="delete-batch-title" aria-describedby="delete-batch-detail" onClose={(event) => {
       if (deleteTarget && event.currentTarget.returnValue === "delete") deleteBatch(deleteTarget);
@@ -1565,16 +1675,19 @@ export default function App() {
         if (event.key === "Enter" || event.key === " ") { event.preventDefault(); if (!busy) fileInput.current?.click(); }
       }} onClick={() => { if (!busy) fileInput.current?.click(); }} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={(event) => { event.preventDefault(); setDragOver(false); upload(event.dataTransfer.files); }}><span className="dz-glyph" aria-hidden="true" /><div className="dz-main">{uploading ? "正在读取账单…" : "拖入账单，或点击选择文件"}</div><div className="dz-sub">可同时选择多个 CSV / XLSX / PDF · ZIP 请先解压</div></div></section>
       <section className="card" aria-busy={batchesRefreshing}>
-        <div className="toolbar"><h2>导入批次</h2><span className="spacer" /><button className="btn small" disabled={busy || batchesRefreshing} onClick={() => void refreshBatchList()}>刷新</button></div>
-        {!batches.length ? <p className="muted">{batchesRefreshing ? "正在加载导入批次…" : "暂无已保存批次。"}</p> : <div className="batch-list">{batches.map((item) => <div className="batch-row" key={item.batchId}>
-          <div className="batch-info"><b>{item.file}</b><small>{batchTime(item.createdAt)} · {item.txCount} 笔{item.committed && " · 已提交"}</small></div>
-          <div className="batch-actions">
-            <button type="button" className={`btn${item.committed ? "" : " primary"}`} disabled={busy}
-              aria-label={`${item.committed ? "查看批次" : "继续审批"} · ${item.file}`}
-              onClick={() => navigateBatch(item.batchId)}>{item.committed ? "查看批次" : "继续审批"}</button>
-            {!item.committed && <button type="button" className="btn batch-delete" disabled={busy} aria-label={`删除批次 ${item.file}（${batchTime(item.createdAt)}）`} onClick={() => setDeleteTarget(item)}>删除</button>}
-          </div>
-        </div>)}</div>}
+        <div className="toolbar"><h2>导入批次</h2><span className="spacer" />
+          {selectedBatches.length > 0 && <>
+            <span className="muted" role="status">已选 {selectedBatches.length} 个</span>
+            <button type="button" className="btn small primary" aria-haspopup="dialog" disabled={busy || selectedBatches.length < 2} onClick={openBatchMerge}>合并审批</button>
+          </>}
+          <button className="btn small" disabled={busy || batchesRefreshing} onClick={() => void refreshBatchList()}>刷新</button>
+        </div>
+        {!batches.length ? <p className="muted">{batchesRefreshing ? "正在加载导入批次…" : "暂无已保存批次。"}</p>
+          : <div className="batch-list">{batches.filter((item) => !item.mergedInto).map(renderBatchRow)}</div>}
+        {archivedBatches.length > 0 && <details className="archived-batches">
+          <summary>已合并批次（{archivedBatches.length}）</summary>
+          <div className="batch-list">{archivedBatches.map(renderBatchRow)}</div>
+        </details>}
       </section>
     </>}
 
@@ -1585,6 +1698,8 @@ export default function App() {
           {!emptyImportFailed && <div className="toolbar review-actions" role="group" aria-label="批次操作">
             <ReviewMenu label="批次操作" title="批次操作">{(close) => <>
               <button className="menu-action" disabled={busy || blockBatchChanges} onClick={() => { close(); reloadBatch(); }}>重新载入</button>
+              {Boolean(batch.statementSources?.length) && !batch.mergedInto && <button className="menu-action" disabled={busy || blockBatchChanges}
+                onClick={() => { close(); setError(""); setRenameStatementsOpen(true); }}>账单显示名</button>}
               {!readOnly && <>
                 <button className="menu-action" disabled={editingDisabled || blockBatchChanges || !pendingHigh.length}
                   onClick={() => { close(); saveReviewDecisions(pendingHigh.map((tx) => ({ id: tx.id, account: tx.suggestedAccount, status: "ready" }))); }}>
@@ -1620,7 +1735,7 @@ export default function App() {
           <DateRangeFilter value={dateRange} onChange={setDateRange} />
           <nav className="tabs" aria-label="筛选交易">
             {STATUS_TABS.map(({ key, label }) => <button className={`tab${statusFilter === key ? " active" : ""}`} aria-pressed={statusFilter === key}
-              key={key} onClick={() => setStatusFilter(key)}>{readOnly && key === "ready" ? "已入账" : label}<span className="count">{count(key)}</span></button>)}
+              key={key} onClick={() => setStatusFilter(key)}>{posted && key === "ready" ? "已入账" : label}<span className="count">{count(key)}</span></button>)}
           </nav>
           <select aria-label="排序" value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="date">按日期</option><option value="amount">按金额</option><option value="payee">按商户</option></select>
         </div>
@@ -1631,7 +1746,8 @@ export default function App() {
               <tr role="row">
                 {!readOnly && <th role="columnheader" scope="col" className="select-column">
                   <label className="select-filtered">
-                    <input type="checkbox" className="checkbox" checked={selectedVisible === visibleEntries.length}
+                    <input type="checkbox" className="checkbox" disabled={visibleEntries.length === 0}
+                      checked={visibleEntries.length > 0 && selectedVisible === visibleEntries.length}
                       ref={(input) => { if (input) input.indeterminate = selectedVisible > 0 && selectedVisible < visibleEntries.length; }}
                       onChange={(event) => selectTransactions(visibleEntries, event.target.checked)} />
                     全选
@@ -1655,14 +1771,14 @@ export default function App() {
           {bulkPosting ? <div className="bulk-bar" role="group" aria-label="批量编辑">
             <select className="bulk-scope" aria-label="批量编辑范围" value={bulkScope} onChange={(event) => setBulkScope(event.target.value as typeof bulkScope)}>
               <option value="selected">已选 {selectedRows} 笔{hiddenSelection > 0 ? `（筛选外 ${hiddenSelection}）` : ""}</option>
-              <option value="filtered">全部筛选结果 · {visible.length} 笔</option>
+              <option value="filtered">全部可选结果 · {selectableRows} 笔</option>
             </select>
             <button type="button" className="btn primary small" disabled={bulkEditDisabled || !bulkPosting.approvals.length}
               aria-describedby={bulkPosting.reviewTargets.length ? "bulk-review-hint" : undefined}
               onClick={() => savePostingDecisions(bulkPosting.approvals, { followedRefundIds: bulkPosting.followedRefundIds })}>标记 {bulkPosting.approvalCount} 笔入账</button>
             <button type="button" className="btn small" disabled={bulkEditDisabled || !bulkPosting.exclusionIds.length}
               onClick={() => void savePostingStatus(bulkPosting.exclusionIds, "excluded")}>{bulkScope === "filtered" ? "排除筛选结果" : "排除所选"}</button>
-            {(bulkScope === "filtered" ? visible.length : selectedRows) >= 2 && <button type="button" className="btn small" disabled={bulkEditDisabled || targets.length < 2}
+            {(bulkScope === "filtered" ? selectableRows : selectedRows) >= 2 && <button type="button" className="btn small" disabled={bulkEditDisabled || targets.length < 2}
               onClick={() => { setError(""); setMergeIds(targets.map(({ id }) => id)); }}>合并记账</button>}
             <ReviewMenu label="批量标签与标记" title="标签与标记">{(close) => <div className="bulk-edit-menu">
               <input value={bulkTags} onChange={(event) => setBulkTags(event.target.value)} placeholder="英文标签，空格分隔" aria-label="批量标签"
@@ -1690,7 +1806,11 @@ export default function App() {
       </section>
 
       {preview && <section className="card"><div className="toolbar"><h2 ref={previewHeading} tabIndex={-1}>分录预览</h2><span>共 {preview.generated} 笔</span><span className="spacer" />{!readOnly && <button className="btn primary" disabled={busy || blockBatchChanges || Boolean(preview.errors?.length) || preview.revision !== batch.revision} onClick={commit}>校验并写入账本</button>}</div><p className="muted preview-targets">{(preview.targetFiles ?? Object.keys(preview.monthFiles)).join(" · ")}</p>{preview.opens.length > 0 && <p className="error-line">账户指令建议：{preview.opens.join("；")}</p>}{preview.errors?.map((message, index) => <p role="alert" className="error-line" key={index}>{message}</p>)}<BeancountCode className="code" text={preview.entries} /></section>}
-      {readOnly && <section className="card done-banner"><h2>此批次已过账</h2>{Boolean(batch.written?.length) && <p>{batch.written?.join(" · ")}</p>}</section>}
+      {posted && <section className="card done-banner"><h2>此批次已过账</h2>{Boolean(batch.written?.length) && <p>{batch.written?.join(" · ")}</p>}</section>}
+      {batch.mergedInto && <section className="card done-banner"><div className="toolbar"><h2>此批次已合并</h2>
+        {batches.some(({ batchId }) => batchId === batch.mergedInto) && <button type="button" className="btn small"
+          disabled={busy} onClick={() => navigateBatch(batch.mergedInto!)}>查看合并后的批次</button>}
+      </div></section>}
       <section className="card"><div className="toolbar"><button className="btn" disabled={busy} onClick={() => void perform(async () => { const result = await api.validate(); setValidation(`${result.ok ? "校验通过" : "校验未通过"}\n${result.output}`); })}>校验当前账本</button><button className="btn" disabled={busy} onClick={() => void perform(async () => { const result = await api.fava(); setFavaMessage(result.running ? `http://localhost:${result.port}` : result.error ?? "Fava 启动失败"); })}>打开 Fava 报表</button></div>{validation && <pre className="code">{validation}</pre>}{favaMessage && <p>{favaMessage.startsWith("http") ? <a href={favaMessage} target="_blank" rel="noreferrer">在新窗口查看 Fava</a> : favaMessage}</p>}</section>
     </>}
   </main>;

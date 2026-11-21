@@ -55,7 +55,7 @@ export function buildReviewRows(txs: readonly ParsedTx[]): ReviewRow[] {
 }
 
 export function isEditablePostingStatus(tx: ParsedTx): boolean {
-  return tx.status === "ready" || tx.status === "pending";
+  return !tx.reviewConflictId && (tx.status === "ready" || tx.status === "pending");
 }
 
 function planApproval(tx: ParsedTx, accounts: ReadonlySet<string>): { decision: TxDecision } | { target: ReviewTarget } {
@@ -81,7 +81,7 @@ export function buildBulkPostingPlan(rows: readonly ReviewRow[], accounts: Reado
   const reviewTargets: ReviewTarget[] = [];
   let approvalCount = 0;
   for (const { tx, refund, entries } of rows) {
-    const targets = selected ? entries.filter((entry) => selected.has(entry.id)) : entries;
+    const targets = entries.filter((entry) => !entry.reviewConflictId && (!selected || selected.has(entry.id)));
     exclusionIds.push(...targets.filter(isEditablePostingStatus).map((entry) => entry.id));
     const candidates = targets.filter((entry) => !entry.excludedReason && (entry.status === "pending" || entry.status === "excluded"));
     if (!candidates.length) continue;

@@ -759,15 +759,19 @@ try {
     fs.mkdirSync(path.dirname(fundingLock), { recursive: true });
     fs.writeFileSync(fundingLock, JSON.stringify({ pid: process.pid }));
     const { groups } = await request(mappingBase, `${route}/funding`, { revision });
-    assert.deepEqual(groups.map(({ label, count }: { label: string; count: number }) => [label, count]), [["测试卡（9999）", 2], ["自定义钱包", 1]]);
+    assert.deepEqual(groups.map(({ label, count }: { label: string; count: number }) => [label, count]), [["测试卡（9999）", 2], ["自定义钱包", 1], ["零钱", 1]]);
     assert.deepEqual(groups[0].accounts, ["Assets:CN:BOC:1111", "Assets:CN:BOC:2222"]);
-    const mappings = [{ id: groups[0].id, account: "Assets:CN:BOC:1111" }, { id: groups[1].id, account: "Assets:CN:BOC:2222" }];
+    const mappings = [
+      { id: groups[0].id, account: "Assets:CN:BOC:1111" },
+      { id: groups[1].id, account: "Assets:CN:BOC:2222" },
+      { id: groups[2].id, account: "Assets:CN:BOC:2222" },
+    ];
     await request(mappingBase, `${route}/funding`, { revision, mappings }, 409);
     fs.unlinkSync(fundingLock);
     await request(mappingBase, `${route}/funding`, { revision: revision - 1, mappings }, 409);
     await request(mappingBase, `${route}/funding`, { revision, mappings: [{ ...mappings[0], account: "Assets:Future" }] }, 400);
     const incomplete = await request(mappingBase, `${route}/funding`, { revision, mappings: mappings.slice(0, 1) });
-    assert.equal(incomplete.groups.length, 2);
+    assert.equal(incomplete.groups.length, 3);
     assert.equal((await request(mappingBase, route)).revision, revision);
     assert.equal(fs.existsSync(path.join(mappingRoot, ".beancount-importer.json")), false);
     const mapped = await request(mappingBase, `${route}/funding`, { revision, mappings });
@@ -777,7 +781,7 @@ try {
     assert.equal(mapped.batch.txs[2].fundingAccount, mappings[0].account);
     assert.equal(mapped.batch.txs[3].fundingAccount, mappings[1].account);
     assert.ok(mapped.batch.txs[0].matches.some((match: { reason: string }) => match.reason === "转账配对建议"));
-    assert.deepEqual(mapped.batch.txs.slice(4).map((tx: { fundingAccount: string }) => tx.fundingAccount), ["", "", "", ""]);
+    assert.deepEqual(mapped.batch.txs.slice(4).map((tx: { fundingAccount: string }) => tx.fundingAccount), ["", mappings[2].account, "", ""]);
 
     const restarted = await boot(undefined, mappingData, mappingActive);
     const resumed = await request(restarted, `/api/batch/${earlier.batchId}/funding`, { revision: earlier.revision });
@@ -840,6 +844,31 @@ try {
     assert.ok(preview.reviewProblems.some((problem: { id: string; field: string; message: string }) =>
       problem.id === older.id && problem.field === "postings" && problem.message === "请拆分组合支付"));
     passed("combined payment defaults work on import and resume while preserving review and split validation");
+
+    const newMethod = "联名信用卡(9290)";
+    const splitInput = [csv().split("\n")[0],
+      "2026-01-05 10:10:00,餐饮美食,测试餐厅,午餐,支出,10," + newMethod + "&银行立减,交易成功,new-split-1",
+      "2026-01-05 10:20:00,餐饮美食,测试餐厅,午餐,支出,12,集分宝＋" + newMethod + ",交易成功,new-split-2",
+      "2026-01-05 10:30:00,餐饮美食,测试餐厅,午餐,支出,8," + newMethod + ",交易成功,new-split-3",
+      "2026-01-05 10:40:00,餐饮美食,测试餐厅,午餐,支出,5,红包＋积分,交易成功,new-split-4",
+    ].join("\n");
+    const needsMapping = await upload(splitBase, splitInput);
+    const splitRoute = "/api/batch/" + needsMapping.batchId + "/funding";
+    const { groups } = await request(splitBase, splitRoute, { revision: needsMapping.revision });
+    assert.deepEqual(groups.map(({ label, count }: { label: string; count: number }) => [label, count]), [[newMethod, 3]]);
+    const mapped = await request(splitBase, splitRoute, { revision: needsMapping.revision, mappings: [{ id: groups[0].id, account: card }] });
+    assert.deepEqual(mapped.groups, []);
+    assert.equal(mapped.batch.txs.length, needsMapping.txs.length);
+    assert.ok(mapped.batch.txs.slice(0, 2).every((tx: ParsedTx, index: number) => tx.fundingAccount === card && tx.status === "pending"
+      && tx.sourceTxId === needsMapping.txs[index].sourceTxId && tx.amount === needsMapping.txs[index].amount && !tx.postings));
+    assert.deepEqual(mapped.batch.txs[0].fundingParts, needsMapping.txs[0].fundingParts);
+    assert.equal(mapped.batch.txs[2].fundingAccount, card);
+    assert.equal(mapped.batch.txs[3].fundingAccount, "");
+    assert.deepEqual(mapped.config.assetMapping.at(-1), { keyword: newMethod, source: "alipay", exact: true, account: card, kind: "credit" });
+    const again = await upload(splitBase, splitInput.replaceAll("new-split-", "repeat-split-"));
+    assert.equal(again.txs[0].fundingAccount, card);
+    assert.deepEqual(await request(splitBase, "/api/batch/" + again.batchId + "/funding", { revision: again.revision }), { groups: [] });
+    passed("import mapping asks once per unknown payment method across ordinary and combined orders and ignores discounts");
   }
   {
     const quickRoot = path.join(temporary, "quick-funding-mapping");
@@ -1006,6 +1035,55 @@ try {
     passed("WeChat wallet receipts expose existing ledger matches on import and resume");
   }
   {
+    const alipayRoot = path.join(temporary, "alipay-refund-ledger"), alipayData = path.join(temporary, "alipay-refund-data");
+    const purchaseOrder = "2026091223000000000001", refundOrder = purchaseOrder + "_987654321";
+    const unmatchedOrder = "2026091223000000000002", partialOrder = "2026091223000000000003";
+    const fundingAccount = "Assets:CN:BOC:1111", category = "Expenses:Food:Meals:Dine";
+    fs.mkdirSync(alipayRoot);
+    fs.writeFileSync(path.join(alipayRoot, "main.bean"), definitions);
+    const alipayBase = await boot({ ...config, ledgerRoot: alipayRoot }, alipayData);
+    const imported = await upload(alipayBase, [csv().split("\n")[0],
+      "2026-09-12 21:50:17,日用百货,测试商家,早餐券,支出,20,中国银行储蓄卡(1111),交易关闭," + purchaseOrder,
+      "2026-09-13 11:53:41,退款,测试商家,退款-早餐券,不计收支,20,中国银行储蓄卡(1111),退款成功," + refundOrder,
+      "2026-09-12 21:50:18,日用百货,测试商家,取消订单,支出,20,中国银行储蓄卡(1111),交易关闭," + unmatchedOrder,
+      "2026-09-12 21:50:19,日用百货,测试商家,部分退款,支出,20,中国银行储蓄卡(1111),交易关闭," + partialOrder,
+      "2026-09-13 11:53:42,退款,测试商家,部分退款,不计收支,10,中国银行储蓄卡(1111),退款成功," + partialOrder + "_987654322",
+    ].join("\n"));
+    const [purchase, refund, unmatched, partial] = imported.txs;
+    assert.equal(purchase.status, "pending");
+    assert.equal(purchase.excludedReason, undefined);
+    assert.equal(purchase.refundCounterpartId, refund.id);
+    assert.equal(refund.refundCounterpartId, purchase.id);
+    assert.equal(unmatched.status, "excluded");
+    assert.equal(partial.status, "excluded");
+
+    const store = new BatchStore(path.join(alipayData, "batches"));
+    const older = store.create({
+      file: imported.file, source: "alipay", txCount: 2, errors: [], accountsDetected: [], ledgerProfile: profileId(alipayRoot, "main.bean"),
+      txs: [
+        { ...purchase, status: "excluded", excludedReason: "交易未完成：交易关闭", fundingAccount: "", fundingConfidence: 0,
+          issues: ["账户未映射"], refundCounterpartId: undefined, reviewNote: "已有备注" },
+        { ...refund, refundCounterpartId: undefined },
+      ],
+    });
+    const route = "/api/batch/" + older.batchId;
+    assert.equal((await request(alipayBase, route)).txs[0].refundCounterpartId, refund.id);
+    const reopened = await request(alipayBase, route + "/recheck-ledger", { revision: older.revision });
+    assert.equal(reopened.batch.txs[0].status, "pending");
+    assert.equal(reopened.batch.txs[0].reviewNote, "已有备注");
+    assert.equal(reopened.batch.txs[0].fundingAccount, fundingAccount);
+    const categorized = await request(alipayBase, route + "/decide", { revision: reopened.batch.revision,
+      decisions: [{ id: purchase.id, account: category, status: "ready" }] });
+    assert.equal(categorized.ready, 2);
+    assert.equal(categorized.batch.txs[1].finalAccount, category);
+    const preview = await request(alipayBase, route + "/generate", { revision: categorized.revision });
+    const parsed = parseLedgerText(definitions + preview.entries, python);
+    assert.deepEqual(parsed.errors, []);
+    assert.deepEqual(parsed.transactions.map((tx) => [tx.date, tx.sourceTxId, tx.postings.find((row) => row.account === category)?.amount]),
+      [["2026-09-12", purchaseOrder, 20], ["2026-09-13", refundOrder, -20]]);
+    passed("a closed Alipay purchase and its exact full refund are restored on import and reload and post on their own dates");
+  }
+  {
     const refundRoot = path.join(temporary, "wechat-refund-ledger");
     const refundData = path.join(temporary, "wechat-refund-data");
     const card = "Liabilities:CreditCard:Citic-中信信用卡";
@@ -1162,6 +1240,141 @@ try {
   assert.deepEqual(stillReferenced.txs[0].matches?.filter((match) => match.id.startsWith("batch:")).map((match) => match.id.split(":")[1]), [secondCopy.batchId]);
   assert.ok(!(await request(base, "/api/batches")).some((item: { batchId: string }) => item.batchId === discarded.batchId));
   passed("deleting a reviewed draft removes only that batch and clears its references, while revisions and journals guard deletion");
+  {
+    const directory = path.join(temporary, "batch-review-merge");
+    const combinedBase = await boot(config, directory);
+    const store = new BatchStore(path.join(directory, "batches"));
+    const funding = "Assets:CN:BOC:1111", category = "Expenses:Food:Meals:Dine";
+    const row = (id: string, file: string, changes: Partial<ParsedTx> = {}): ParsedTx => ({
+      id, sourceTxId: id, source: "alipay", sourceFile: file, sourceFileHash: createHash("sha256").update(file).digest("hex"), row: 5,
+      date: "2026-08-15", direction: "out", eventType: "expense", currency: "CNY", amount: 32,
+      payee: id, note: "示例消费", rawAccount: "中国银行储蓄卡(1111)", rawCategory: "餐饮美食",
+      fundingAccount: funding, fundingConfidence: 1, finalAccount: category, suggestedAccount: category, confidence: 0.9,
+      status: "ready", ...changes,
+    });
+    const save = (file: string, txs: ParsedTx[]) => store.create({
+      file, source: "alipay", txCount: txs.length, txs, errors: [], accountsDetected: [], ledgerProfile: profileId(root, config.mainFile),
+    });
+    const first = save("原始账单一.csv", [
+      row("retain", "原始账单一.csv", { narration: "保留摘要", tags: ["keep"] }),
+      row("conflict", "原始账单一.csv", { reviewNote: "沿用餐饮" }),
+      row("group-one", "原始账单一.csv"), row("group-two", "原始账单一.csv"),
+    ]);
+    const firstRoute = "/api/batch/" + first.batchId;
+    const grouped = await request(combinedBase, firstRoute + "/merge", {
+      revision: first.revision, ids: ["group-one", "group-two"], payee: "保留的手动合并", narration: "两笔账目",
+    });
+    const second = save("原始账单二.csv, 另一份账单.xlsx", [
+      row("conflict", "原始账单二.csv", { status: "excluded", reviewNote: "排除此笔" }),
+      row("extra-file", "另一份账单.xlsx"),
+    ]);
+    const third = save("原始账单三.csv", [
+      row("retain", "原始账单三.csv", { status: "excluded", narration: "旧摘要" }),
+      row("conflict", "原始账单三.csv", { reviewNote: "不保留" }),
+      row("reset", "原始账单三.csv", { fundingAccount: "Assets:CN:BOC:2222", narration: "清除摘要", reviewNote: "清除备注", tags: ["old"], flag: "!" }),
+      row("closed", "原始账单三.csv", { status: "excluded", excludedReason: "交易关闭" }),
+    ]);
+    const selection = [
+      { batchId: first.batchId, revision: grouped.batch.revision },
+      { batchId: second.batchId, revision: second.revision },
+      { batchId: third.batchId, revision: third.revision },
+    ];
+    const options = await request(combinedBase, "/api/batches/merge-options", { batches: selection });
+    assert.deepEqual(options.sources.map(({ file, name }: { file: string; name: string }) => [file, name]), [
+      ["原始账单一.csv", "原始账单一"], ["原始账单二.csv", "原始账单二"], ["另一份账单.xlsx", "另一份账单"], ["原始账单三.csv", "原始账单三"],
+    ]);
+    const mergeRequest = { batches: selection, keepProgress: [first.batchId, second.batchId], names: [{ id: options.sources[0].id, name: "中信" }] };
+    await request(combinedBase, "/api/batches/merge", { ...mergeRequest, batches: [{ ...selection[0], revision: 1 }, ...selection.slice(1)] }, 409);
+    assert.equal(store.get(first.batchId)?.mergedInto, undefined);
+    const merged = await request(combinedBase, "/api/batches/merge", mergeRequest, 201);
+    const result = merged.batch as ImportPreview & { batchId: string; revision: number };
+    const find = (id: string) => result.txs.find(({ sourceTxId }) => sourceTxId === id)!;
+    assert.equal(result.txs.filter(({ sourceTxId }) => sourceTxId === "retain").length, 1);
+    assert.equal(find("retain").status, "ready");
+    assert.equal(find("retain").narration, "保留摘要");
+    assert.deepEqual(find("retain").tags, ["keep"]);
+    assert.equal(find("retain").statementSourceIds?.length, 2);
+    assert.equal(find("conflict").status, "pending");
+    assert.equal(find("conflict").statementSourceIds?.length, 3);
+    assert.equal(find("reset").status, "pending");
+    assert.equal(find("reset").fundingAccount, funding);
+    assert.equal(find("reset").flag, "*");
+    assert.deepEqual(find("reset").tags, []);
+    assert.equal(find("reset").narration, undefined);
+    assert.equal(find("reset").reviewNote, undefined);
+    assert.equal(find("closed").status, "excluded");
+    const manual = result.txs.find(({ merge }) => merge)!;
+    assert.equal(manual.payee, "保留的手动合并");
+    assert.equal(manual.merge!.originals.length, 2);
+    assert.ok(manual.merge!.originals.every(({ id }) => result.txs.some((tx) => tx.id === id)));
+    assert.equal(result.statementSources![0].name, "中信");
+    assert.equal(result.statementSources![0].file, "原始账单一.csv");
+    assert.ok(merged.batches.filter((item: { mergedInto?: string }) => item.mergedInto === result.batchId).length === 3);
+    assert.equal((await request(combinedBase, firstRoute)).mergedInto, result.batchId);
+    await request(combinedBase, firstRoute + "/decide", { revision: grouped.batch.revision, decisions: [] }, 409);
+    await request(combinedBase, firstRoute + "/generate", { revision: grouped.batch.revision }, 409);
+    await deleteBatch(combinedBase, first.batchId, grouped.batch.revision, 409);
+    const resultRoute = "/api/batch/" + result.batchId;
+    const conflict = result.reviewConflicts![0];
+    assert.deepEqual(conflict.choices.map(({ txs }) => txs[0].reviewNote), ["沿用餐饮", "排除此笔"]);
+    await request(combinedBase, resultRoute + "/decide", {
+      revision: result.revision, decisions: [{ id: find("conflict").id, account: category, status: "ready" }],
+    }, 422);
+    const resolved = await request(combinedBase, resultRoute + "/review-conflicts", {
+      revision: result.revision, conflictId: conflict.id, sourceBatchId: second.batchId,
+    });
+    const chosen = (resolved.batch.txs as ParsedTx[]).find(({ sourceTxId }) => sourceTxId === "conflict")!;
+    assert.equal(chosen.status, "excluded");
+    assert.equal(chosen.reviewNote, "排除此笔");
+    assert.equal(chosen.statementSourceIds?.length, 3);
+    assert.equal(chosen.reviewConflictId, undefined);
+    const renamed = await request(combinedBase, resultRoute + "/statement-names", {
+      revision: resolved.batch.revision, names: [{ id: options.sources[0].id, name: "中信信用卡" }],
+    });
+    const restarted = await boot(config, directory);
+    const restored = await request(restarted, resultRoute);
+    assert.equal(restored.statementSources[0].name, "中信信用卡");
+    assert.equal(restored.statementSources[0].file, "原始账单一.csv");
+    assert.equal(restored.txs.find((tx: ParsedTx) => tx.sourceTxId === "conflict").sourceFile, "原始账单二.csv");
+    await deleteBatch(restarted, result.batchId, renamed.batch.revision);
+    await request(restarted, resultRoute, undefined, 404);
+    assert.equal((await request(restarted, firstRoute)).mergedInto, result.batchId);
+    await request(restarted, "/api/batches/merge-options", { batches: selection }, 409);
+    passed("batch review merging keeps selected progress, resets others, preserves distinct statement sources and archives original batches permanently");
+
+    const groupSource = save("原有合并组.csv", [row("overlap-one", "原有合并组.csv"), row("overlap-two", "原有合并组.csv")]);
+    const singleSource = save("组内流水副本.csv", [row("overlap-one", "组内流水副本.csv", { status: "excluded" })]);
+    const manualReview = await request(restarted, "/api/batch/" + groupSource.batchId + "/merge", {
+      revision: groupSource.revision, ids: ["overlap-one", "overlap-two"], payee: "原合并组", narration: "预览检查",
+    });
+    const overlapping = await request(restarted, "/api/batches/merge", {
+      batches: [{ batchId: groupSource.batchId, revision: manualReview.batch.revision }, singleSource],
+      keepProgress: [groupSource.batchId, singleSource.batchId], names: [],
+    }, 201);
+    assert.equal(overlapping.batch.reviewConflicts[0].transactionIds.length, 2);
+    assert.ok(overlapping.batch.txs.every((tx: ParsedTx) => !tx.merge && tx.reviewConflictId));
+    const extra = save("附加账单.csv", [row("extra", "附加账单.csv", { status: "pending" })]);
+    const combinedAgain = await request(restarted, "/api/batches/merge", {
+      batches: [overlapping.batch, extra], keepProgress: [overlapping.batch.batchId], names: [],
+    }, 201);
+    const againRoute = "/api/batch/" + combinedAgain.batch.batchId;
+    const carried = combinedAgain.batch.reviewConflicts[0];
+    assert.equal(carried.transactionIds.length, 2);
+    assert.ok(carried.choices.some((choice: { batchId: string }) => choice.batchId === groupSource.batchId));
+    const chosenGroup = await request(restarted, againRoute + "/review-conflicts", {
+      revision: combinedAgain.batch.revision, conflictId: carried.id, sourceBatchId: groupSource.batchId,
+    });
+    const activeGroup = chosenGroup.batch.txs.find((tx: ParsedTx) => tx.merge);
+    assert.equal(activeGroup.merge.originals.length, 2);
+    assert.ok(chosenGroup.batch.txs.every((tx: ParsedTx) => !tx.reviewConflictId));
+    const reviewedGroup = await request(restarted, againRoute + "/decide", {
+      revision: chosenGroup.batch.revision, decisions: [{ id: activeGroup.id, status: "ready" }],
+    });
+    const combinedPreview = await request(restarted, againRoute + "/generate", { revision: reviewedGroup.revision });
+    assert.equal(combinedPreview.generated, 1);
+    assert.match(combinedPreview.entries, /原合并组/);
+    passed("overlapping transaction groups stay pending across another batch merge and can be restored without double posting");
+  }
   const route = `/api/batch/${batch.batchId}`;
   await request(base, route + "/decide", { revision: 0, decisions: [] }, 409);
   const original = batch.txs[0];

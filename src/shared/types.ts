@@ -150,6 +150,8 @@ export interface ParsedTx extends RawTx {
   /** Whether a refund follows the reviewed purchase or has its own review decision. */
   refundReviewMode?: "follow-purchase" | "manual";
   merge?: TransactionMerge;
+  statementSourceIds?: string[];
+  reviewConflictId?: string;
 }
 
 export const MAX_NARRATION_LENGTH = 2000;
@@ -163,15 +165,15 @@ export function isSuspectedDuplicate(tx: ParsedTx): boolean {
 }
 
 export function canFollowPurchaseRefund(refund: ParsedTx): boolean {
-  if (refund.source !== "wechat" || refund.eventType !== "refund" || refund.excludedReason
+  if ((refund.source !== "wechat" && refund.source !== "alipay") || refund.eventType !== "refund" || refund.excludedReason
     || refund.status === "excluded" || refund.status === "duplicate"
-    || refund.postings || refund.fundingAccount2 || refund.refundReviewMode === "manual") return false;
+    || refund.reviewConflictId || refund.postings || refund.fundingAccount2 || refund.refundReviewMode === "manual") return false;
   return refund.refundReviewMode === "follow-purchase"
     || (refund.status === "pending" && (!refund.finalAccount || refund.finalAccount === refund.suggestedAccount));
 }
 
 export function canExcludeSuspectedDuplicate(tx: ParsedTx): boolean {
-  return (tx.status === "pending" || tx.status === "ready") && isSuspectedDuplicate(tx);
+  return !tx.reviewConflictId && (tx.status === "pending" || tx.status === "ready") && isSuspectedDuplicate(tx);
 }
 
 export interface LedgerTx {
@@ -220,6 +222,25 @@ export interface LedgerInfo {
   accountSources?: { file: string; sha256: string }[];
 }
 
+export interface BatchRevision {
+  batchId: string;
+  revision: number;
+}
+
+export interface StatementSource {
+  id: string;
+  file: string;
+  name: string;
+}
+
+export type StatementName = Pick<StatementSource, "id" | "name">;
+
+export interface BatchReviewConflict {
+  id: string;
+  transactionIds: string[];
+  choices: Array<{ batchId: string; file: string; txs: ParsedTx[] }>;
+}
+
 export interface ImportPreview {
   file: string;
   source: SourceType;
@@ -232,6 +253,9 @@ export interface ImportPreview {
   createdAt?: number;
   revision?: number;
   committed?: boolean;
+  mergedInto?: string;
+  statementSources?: StatementSource[];
+  reviewConflicts?: BatchReviewConflict[];
   committedAt?: string;
   written?: string[];
   parseStats?: { total: number; excluded: number; pending: number; duplicate: number; ready: number };

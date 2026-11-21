@@ -79,7 +79,7 @@ export const fundingMappingIssue = (issue: string) => issue === "账户未映射
   || issue === "支付方式缺失" || /未绑定账本账户|^支付方式对应 \d+ 个账户|^账单未注明支付方式/.test(issue);
 
 const unknown = (message: string): FundingGuess => ({ account: "", confidence: 0, issues: [message], reason: message });
-const isPaymentAccountPart = ({ rawAccount }: { rawAccount: string }) =>
+export const isPaymentAccountPart = ({ rawAccount }: { rawAccount: string }) =>
   !isMissingPaymentMethod(rawAccount) && !/红包|积分|优惠|立减|满减|折扣|补贴|抵扣|代金券|消费券|淘金币|集分宝|京豆/.test(rawAccount);
 
 export function unallocatedFundingParts(tx: ParsedTx): ParsedTx["fundingParts"] {
@@ -110,7 +110,7 @@ export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: Le
   return matchFundingAccount(raw, tx, config, ledger);
 }
 
-function matchFundingAccount(raw: string, tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo): FundingGuess {
+export function matchFundingAccount(raw: string, tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo): FundingGuess {
   const available = ledger?.accounts;
   const valid = (name: string) => {
     if (!isFundingAccount(name)) return false;

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { DraftPosting, ParsedAccount, ParsedTx, TxDecision } from "../../src/shared/types.js";
+import type { DraftPosting, ParsedAccount, ParsedTx, StatementSource, TxDecision } from "../../src/shared/types.js";
 import { accountPattern, amountText, currencyPattern, fundingPostingSign, transactionPostings } from "../../src/shared/postings.js";
 import AccountSelect from "./AccountSelect";
 import { calculatePostingAmount } from "./postingCalculator";
@@ -186,9 +186,10 @@ export function ReviewPostingFields({ tx, draft, accounts, disabled, postingErro
   </fieldset>;
 }
 
-export function TransactionSourceDetails({ tx, counterpart }: { tx: ParsedTx; counterpart?: ParsedTx }) {
+export function TransactionSourceDetails({ tx, counterpart, sources }: { tx: ParsedTx; counterpart?: ParsedTx; sources?: StatementSource[] }) {
   return <dl className="tx-meta source-details">
     <div><dt>原始来源</dt><dd>{tx.sourceFile} · 第 {tx.row} 行 · {tx.source}</dd></div>
+    {sources && sources.length > 1 && <div><dt>来源账单</dt><dd>{sources.map(({ file, id }) => <div key={id}>{file}</div>)}</dd></div>}
     {tx.sourceStatus && <div><dt>账单状态</dt><dd>{tx.sourceStatus}</dd></div>}
     {tx.note && <div><dt>账单备注</dt><dd>{tx.note}</dd></div>}
     {tx.rawAccount && <div><dt>支付方式</dt><dd>{tx.rawAccount}</dd></div>}

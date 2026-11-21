@@ -1,15 +1,19 @@
-import type { AppConfig, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, TxDecision } from "../../src/shared/types.js";
+import type { AppConfig, BatchRevision, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, StatementName, StatementSource, TxDecision } from "../../src/shared/types.js";
 
 export type ConfigResponse = AppConfig & { nativePathPicker?: boolean };
 export type PathField = "ledgerRoot" | "pythonPath";
 
-export interface BatchSummary {
-  batchId: string;
+export interface BatchSummary extends BatchRevision {
   file: string;
   createdAt: number;
-  revision: number;
   committed: boolean;
+  mergedInto?: string;
   txCount: number;
+}
+
+export interface BatchMergeOptions {
+  batches: BatchSummary[];
+  sources: StatementSource[];
 }
 
 export interface UploadSummary {
@@ -108,6 +112,13 @@ export const api = {
     return send<UploadSummary>("/api/upload", { method: "POST", body });
   },
   batches: (signal?: AbortSignal) => send<BatchSummary[]>("/api/batches", { signal }),
+  batchMergeOptions: (batches: BatchRevision[]) => post<BatchMergeOptions>("/api/batches/merge-options", { batches }),
+  mergeBatches: (batches: BatchRevision[], keepProgress: string[], names: StatementName[]) =>
+    post<{ batch: ImportPreview & BatchRevision; batches: BatchSummary[] }>("/api/batches/merge", { batches, keepProgress, names }),
+  renameStatements: (id: string, revision: number, names: StatementName[]) =>
+    post<{ batch: ImportPreview }>("/api/batch/" + encodeURIComponent(id) + "/statement-names", { revision, names }),
+  resolveReviewConflict: (id: string, revision: number, conflictId: string, sourceBatchId: string | null) =>
+    post<{ batch: ImportPreview }>("/api/batch/" + encodeURIComponent(id) + "/review-conflicts", { revision, conflictId, sourceBatchId }),
   batch: (id: string) => send<ImportPreview>(`/api/batch/${encodeURIComponent(id)}`),
   pdfPreview: (id: string, txId: string, signal?: AbortSignal) =>
     send<PdfPreview>(`/api/batch/${encodeURIComponent(id)}/pdf-preview/${encodeURIComponent(txId)}`, { signal }),

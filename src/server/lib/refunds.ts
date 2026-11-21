@@ -1,4 +1,5 @@
 import { canFollowPurchaseRefund, isSuspectedDuplicate, type ParsedTx } from "../../shared/types.js";
+import { alipayRefundOrderId, isClosedAlipayPurchase } from "../../shared/alipay.js";
 import { isFundingAccount } from "../../shared/funding.js";
 import { parseAmount } from "../parsers/common.js";
 import { normalizePaymentMethod, singlePaymentMethod } from "./accounts.js";
@@ -27,7 +28,7 @@ function paidBefore(purchase: ParsedTx, refund: ParsedTx): boolean {
 export function matchWechatRefunds(txs: readonly ParsedTx[]): Map<string, string> {
   const unique = new Map<string, ParsedTx>();
   for (const tx of txs) {
-    if (tx.source !== "wechat" || tx.excludedReason || !tx.date || tx.amount <= 0) continue;
+    if (tx.source !== "wechat" || tx.excludedReason || tx.reviewConflictId || !tx.date || tx.amount <= 0) continue;
     const key = sourceKey(tx.source, tx.sourceTxId, tx.sourceFileHash, tx.row) ?? tx.id;
     const previous = unique.get(key);
     if (!previous || (previous.status === "duplicate" && tx.status !== "duplicate")) unique.set(key, tx);
@@ -67,8 +68,49 @@ export function matchWechatRefunds(txs: readonly ParsedTx[]): Map<string, string
   return pairs;
 }
 
-export function syncWechatRefunds(txs: readonly ParsedTx[]): boolean {
+function matchAlipayRefunds(txs: readonly ParsedTx[]): Map<string, string> {
+  const purchases = new Map<string, ParsedTx | undefined>();
+  const refunds = new Map<string, ParsedTx | undefined>();
+  for (const tx of txs) {
+    if (tx.source !== "alipay" || !tx.sourceTxId || !tx.date || !(tx.amount > 0) || tx.status === "duplicate" || tx.reviewConflictId) continue;
+    const order = alipayRefundOrderId(tx.sourceTxId);
+    if (order && tx.eventType === "refund" && tx.direction === "in" && tx.sourceStatus === "退款成功" && !tx.excludedReason) {
+      refunds.set(order, refunds.has(order) ? undefined : tx);
+    } else if (tx.eventType === "expense" && tx.direction === "out" && (!tx.excludedReason || isClosedAlipayPurchase(tx))) {
+      purchases.set(tx.sourceTxId, purchases.has(tx.sourceTxId) ? undefined : tx);
+    }
+  }
+  const pairs = new Map<string, string>();
+  for (const [order, refund] of refunds) {
+    const purchase = purchases.get(order);
+    if (!purchase || !refund || purchase.currency !== refund.currency || !paidBefore(purchase, refund)
+      || refund.amount > purchase.amount || (isClosedAlipayPurchase(purchase) && refund.amount !== purchase.amount)) continue;
+    pairs.set(purchase.id, refund.id);
+    pairs.set(refund.id, purchase.id);
+  }
+  return pairs;
+}
+
+export function restoreAlipayFullRefundPurchases(txs: readonly ParsedTx[]): ParsedTx[] {
+  const pairs = matchAlipayRefunds(txs);
+  const restored = txs.filter((tx) => tx.status === "excluded" && isClosedAlipayPurchase(tx) && pairs.has(tx.id));
+  for (const tx of restored) {
+    delete tx.excludedReason;
+    tx.status = "pending";
+    const issue = "已退款，核对退款流水";
+    if (!tx.issues?.includes(issue)) tx.issues = [...(tx.issues ?? []), issue];
+  }
+  return restored;
+}
+
+export function matchStatementRefunds(txs: readonly ParsedTx[]): Map<string, string> {
   const pairs = matchWechatRefunds(txs);
+  for (const [id, counterpart] of matchAlipayRefunds(txs)) pairs.set(id, counterpart);
+  return pairs;
+}
+
+export function syncStatementRefunds(txs: readonly ParsedTx[]): boolean {
+  const pairs = matchStatementRefunds(txs);
   if (!pairs.size && !txs.some((tx) => tx.refundReviewMode === "follow-purchase")) return false;
   const byId = new Map(txs.map((tx) => [tx.id, tx]));
   let changed = false;

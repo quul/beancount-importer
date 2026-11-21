@@ -6,7 +6,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
-import type { AppConfig, FundingMappingChoice, FundingMappingGroup, ImportPreview, ParsedTx, ReviewProblem, TxDecision, LedgerInfo } from "../shared/types.js";
+import type { AppConfig, BatchRevision, FundingMappingChoice, FundingMappingGroup, ImportPreview, ParsedTx, ReviewProblem, TxDecision, LedgerInfo } from "../shared/types.js";
 import { canExcludeSuspectedDuplicate, duplicateReviewIssue, MAX_NARRATION_LENGTH } from "../shared/types.js";
 import { MAX_CATEGORY_ALLOCATIONS, planCategoryAllocations, savedCategoryAllocations } from "../shared/categoryAllocations.js";
 import { activeTransactions, mergeSource, planTransactionMerge } from "../shared/transactionMerge.js";
@@ -15,9 +15,12 @@ import { hasFundingPosting, isFundingAccount, isStatementOnlyPayment, reusablePa
 import { configWithDefaults, defaultActiveLedgerFile, loadConfig, readLedgerSettings, saveConfig } from "./config.js";
 import { discoverPython, LedgerAccessError, parseLedger, parseLedgerAsync, validateLedgerFile } from "./lib/ledger.js";
 import { markDuplicates, refreshLedgerDuplicateHints, sourceKey } from "./lib/dedup.js";
-import { matchWechatRefunds, syncWechatRefunds } from "./lib/refunds.js";
+import { matchStatementRefunds, restoreAlipayFullRefundPurchases, syncStatementRefunds } from "./lib/refunds.js";
 import { classifyLocal, classifyWithLlm, loadMemory, saveMemory, suggestRefundsFromBatch } from "./lib/classify.js";
-import { accountIsActive, confirmFundingAccount, detectAccounts, fundingMappingIssue, inferFundingAccount, isMissingPaymentMethod, normalizePaymentMethod, setExactFundingMapping, singlePaymentMethod, unallocatedFundingParts } from "./lib/accounts.js";
+import {
+  accountIsActive, confirmFundingAccount, detectAccounts, fundingMappingIssue, inferFundingAccount, isMissingPaymentMethod,
+  isPaymentAccountPart, matchFundingAccount, normalizePaymentMethod, setExactFundingMapping, singlePaymentMethod, unallocatedFundingParts,
+} from "./lib/accounts.js";
 import { generateEntries, suggestOpens, transactionPostings } from "./lib/generate.js";
 import { isAlipay, parseAlipay } from "./parsers/alipay.js";
 import { isWechat, parseWechat } from "./parsers/wechat.js";
@@ -28,6 +31,7 @@ import { parsePdfBank, PDF_RETRY_HINT } from "./parsers/pdf.js";
 import { pairTransfers, transferPairIssue } from "./lib/transfers.js";
 import { isParsedStatementRow, readSheet } from "./parsers/common.js";
 import { BatchStore, isBatchId, profileId, type StoredBatch, type StoredPdfUpload } from "./lib/batches.js";
+import { applyStatementNames, combineBatchReviews, resolveBatchReviewConflict, statementsForBatches } from "./lib/batch-review-merge.js";
 import { acquireWriteLock, assertBatchDeletable, commitBatch, ImportError } from "./lib/commit.js";
 import { importDirectoryError } from "./lib/import-paths.js";
 import { isLocalRequest } from "./lib/local-request.js";
@@ -61,7 +65,7 @@ function publicParseErrors(errors: ImportPreview["errors"]): ImportPreview["erro
 }
 
 function batchFileLabel(batch: StoredBatch): string {
-  if (!batch.errors.length) return batch.file;
+  if (!batch.errors.length || batch.mergedFrom?.length) return batch.file;
   // Older batches included failed filenames in the label.
   const files = new Set(batch.txs.filter((tx) => !tx.merge && isParsedStatementRow(tx)).map((tx) => tx.sourceFile).filter(Boolean));
   return files.size ? [...files].join(", ") : batch.file;
@@ -99,7 +103,7 @@ function draftProblems(txs: ParsedTx[], ledger: LedgerInfo, opening: Set<string>
 
 function referenceUncommittedBatches(txs: ParsedTx[], previous: StoredBatch[]) {
   const identities = new Map<string, Array<{ batch: StoredBatch; tx: ParsedTx }>>();
-  for (const batch of previous.filter((batch) => !batch.committed)) for (const tx of batch.txs) {
+  for (const batch of previous.filter((batch) => !batch.committed && !batch.mergedInto)) for (const tx of batch.txs) {
     if (tx.status === "excluded" || tx.excludedReason || tx.status === "duplicate") continue;
     const key = sourceKey(tx.source, tx.sourceTxId, tx.sourceFileHash, tx.row);
     if (!key) continue;
@@ -108,7 +112,7 @@ function referenceUncommittedBatches(txs: ParsedTx[], previous: StoredBatch[]) {
     identities.set(key, matches);
   }
   for (const tx of txs) {
-    if (tx.status === "excluded" || tx.status === "duplicate") continue;
+    if (tx.status === "excluded" || tx.status === "duplicate" || tx.reviewConflictId) continue;
     const key = sourceKey(tx.source, tx.sourceTxId, tx.sourceFileHash, tx.row);
     const references = key ? identities.get(key) : undefined;
     if (!references?.length) continue;
@@ -156,8 +160,30 @@ function needsFundingAccount(tx: ParsedTx): boolean {
     && tx.status !== "excluded" && tx.status !== "duplicate";
 }
 
-function unmappedPayments(txs: ParsedTx[], wechatRules: ReturnType<typeof loadWechatRules>) {
-  const groups = new Map<string, { raw: string; fromFile: boolean; txs: ParsedTx[] }>();
+function restoreAlipayPurchases(txs: readonly ParsedTx[], config: AppConfig, ledger: LedgerInfo): ParsedTx[] {
+  const restored = restoreAlipayFullRefundPurchases(txs);
+  for (const tx of restored) {
+    if (tx.fundingAccount) continue;
+    const guess = inferFundingAccount(tx, config, ledger);
+    tx.fundingAccount = guess.account;
+    tx.fundingConfidence = guess.confidence;
+    tx.fundingReason = guess.reason;
+    tx.issues = [...new Set([...(tx.issues ?? []).filter((issue) => !fundingMappingIssue(issue)), ...(guess.issues ?? [])])];
+  }
+  return restored;
+}
+
+type PaymentGroups = Map<string, { raw: string; fromFile: boolean; txs: Set<ParsedTx> }>;
+
+function addPaymentGroup(groups: PaymentGroups, tx: ParsedTx, raw: string, fromFile = false): void {
+  const id = crypto.createHash("sha256").update(JSON.stringify([tx.source, fromFile ? raw : normalizePaymentMethod(raw)])).digest("hex");
+  const group = groups.get(id) ?? { raw, fromFile, txs: new Set<ParsedTx>() };
+  group.txs.add(tx);
+  groups.set(id, group);
+}
+
+function unmappedPayments(txs: ParsedTx[], wechatRules: ReturnType<typeof loadWechatRules>): PaymentGroups {
+  const groups: PaymentGroups = new Map();
   for (const tx of txs) {
     if (!needsFundingAccount(tx)) continue;
     if (tx.source === "wechat" && isMissingPaymentMethod(tx.rawAccount)) {
@@ -165,12 +191,7 @@ function unmappedPayments(txs: ParsedTx[], wechatRules: ReturnType<typeof loadWe
       if (recognition) tx.recognition = recognition;
     }
     const raw = singlePaymentMethod(tx);
-    if (!raw) continue;
-    const fromFile = isStatementOnlyPayment(tx, raw);
-    const id = crypto.createHash("sha256").update(JSON.stringify([tx.source, fromFile ? raw : normalizePaymentMethod(raw)])).digest("hex");
-    const group = groups.get(id) ?? { raw, fromFile, txs: [] };
-    group.txs.push(tx);
-    groups.set(id, group);
+    if (raw) addPaymentGroup(groups, tx, raw, isStatementOnlyPayment(tx, raw));
   }
   return groups;
 }
@@ -227,13 +248,16 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   const requireRevision = (batch: StoredBatch, value: unknown) => {
     if (!Number.isInteger(value) || value !== batch.revision) throw new ImportError(409, "批次已被更新，请重新加载");
   };
+  const requireActiveBatch = (batch: StoredBatch) => {
+    if (batch.mergedInto) throw new ImportError(409, "此批次已合并，请打开合并后的批次");
+  };
   const saveBatchRevision = (batch: StoredBatch) => {
     batch.revision++;
     delete batch.preview;
     batches.save(batch);
   };
   const publicBatch = (batch: StoredBatch) => {
-    const counterparts = matchWechatRefunds(batch.txs);
+    const counterparts = matchStatementRefunds(activeTransactions(batch.txs));
     const txs = counterparts.size ? batch.txs.map((tx) => {
       const refundCounterpartId = counterparts.get(tx.id);
       return refundCounterpartId ? { ...tx, refundCounterpartId } : tx;
@@ -247,7 +271,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       const matches = tx.matches.filter((match) => {
         if (!match.id.startsWith("batch:")) return true;
         const id = match.id.split(":")[1];
-        if (!existence.has(id)) existence.set(id, batches.has(id));
+        if (!existence.has(id)) existence.set(id, batches.has(id) && !batches.mergedInto(id));
         return existence.get(id);
       });
       if (matches.length === tx.matches.length) return tx;
@@ -266,18 +290,122 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     (req: express.Request, res: express.Response) => {
       const id = req.params.id;
       const release = lockBatch(id);
-      try { handler(req, res, getBatch(id)); }
+      try {
+        const batch = getBatch(id);
+        requireActiveBatch(batch);
+        handler(req, res, batch);
+      }
       finally { release(); }
     };
 
-  app.get("/api/health", (_req, res) => res.json({ ok: true }));
-  app.get("/api/batches", (_req, res) => {
-    if (!config.ledgerRoot) { res.json([]); return; }
+  const summarizeBatch = (batch: StoredBatch) => ({
+    batchId: batch.batchId, file: batchFileLabel(batch), createdAt: batch.createdAt, revision: batch.revision, committed: batch.committed,
+    mergedInto: batch.mergedInto,
+    txCount: batch.txCount ?? batch.txs.filter((tx) => !tx.merge).length,
+  });
+  const listBatches = () => {
+    if (!config.ledgerRoot) return [];
     const currentProfile = profile();
-    res.json(batches.list().filter((batch) => batch.ledgerProfile === currentProfile && batch.txs.some(isParsedStatementRow)).map((batch) => ({
-      batchId: batch.batchId, file: batchFileLabel(batch), createdAt: batch.createdAt, revision: batch.revision, committed: batch.committed,
-      txCount: batch.txCount ?? batch.txs.filter((tx) => !tx.merge).length,
-    })));
+    return batches.list().filter((batch) => batch.ledgerProfile === currentProfile && batch.txs.some(isParsedStatementRow)).map(summarizeBatch);
+  };
+  const mergeSelection = (value: unknown): BatchRevision[] => {
+    if (!Array.isArray(value) || value.length < 2 || value.some((item) =>
+      !item || typeof item.batchId !== "string" || !isBatchId(item.batchId) || !Number.isInteger(item.revision))
+      || new Set(value.map(({ batchId }) => batchId)).size !== value.length) {
+      throw new ImportError(400, "请选择至少两个不同的导入批次");
+    }
+    return value;
+  };
+  const mergeInputs = (selection: BatchRevision[]) => selection.map(({ batchId, revision }) => {
+    const batch = getBatch(batchId);
+    requireActiveBatch(batch);
+    requireRevision(batch, revision);
+    if (batch.committed) throw new ImportError(409, "已过账的批次不能合并审批");
+    assertBatchDeletable(batch, dataDir);
+    return batch;
+  });
+  const reviewMergedTransactions = (txs: ParsedTx[], currentLedger: LedgerInfo, previous: StoredBatch[]) => {
+    const active = activeTransactions(txs);
+    const approved = new Set(active.filter((tx) => tx.status === "ready").map(({ id }) => id));
+    for (const tx of active) {
+      delete tx.matches;
+      delete tx.duplicateOf;
+      tx.issues = tx.issues?.filter((issue) => !duplicateReviewIssue(issue) && !transferPairIssue(issue) && !otherBatchIssue(issue));
+      if (tx.status === "duplicate") tx.status = "pending";
+    }
+    applyWechatExclusions(txs, wechatRulesFor(txs));
+    const deduped = markDuplicates(active, currentLedger.transactions);
+    const transfers = pairTransfers(active.filter((tx) => !tx.reviewConflictId));
+    referenceUncommittedBatches(active, previous);
+    for (const tx of active) {
+      if (tx.reviewConflictId) tx.status = "pending";
+      else if (approved.has(tx.id) && !tx.excludedReason && tx.status !== "duplicate") tx.status = "ready";
+    }
+    return { ...deduped.stats, transferPairs: transfers.pairs.length, familyCardPairs: transfers.familyCardPairs };
+  };
+
+  app.get("/api/health", (_req, res) => res.json({ ok: true }));
+  app.get("/api/batches", (_req, res) => res.json(listBatches()));
+  app.post("/api/batches/merge-options", (req, res) => {
+    const selected = mergeInputs(mergeSelection(req.body?.batches));
+    res.json({ batches: selected.map(summarizeBatch), sources: statementsForBatches(selected) });
+  });
+  app.post("/api/batches/merge", (req, res) => {
+    const selection = mergeSelection(req.body?.batches);
+    const selectedIds = new Set(selection.map(({ batchId }) => batchId));
+    const keep = req.body?.keepProgress;
+    if (!Array.isArray(keep) || keep.some((id) => !selectedIds.has(id)) || new Set(keep).size !== keep.length) {
+      throw new ImportError(400, "请选择要保留审批进度的批次");
+    }
+    const releases: Array<() => void> = [];
+    try {
+      for (const id of [...selectedIds].sort()) releases.push(lockBatch(id));
+      const selected = mergeInputs(selection);
+      const sources = applyStatementNames(statementsForBatches(selected), req.body?.names);
+      const currentLedger = ledger(), memory = loadMemory(memoryFile());
+      const rules = wechatRulesFor(selected.flatMap(({ txs }) => txs));
+      const resetReview = (original: ParsedTx): ParsedTx => {
+        const tx: ParsedTx = {
+          ...original, status: original.excludedReason ? "excluded" : "pending", finalAccount: "", suggestedAccount: "",
+          fundingAccount: "", confidence: 0, flag: "*", tags: [],
+        };
+        delete tx.fundingAccount2;
+        delete tx.postings;
+        delete tx.reviewNote;
+        delete tx.narration;
+        delete tx.refundReviewMode;
+        delete tx.reason;
+        if (tx.source === "wechat") tx.recognition = recognizeWechatTransaction(tx, rules);
+        const funding = inferFundingAccount(tx, config, currentLedger);
+        tx.fundingAccount = funding.account;
+        tx.fundingConfidence = funding.confidence;
+        tx.fundingReason = funding.reason;
+        tx.issues = [...new Set([...(tx.issues ?? []).filter((issue) => !fundingMappingIssue(issue)), ...(funding.issues ?? [])])];
+        const suggestion = classifyLocal(tx, memory, currentLedger);
+        if (suggestion) {
+          tx.finalAccount = tx.suggestedAccount = suggestion.account;
+          tx.confidence = suggestion.confidence;
+          tx.reason = suggestion.reason;
+        }
+        return tx;
+      };
+      const combined = combineBatchReviews(selected, new Set(keep), resetReview);
+      restoreAlipayPurchases(activeTransactions(combined.txs), config, currentLedger);
+      const ledgerProfile = profile();
+      const previous = batches.list().filter((item) => item.ledgerProfile === ledgerProfile && !selectedIds.has(item.batchId));
+      const dedup = reviewMergedTransactions(combined.txs, currentLedger, previous);
+      const merged = batches.create({
+        ...combined, file: "合并审批 · " + sources.length + " 份账单", source: "unknown",
+        txCount: combined.txs.filter((tx) => !tx.merge).length,
+        errors: selected.flatMap(({ errors }) => errors),
+        accountsDetected: detectAccounts(combined.txs.filter((tx) => !tx.merge)),
+        statementSources: sources, mergedFrom: [...selectedIds], ledgerProfile, ledgerErrors: currentLedger.errors ?? [], dedup,
+        pdfUploads: Object.assign({}, ...selected.map(({ pdfUploads }) => pdfUploads ?? {})),
+      });
+      res.status(201).json({ batch: publicReviewBatch(merged), batches: listBatches() });
+    } finally {
+      for (const release of releases.reverse()) release();
+    }
   });
   app.post("/api/upload", upload.array("files"), asyncRoute(async (req, res) => {
     const files = (req.files as Express.Multer.File[]) ?? [];
@@ -359,6 +487,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       }
       if (!importedFiles.size) throw new ImportError(422, "未导入任何账单。", errors.map(({ message }) => message));
 
+      restoreAlipayPurchases(txs, uploadConfig, currentLedger);
       const llm = await classifyWithLlm(txs.filter((tx) => tx.status !== "excluded" && tx.confidence < 0.7), uploadConfig, currentLedger);
       for (const tx of txs) {
         const hit = llm.get(tx.id);
@@ -399,19 +528,26 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   }));
   app.post("/api/batch/:id/recheck-ledger", asyncRoute(async (req, res) => {
     const requested = getBatch(req.params.id);
+    requireActiveBatch(requested);
     if (requested.committed) throw new ImportError(409, "已写入的批次不能再修改");
     requireRevision(requested, req.body?.revision);
     const currentLedger = await parseLedgerAsync(ledgerRoot(), config.mainFile, config.pythonPath);
     const release = lockBatch(requested.batchId);
     try {
       const batch = getBatch(requested.batchId);
+      requireActiveBatch(batch);
       if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
       requireRevision(batch, requested.revision);
-      const txs = activeTransactions(batch.txs).filter((tx) => !tx.merge);
+      const txs = activeTransactions(batch.txs).filter((tx) => !tx.merge && !tx.reviewConflictId);
       const exclusionsChanged = applyWechatExclusions(txs, wechatRulesFor(txs));
+      const restored = restoreAlipayPurchases(txs, config, currentLedger);
+      if (restored.length) {
+        markDuplicates(restored, currentLedger.transactions);
+        batch.accountsDetected = detectAccounts(batch.txs);
+      }
       const result = refreshLedgerDuplicateHints(txs, currentLedger.transactions);
-      const refundsChanged = syncWechatRefunds(txs);
-      if (exclusionsChanged || result.changed || refundsChanged) saveBatchRevision(batch);
+      const refundsChanged = syncStatementRefunds(txs);
+      if (exclusionsChanged || restored.length || result.changed || refundsChanged) saveBatchRevision(batch);
       res.json({ batch: publicReviewBatch(batch), suspected: result.suspected });
     } finally {
       release();
@@ -427,7 +563,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       delete tx.duplicateOf;
     }
     if (targets.length) {
-      syncWechatRefunds(txs);
+      syncStatementRefunds(txs);
       saveBatchRevision(batch);
     }
     res.json({ batch: publicReviewBatch(batch), excluded: targets.length });
@@ -437,6 +573,22 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     assertBatchDeletable(batch, dataDir);
     batches.remove(batch.batchId);
     res.json({ ok: true });
+  }));
+  app.post("/api/batch/:id/statement-names", withBatchWrite((req, res, batch) => {
+    requireRevision(batch, req.body?.revision);
+    if (!batch.statementSources?.length) throw new ImportError(422, "此批次没有可改名的账单");
+    batch.statementSources = applyStatementNames(batch.statementSources, req.body?.names);
+    saveBatchRevision(batch);
+    res.json({ batch: publicReviewBatch(batch) });
+  }));
+  app.post("/api/batch/:id/review-conflicts", withBatchWrite((req, res, batch) => {
+    if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
+    requireRevision(batch, req.body?.revision);
+    resolveBatchReviewConflict(batch, req.body?.conflictId, req.body?.sourceBatchId);
+    const previous = batches.list().filter((item) => item.ledgerProfile === batch.ledgerProfile && item.batchId !== batch.batchId);
+    batch.dedup = reviewMergedTransactions(batch.txs, ledger(), previous);
+    saveBatchRevision(batch);
+    res.json({ batch: publicReviewBatch(batch) });
   }));
   app.post("/api/batch/:id/merge", withBatchWrite((req, res, batch) => {
     if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
@@ -450,7 +602,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const selected = new Set<string>(ids);
     const txs = activeTransactions(batch.txs).filter((tx) => selected.has(tx.id));
     if (txs.length !== selected.size) throw new ImportError(409, "所选交易已变更，请重新选择");
-    const counterparts = matchWechatRefunds(batch.txs);
+    if (txs.some((tx) => tx.reviewConflictId)) throw new ImportError(422, "请先核对所选交易的审批冲突");
+    const counterparts = matchStatementRefunds(activeTransactions(batch.txs));
     const rules = wechatRulesFor(txs);
     const members = txs.map((tx) => ({ ...tx, refundCounterpartId: counterparts.get(tx.id), excludedReason: tx.excludedReason || wechatExclusionReason(tx, rules) }));
     const plan = planTransactionMerge(members, currentAccountNames());
@@ -482,8 +635,9 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   }));
   app.post("/api/batch/:id/funding", (req, res) => {
     const batch = getBatch(req.params.id);
+    requireActiveBatch(batch);
     requireRevision(batch, req.body?.revision);
-    const txs = batch.committed ? [] : activeTransactions(batch.txs).filter((tx) => !tx.merge);
+    const txs = batch.committed ? [] : activeTransactions(batch.txs).filter((tx) => !tx.merge && !tx.reviewConflictId);
     const rules = wechatRulesFor(txs);
     const exclusionsChanged = applyWechatExclusions(txs, rules);
     const payments = unmappedPayments(txs, rules);
@@ -491,30 +645,44 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       const fundingParts = needsFundingAccount(tx) ? unallocatedFundingParts(tx) : undefined;
       return fundingParts ? [{ tx, fundingParts }] : [];
     });
+    const currentLedger = payments.size || splitPayments.length ? ledger() : undefined;
+    const splits = splitPayments.map(({ tx, fundingParts }) => ({
+      tx, fundingParts, guess: inferFundingAccount({ ...tx, fundingParts }, config, currentLedger),
+    }));
+    const splitRows = new Set(splits.map(({ tx }) => tx));
+    for (const { tx, fundingParts, guess } of splits) {
+      if (guess.account) continue;
+      for (const part of fundingParts) {
+        if (isPaymentAccountPart(part)) addPaymentGroup(payments, tx, part.rawAccount.trim());
+      }
+    }
     const mappings = req.body?.mappings as FundingMappingChoice[] | undefined;
     if (mappings !== undefined && (!Array.isArray(mappings) || mappings.length > payments.size
       || mappings.some((item) => !item || !payments.has(item.id) || typeof item.account !== "string")
       || new Set(mappings.map((item) => item.id)).size !== mappings.length)) throw new ImportError(400, "资金映射无效");
-    const currentLedger = payments.size || splitPayments.length ? ledger() : undefined;
     const available = currentLedger?.accounts.filter(({ account }) => isFundingAccount(account)) ?? [];
     const choices = new Map(mappings?.map(({ id, account }) => [id, account]));
     const groups: FundingMappingGroup[] = [];
     const resolved = new Map<ParsedTx, string>();
     let assetMapping = config.assetMapping;
     for (const [id, payment] of payments) {
-      const { raw, fromFile, txs } = payment;
-      const { source, sourceFile } = txs[0];
-      const accounts = available.filter((account) => txs.every((tx) => accountIsActive(account, tx.date, tx.currency))).map((account) => account.account);
-      const guesses = new Set(txs.map((tx) => inferFundingAccount(tx, config, currentLedger).account));
+      const { raw, fromFile } = payment;
+      const rows = [...payment.txs];
+      const { source, sourceFile } = rows[0];
+      const accounts = available.filter((account) => rows.every((tx) => accountIsActive(account, tx.date, tx.currency))).map((account) => account.account);
+      const guesses = new Set(rows.map((tx) => {
+        const result = splitRows.has(tx) ? matchFundingAccount(raw, tx, config, currentLedger) : inferFundingAccount(tx, config, currentLedger);
+        return result.account;
+      }));
       const [guess] = guesses;
       const existing = guesses.size === 1 && accounts.includes(guess) ? guess : "";
       const choice = choices.get(id);
       if (choice !== undefined && !accounts.includes(choice)) throw new ImportError(400, `账户不可用：${fromFile ? sourceFile : raw}`);
       if (choice && existing && choice !== existing) throw new ImportError(409, "账户映射已更新");
-      if (!existing) groups.push({ id, label: fromFile ? sourceFile : raw, source, count: txs.length, accounts, statementOnly: fromFile || undefined });
+      if (!existing) groups.push({ id, label: fromFile ? sourceFile : raw, source, count: rows.length, accounts, statementOnly: fromFile || undefined });
       const account = existing || choice;
       if (!account) continue;
-      for (const tx of txs) resolved.set(tx, account);
+      for (const tx of rows) if (!splitRows.has(tx)) resolved.set(tx, account);
       if (!existing && !fromFile) {
         assetMapping = setExactFundingMapping(assetMapping, source, raw, account);
       }
@@ -527,8 +695,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     }
     let fundingChanged = resolved.size > 0;
     const fundingConfig = { ...config, assetMapping };
-    for (const { tx, fundingParts } of splitPayments) {
-      const guess = inferFundingAccount({ ...tx, fundingParts }, fundingConfig, currentLedger);
+    for (const { tx, fundingParts, guess: originalGuess } of splits) {
+      const guess = assetMapping === config.assetMapping ? originalGuess : inferFundingAccount({ ...tx, fundingParts }, fundingConfig, currentLedger);
       if (!guess.account) continue;
       tx.fundingParts = fundingParts;
       tx.fundingAccount = guess.account;
@@ -553,11 +721,12 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     } else if (fundingChanged && currentLedger) {
       refreshLedgerDuplicateHints(txs, currentLedger.transactions);
     }
-    const refundsChanged = syncWechatRefunds(txs);
+    const refundsChanged = syncStatementRefunds(txs);
     if (!fundingChanged && !exclusionsChanged && !refundsChanged) { res.json({ groups: [] }); return; }
     const release = lockBatch(batch.batchId);
     try {
       const latest = getBatch(batch.batchId);
+      requireActiveBatch(latest);
       requireRevision(latest, batch.revision);
       if (latest.committed) throw new ImportError(409, "已写入的批次不能再修改");
       if (assetMapping !== config.assetMapping) {
@@ -578,6 +747,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const txs = activeTransactions(batch.txs);
     const tx = txs.find(({ id }) => id === req.body?.id);
     if (!tx) throw new ImportError(404, "交易不存在");
+    if (tx.reviewConflictId) throw new ImportError(422, "请先核对这笔交易的审批冲突");
     const payment = reusablePaymentMethod(tx);
     if (!payment) throw new ImportError(422, "账单缺少可保存的单一付款方式");
     if (!hasFundingPosting(tx)) throw new ImportError(422, "请先在拆分分录中核对资金账户");
@@ -591,6 +761,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
 
     const key = normalizePaymentMethod(payment);
     const affected = txs.filter((other) => other === tx || (other.source === tx.source
+      && !other.reviewConflictId
       && (other.fundingConfidence ?? 1) < 1 && !other.postings && !other.fundingAccount2 && !other.excludedReason
       && (other.status === "pending" || other.status === "ready") && accountIsActive(account, other.date, other.currency)
       && normalizePaymentMethod(reusablePaymentMethod(other)) === key));
@@ -599,7 +770,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       other.issues = other.issues?.filter((issue) => !fundingMappingIssue(issue));
     }
     refreshLedgerDuplicateHints(affected, currentLedger.transactions);
-    syncWechatRefunds(txs);
+    syncStatementRefunds(txs);
     batch.accountsDetected = detectAccounts(batch.txs.filter((entry) => !entry.merge));
     const candidate = { ...config, assetMapping: setExactFundingMapping(config.assetMapping, tx.source, payment, accountName) };
     saveConfig(candidate, { activeLedgerFile: options.activeLedgerFile });
@@ -620,6 +791,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     for (const input of requested) {
       const tx = input && typeof input.id === "string" ? txById.get(input.id) : undefined;
       if (!tx) throw new ImportError(400, "交易不存在");
+      if (tx.reviewConflictId) throw new ImportError(422, "请先核对这笔交易的审批冲突");
       const { categoryAllocations, ...changes } = input;
       if (tx.merge && (categoryAllocations !== undefined || changes.account !== undefined || changes.funding !== undefined || changes.postings !== undefined)) {
         throw new ImportError(422, "要调整分录，请先撤销合并并编辑原交易");
@@ -658,7 +830,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     let memory: ReturnType<typeof loadMemory> | undefined;
     for (const decision of decisions) {
       const tx = txById.get(decision.id)!;
-      if (tx.source === "wechat" && tx.eventType === "refund"
+      if ((tx.source === "wechat" || tx.source === "alipay") && tx.eventType === "refund"
         && (decision.account !== undefined || decision.status !== undefined || decision.postings !== undefined)) tx.refundReviewMode = "manual";
       if (decision.account !== undefined) {
         const account = decision.account;
@@ -685,7 +857,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       else if (decision.account !== undefined) tx.status = statusAfterCategorization(tx);
       if (tx.status !== "duplicate") delete tx.duplicateOf;
     }
-    syncWechatRefunds(active);
+    syncStatementRefunds(active);
     saveBatchRevision(batch);
     if (memory) saveMemory(memoryFile(), memory);
     const reviewed = publicReviewBatch(batch);
