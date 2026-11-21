@@ -1,5 +1,6 @@
 import { useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
 import type { ParsedAccount } from "../../src/shared/types.js";
+import { isFundingAccount } from "../../src/shared/funding.js";
 import useAnchoredOptions from "./useAnchoredOptions";
 
 type AccountOption = Pick<ParsedAccount, "account" | "closedAt">;
@@ -16,7 +17,7 @@ export default function AccountSelect({ value, accounts, onChange, disabled, fun
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState<string | null>(null);
   const [activeIndex, setActiveIndex] = useState(-1);
-  const allowed = (option: AccountOption) => !funding || /^(Assets|Liabilities):/.test(option.account);
+  const allowed = (option: AccountOption) => !funding || isFundingAccount(option.account);
   const current = value ? accounts.find((option) => option.account === value && allowed(option)) : undefined;
   const hint = current?.closedAt ? `关闭于 ${current.closedAt}` : value && !current ? "未在账本定义" : undefined;
   const description = [hint && `${listId}-hint`, matchReason && `${listId}-match`].filter(Boolean).join(" ") || undefined;

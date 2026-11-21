@@ -3,6 +3,8 @@ import path from "node:path";
 import crypto from "node:crypto";
 import type { GenerateResult, ImportPreview } from "../../shared/types.js";
 
+export type StoredPdfUpload = string | { archiveName: string };
+
 export interface StoredBatch extends ImportPreview {
   batchId: string;
   createdAt: number;
@@ -11,7 +13,7 @@ export interface StoredBatch extends ImportPreview {
   /** Never allow an old batch to follow a change to the configured ledger. */
   ledgerProfile: string;
   /** Storage names of the original PDFs, keyed by their upload digest. */
-  pdfUploads?: Record<string, string>;
+  pdfUploads?: Record<string, StoredPdfUpload>;
   preview?: { revision: number; result: GenerateResult; opens: string[] };
 }
 

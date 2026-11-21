@@ -1,17 +1,41 @@
 import { defaultNarration, type DraftPosting, type ParsedTx } from "./types.js";
 
 export const accountPattern = /^(Assets|Liabilities|Equity|Income|Expenses)(?::[\p{Lu}\p{Nd}][\p{L}\p{Nd}-]*)+$/u;
+const isPostingAccount = (account: string) => accountPattern.test(account) && !/(?:^|:)(FixMe|Unknown)(?::|$)/i.test(account);
 export const currencyPattern = /^[A-Z][A-Z0-9._'-]*$/;
 export const amountText = (amount: number) => (Object.is(amount, -0) ? 0 : amount).toFixed(8).replace(/(\.\d{2}\d*?)0+$/, "$1");
 export const validDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) && Number.isFinite(Date.parse(`${value}T00:00:00Z`)) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
 const quote = (value: string) => JSON.stringify(value.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, " "));
 
+/** An income source is credited, while an incoming refund reverses the original funding leg. */
+export function fundingPostingSign(tx: Pick<ParsedTx, "direction" | "eventType" | "fundingAccount">): 1 | -1 {
+  const incomeSource = tx.fundingAccount?.startsWith("Income:") && tx.eventType !== "refund";
+  return tx.direction === "in" && !incomeSource ? 1 : -1;
+}
+
 export function transactionPostings(tx: ParsedTx): DraftPosting[] {
   if (tx.postings) return tx.postings;
   const amount = tx.amount, currency = tx.currency;
   if (tx.fundingAccount2) return [{ account: tx.fundingAccount, amount: -amount, currency }, { account: tx.fundingAccount2, amount, currency }];
-  const fundingAmount = tx.direction === "in" ? amount : -amount;
+  const fundingAmount = fundingPostingSign(tx) * amount;
   return [{ account: tx.fundingAccount, amount: fundingAmount, currency }, { account: tx.finalAccount, amount: -fundingAmount, currency }];
+}
+
+export const missingPostingAccountMessage = {
+  funding: "请先选择资金账户",
+  category: "请先选择分类账户",
+  postings: "请先补齐分录账户",
+};
+
+export function missingPostingAccount(tx: ParsedTx): keyof typeof missingPostingAccountMessage | undefined {
+  if (tx.postings) return tx.postings.length < 2 || tx.postings.some(({ account }) => !isPostingAccount(account)) ? "postings" : undefined;
+  if (!isPostingAccount(tx.fundingAccount)) return "funding";
+  if (!isPostingAccount(tx.fundingAccount2 || tx.finalAccount)) return "category";
+}
+
+export function statusAfterCategorization(tx: ParsedTx): ParsedTx["status"] {
+  if (!missingPostingAccount(tx)) return "ready";
+  return tx.status === "ready" ? "pending" : tx.status;
 }
 
 export function validateTransaction(tx: ParsedTx, postings: DraftPosting[]): string[] {
@@ -26,7 +50,7 @@ export function validateTransaction(tx: ParsedTx, postings: DraftPosting[]): str
   if (new Set(postings.map((posting) => posting.account)).size < 2) errors.push("资金账户与对方账户不能相同");
   const totals = new Map<string, number>();
   for (const posting of postings) {
-    if (!accountPattern.test(posting.account) || /(?:^|:)(FixMe|Unknown)(?::|$)/i.test(posting.account)) errors.push(`账户无效或尚未确认：${posting.account}`);
+    if (!isPostingAccount(posting.account)) errors.push(`账户无效或尚未确认：${posting.account}`);
     if (!currencyPattern.test(posting.currency)) errors.push(`币种无效：${posting.currency}`);
     if (!Number.isFinite(posting.amount)) errors.push("分录金额不是有效数字");
     else totals.set(posting.currency, (totals.get(posting.currency) ?? 0) + Number(posting.amount.toFixed(8)));

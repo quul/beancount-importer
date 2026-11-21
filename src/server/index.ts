@@ -10,7 +10,7 @@ import type { AppConfig, FundingMappingChoice, FundingMappingGroup, ImportPrevie
 import { canExcludeSuspectedDuplicate, duplicateReviewIssue, MAX_NARRATION_LENGTH } from "../shared/types.js";
 import { MAX_CATEGORY_ALLOCATIONS, planCategoryAllocations, savedCategoryAllocations } from "../shared/categoryAllocations.js";
 import { activeTransactions, mergeSource, planTransactionMerge } from "../shared/transactionMerge.js";
-import { validDate } from "../shared/postings.js";
+import { missingPostingAccount, missingPostingAccountMessage, statusAfterCategorization, validDate } from "../shared/postings.js";
 import { hasFundingPosting, isFundingAccount, isStatementOnlyPayment, reusablePaymentMethod } from "../shared/funding.js";
 import { configWithDefaults, defaultActiveLedgerFile, loadConfig, readLedgerSettings, saveConfig } from "./config.js";
 import { discoverPython, LedgerAccessError, parseLedger, parseLedgerAsync, validateLedgerFile } from "./lib/ledger.js";
@@ -27,17 +27,19 @@ import { detectBank, parseBank } from "./parsers/banks.js";
 import { parsePdfBank, PDF_RETRY_HINT } from "./parsers/pdf.js";
 import { pairTransfers, transferPairIssue } from "./lib/transfers.js";
 import { isParsedStatementRow, readSheet } from "./parsers/common.js";
-import { BatchStore, isBatchId, profileId, type StoredBatch } from "./lib/batches.js";
+import { BatchStore, isBatchId, profileId, type StoredBatch, type StoredPdfUpload } from "./lib/batches.js";
 import { acquireWriteLock, assertBatchDeletable, commitBatch, ImportError } from "./lib/commit.js";
 import { importDirectoryError } from "./lib/import-paths.js";
 import { isLocalRequest } from "./lib/local-request.js";
 import { createPdfPreviewLoader } from "./lib/pdf-preview.js";
+import { archiveStatement, ledgerUploadsDirectory } from "./lib/statement-uploads.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9_./-]*$/;
 const STATUSES = new Set(["pending", "ready", "duplicate", "excluded"]);
 const OTHER_BATCH_ISSUE = "另一个未提交批次已有此交易";
 const STATEMENT_RETRY_HINT = "暂时无法读取这份账单。请重新上传，或重新导出账单后再试。";
+const STATEMENT_ARCHIVE_HINT = "无法保存账单副本。请检查文件名和账本 uploads 目录的写入权限。";
 const MAX_STATEMENT_MB = 30, MAX_STATEMENT_FILES = 20;
 const otherBatchIssue = (issue: string) => issue === OTHER_BATCH_ISSUE || issue.startsWith("这笔交易已在另一个未提交批次中");
 const runFile = promisify(execFile);
@@ -253,7 +255,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     });
     return publicBatch({ ...batch, txs });
   };
-  const publicConfig = () => ({ ...config, nativePathPicker: process.platform === "win32", llm: { ...config.llm, apiKey: "" } });
+  const publicConfig = () => ({ ...config, archiveUploadsInLedger: config.archiveUploadsInLedger ?? true,
+    nativePathPicker: process.platform === "win32", llm: { ...config.llm, apiKey: "" } });
   const lockBatch = (id: string) => {
     if (!isBatchId(id)) throw new ImportError(404, "批次不存在");
     return acquireWriteLock(path.join(dataDir, "locks", "batches", `${id}.json`), "批次正在处理，请稍后重试");
@@ -279,14 +282,17 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const files = (req.files as Express.Multer.File[]) ?? [];
     if (!files.length) throw new ImportError(400, "请选择账单文件");
     const importedFiles = new Map<string, string>();
+    const archiveCopies = config.archiveUploadsInLedger !== false;
+    const archivedCopies: string[] = [];
     let batchSaved = false;
     try {
       const uploadConfig = structuredClone(config), uploadRoot = ledgerRoot();
+      const archiveDirectory = ledgerUploadsDirectory(uploadRoot);
       const uploadProfile = profileId(uploadRoot, uploadConfig.mainFile);
       const currentLedger = parseLedger(uploadRoot, uploadConfig.mainFile, uploadConfig.pythonPath);
       const memory = loadMemory(path.join(dataDir, "profiles", uploadProfile, "memory.json"));
       const txs: ParsedTx[] = [], errors: ImportPreview["errors"] = [];
-      const pdfUploads: Record<string, string> = {};
+      const pdfUploads: Record<string, StoredPdfUpload> = {};
       const instances = new Map<string, number>(), sources = new Set<ImportPreview["source"]>();
       let wechatRules: ReturnType<typeof loadWechatRules> | undefined;
       for (const file of files) {
@@ -324,6 +330,17 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
             if (local) { tx.suggestedAccount = local.account; tx.confidence = local.confidence; tx.reason = local.reason; }
             return tx;
           });
+          let archiveName: string | undefined;
+          if (archiveCopies) {
+            try {
+              archiveName = archiveStatement(file.path, archiveDirectory, name, sourceFileHash);
+              archivedCopies.push(path.join(archiveDirectory, archiveName));
+            } catch (error) {
+              console.error(`Could not archive statement ${name}`, error);
+              errors.push({ row: 0, message: `${name}：${STATEMENT_ARCHIVE_HINT}` });
+              continue;
+            }
+          }
           for (const tx of imported) {
             const occurrence = (instances.get(tx.id) ?? 0) + 1;
             instances.set(tx.id, occurrence);
@@ -331,7 +348,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
             txs.push(tx);
           }
           for (const error of result.errors) errors.push({ ...error, message: `${name}：${error.message}` });
-          if (pdf) pdfUploads[sourceFileHash] = file.filename;
+          if (pdf) pdfUploads[sourceFileHash] = archiveName ? { archiveName } : file.filename;
           importedFiles.set(file.path, name);
           sources.add(result.source);
         } catch (error) {
@@ -346,7 +363,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
         const hit = llm.get(tx.id);
         if (hit && hit.confidence > tx.confidence) { tx.suggestedAccount = hit.account; tx.confidence = hit.confidence; tx.reason = hit.reason; }
         tx.finalAccount = tx.suggestedAccount;
-        if (tx.status === "pending" && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 0) >= 0.9 && !tx.issues?.length) tx.status = "ready";
+        if (tx.status === "pending" && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 0) >= 0.9 && !tx.issues?.length
+          && !missingPostingAccount(tx)) tx.status = "ready";
       }
       suggestRefundsFromBatch(txs, currentLedger);
       const deduped = markDuplicates(txs, currentLedger.transactions), paired = pairTransfers(deduped.txs);
@@ -360,9 +378,10 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       batchSaved = true;
       res.json({ batchId: batch.batchId, revision: batch.revision, preview: { ...publicBatch(batch), txs: undefined, lowConfidence: batch.txs.filter((tx) => tx.status === "pending").length } });
     } finally {
-      for (const file of files) {
-        if (batchSaved && importedFiles.has(file.path)) continue;
-        try { fs.rmSync(file.path, { force: true }); }
+      const unused = files.filter((file) => !batchSaved || archiveCopies || !importedFiles.has(file.path)).map(({ path }) => path);
+      if (!batchSaved) unused.push(...archivedCopies);
+      for (const file of unused) {
+        try { fs.rmSync(file, { force: true }); }
         catch (error) { console.error("Could not remove unused statement upload", error); }
       }
     }
@@ -374,7 +393,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const batch = getBatch(req.params.id);
     const tx = batch.txs.find(({ id }) => id === req.params.txId);
     if (!tx) throw new ImportError(404, "找不到这笔交易。");
-    const preview = await loadPdfPreview(batch, tx);
+    const preview = await loadPdfPreview(batch, tx, ledgerRoot());
     res.set("Cache-Control", "no-store").json(preview);
   }));
   app.post("/api/batch/:id/recheck-ledger", asyncRoute(async (req, res) => {
@@ -623,7 +642,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       const nextStatus = decision.status ?? (decision.account === undefined ? undefined : "ready");
       if (tx.excludedReason && nextStatus && nextStatus !== "excluded") throw new ImportError(422, `这笔交易已排除（${tx.excludedReason}）`);
       if (decision.account !== undefined && (typeof decision.account !== "string" || !hasAccount(decision.account))) throw new ImportError(400, "分类账户必须来自当前账本");
-      if (decision.funding !== undefined && (typeof decision.funding !== "string" || !/^(Assets|Liabilities):/.test(decision.funding) || !hasAccount(decision.funding))) throw new ImportError(400, "资金账户必须来自当前账本的资产或负债账户");
+      if (decision.funding !== undefined && (typeof decision.funding !== "string" || !isFundingAccount(decision.funding) || !hasAccount(decision.funding))) throw new ImportError(400, "资金账户必须来自当前账本的资产、负债或收入账户");
       if (decision.tags !== undefined && (!Array.isArray(decision.tags) || decision.tags.length > 40 || decision.tags.some((tag) => typeof tag !== "string" || tag.length > 64 || !TAG_RE.test(tag)))) throw new ImportError(400, "标签格式无效");
       if (decision.flag !== undefined && decision.flag !== "*" && decision.flag !== "!") throw new ImportError(400, "标记应为 * 或 !");
       if (decision.reviewNote !== undefined && (typeof decision.reviewNote !== "string" || decision.reviewNote.length > 2000)) throw new ImportError(400, "备注最多 2000 字符");
@@ -657,8 +676,12 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       else if (decision.narration !== undefined) tx.narration = decision.narration;
       if (decision.postings === null) { delete tx.postings; delete tx.fundingAccount2; }
       else if (decision.postings !== undefined) { tx.postings = decision.postings; delete tx.fundingAccount2; }
+      if (decision.status === "ready") {
+        const missing = missingPostingAccount(tx);
+        if (missing) throw new ImportError(422, missingPostingAccountMessage[missing]);
+      }
       if (decision.status !== undefined) tx.status = decision.status;
-      else if (decision.account !== undefined) tx.status = "ready";
+      else if (decision.account !== undefined) tx.status = statusAfterCategorization(tx);
       if (tx.status !== "duplicate") delete tx.duplicateOf;
     }
     syncWechatRefunds(active);
@@ -688,7 +711,12 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const opening = new Set(opens.map((line) => line.split(" open ")[1]));
     const errors = [...draftErrors(activeTransactions(batch.txs), currentLedger, opening), ...(result.errors ?? [])];
     if (!result.generated.length && !errors.length) errors.push("没有标记入账的交易，请先审批");
-    if (errors.length) { delete batch.preview; batches.save(batch); res.status(422).json({ error: "请先修正以下问题", errors, details: errors, revision: batch.revision }); return; }
+    if (errors.length) {
+      delete batch.preview;
+      batches.save(batch);
+      res.status(422).json({ code: "review_incomplete", error: "请将待确认内容处理完毕后，再点击「生成预览」。", errors, details: errors, revision: batch.revision });
+      return;
+    }
     batch.preview = { revision: batch.revision, result, opens }; batches.save(batch);
     const { files, ...preview } = result;
     res.json({ ...preview, targetFiles: Object.keys(files), generated: result.generated.length, opens, revision: batch.revision, baselineErrors: currentLedger.errors ?? [] });
@@ -757,7 +785,10 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const switchingDirectory = !config.ledgerRoot || path.relative(ledgerRoot(), root) !== "";
     const existing = switchingDirectory ? readLedgerSettings(root) : undefined;
     const base = existing ? configWithDefaults(ledgerDirectory, existing) : config;
-    const candidate = { ...base, ...patch, ledgerRoot: ledgerDirectory, llm: { ...base.llm, ...patch.llm } };
+    const candidate = {
+      ...base, archiveUploadsInLedger: switchingDirectory && !existing ? true : base.archiveUploadsInLedger ?? true,
+      ...patch, ledgerRoot: ledgerDirectory, llm: { ...base.llm, ...patch.llm },
+    };
     if (typeof candidate.mainFile !== "string" || typeof candidate.monthlyDir !== "string" || (candidate.pythonPath !== undefined && typeof candidate.pythonPath !== "string")) throw new ImportError(400, "账本路径配置无效");
     const directoryError = importDirectoryError(candidate.monthlyDir);
     if (directoryError) throw new ImportError(400, directoryError);
@@ -766,7 +797,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     if (!relativeMain || relativeMain === ".." || relativeMain.startsWith(`..${path.sep}`) || path.isAbsolute(relativeMain) || !fs.existsSync(main)) throw new ImportError(400, "账本主文件不存在或位于账本目录外");
     if (!Array.isArray(candidate.assetMapping) || candidate.assetMapping.some((mapping) => !mapping || typeof mapping.keyword !== "string" || !mapping.keyword.trim() || typeof mapping.account !== "string" || !["credit", "debit"].includes(mapping.kind) || (mapping.cardSuffix !== undefined && (typeof mapping.cardSuffix !== "string" || !/^\d{0,6}$/.test(mapping.cardSuffix))))) throw new ImportError(400, "资金映射需要有效关键词、账户、借贷类型及可选卡片尾号");
     if (typeof candidate.annualLayout !== "boolean" && candidate.annualLayout !== undefined) throw new ImportError(400, "年度布局配置无效");
-    const current = parseLedger(root, candidate.mainFile, candidate.pythonPath), defined = new Set(current.accounts.filter((account) => /^(Assets|Liabilities):/.test(account.account)).map((account) => account.account));
+    if (typeof candidate.archiveUploadsInLedger !== "boolean") throw new ImportError(400, "账单副本归档设置无效");
+    const current = parseLedger(root, candidate.mainFile, candidate.pythonPath), defined = new Set(current.accounts.map(({ account }) => account).filter(isFundingAccount));
     const switched = !config.ledgerRoot || profileId(root, candidate.mainFile) !== profile();
     if (!switched && patch.assetMapping !== undefined && candidate.assetMapping.some((mapping) => !defined.has(mapping.account))) throw new ImportError(400, "资金映射账户必须在目标账本中定义");
     candidate.assetMapping = candidate.assetMapping.filter((mapping) => defined.has(mapping.account)).map((mapping) => ({ ...mapping, keyword: mapping.keyword.trim(), cardSuffix: mapping.cardSuffix || undefined }));

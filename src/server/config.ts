@@ -42,6 +42,7 @@ function defaultConfig(ledgerRoot: string): AppConfig {
     mainFile: "main.bean",
     monthlyDir: "years/{year}/imported",
     annualLayout: true,
+    archiveUploadsInLedger: true,
     pythonPath: ledgerRoot ? discoverPython(ledgerRoot) : undefined,
     assetMapping: [],
     accounts: [],

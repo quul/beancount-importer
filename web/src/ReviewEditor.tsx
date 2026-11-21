@@ -1,5 +1,5 @@
 import type { DraftPosting, ParsedAccount, ParsedTx, TxDecision } from "../../src/shared/types.js";
-import { amountText } from "../../src/shared/postings.js";
+import { amountText, fundingPostingSign } from "../../src/shared/postings.js";
 import AccountSelect from "./AccountSelect";
 import TransactionFlag from "./TransactionFlag";
 
@@ -20,7 +20,7 @@ export function invalidTags(value: string): string[] {
 }
 
 export function makeDraft(tx: ParsedTx): ReviewDraft {
-  const amount = tx.direction === "in" ? -tx.amount : tx.amount;
+  const amount = -fundingPostingSign(tx) * tx.amount;
   const postings: DraftPosting[] = tx.postings ?? [
     { account: tx.finalAccount || tx.suggestedAccount, amount, currency: tx.currency },
     { account: tx.fundingAccount, amount: -amount, currency: tx.currency },

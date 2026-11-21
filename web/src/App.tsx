@@ -5,7 +5,7 @@ import {
   LEDGER_DUPLICATE_ISSUE, MAX_NARRATION_LENGTH, PDF_REVIEW_ISSUE,
 } from "../../src/shared/types.js";
 import { MAX_CATEGORY_ALLOCATIONS, savedCategoryAllocations, supportsCategoryAllocations } from "../../src/shared/categoryAllocations.js";
-import { amountText } from "../../src/shared/postings.js";
+import { amountText, missingPostingAccount, missingPostingAccountMessage } from "../../src/shared/postings.js";
 import { accountIsActive, hasFundingPosting, isFundingAccount, reusablePaymentMethod } from "../../src/shared/funding.js";
 import { activeTransactions } from "../../src/shared/transactionMerge.js";
 import { api, ApiError, type BatchSummary, type ConfigResponse, type GeneratedPreview, type LedgerSummary, type MergeDraft } from "./api";
@@ -37,6 +37,16 @@ function settingsRoute(): SettingsSection | null {
   return window.location.hash === SETTINGS_LINKS.ledger ? "ledger" : null;
 }
 
+const batchIdFromUrl = () => new URLSearchParams(window.location.search).get("batch") ?? "";
+
+function batchUrl(id: string, hash = window.location.hash): string {
+  const url = new URL(window.location.href);
+  if (id) url.searchParams.set("batch", id);
+  else url.searchParams.delete("batch");
+  url.hash = hash;
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
 const DECISION_LABELS: Record<TxStatus, string> = { pending: "待确认", ready: "待入账", duplicate: "重复", excluded: "已排除" };
 const operationMessage = (failure: unknown) => failure instanceof ApiError ? failure.message : "暂时无法完成操作。请重试。";
 const EVENT_LABELS: Record<EventType, string> = { expense: "支出", income: "收入", refund: "退款", transfer: "转账", familyCard: "亲情卡", unknown: "待识别" };
@@ -45,11 +55,23 @@ const fmt = (amount: number) => amount.toLocaleString("zh-CN", { minimumFraction
 const batchTime = (createdAt: number) => new Date(createdAt).toLocaleString("zh-CN");
 const postingStatusLabel = (tx: ParsedTx, readOnly: boolean) => readOnly && tx.status === "ready" ? "已入账" : DECISION_LABELS[tx.status];
 const categoryInputId = (id: string, detail = false) => `${detail ? "detail" : "row"}-category-${id}`;
+const fundingInputId = (id: string, detail = false) => `${detail ? "detail" : "row"}-funding-${id}`;
 type CategoryAdvance = { rowIds: ReadonlySet<string>; origin: Element | null };
 type TransactionDraft = { value: ReviewDraft; original: ReviewDraft };
 type DeleteTarget = Pick<BatchSummary, "batchId" | "file" | "revision"> & { createdAt?: number };
 type ReviewOpening = "import" | "resume" | "reload";
 type FundingTarget = { id: string; batch: ImportPreview; opening: ReviewOpening; groups: FundingMappingGroup[] };
+
+const reviewIcons = {
+  info: <><circle cx="10" cy="10" r="7.6" /><path d="M10 9.5v4" /><circle cx="10" cy="6.8" r=".9" fill="currentColor" stroke="none" /></>,
+  check: <path d="M2.8 10.5 7.6 16.5 17.2 3.5" />,
+  cross: <path d="M3.2 3.2 16.8 16.8M16.8 3.2 3.2 16.8" />,
+  question: <><path d="M7 7.3a3 3 0 1 1 5 2.2c-1.2 1-2 .8-2 2.3" /><circle cx="10" cy="15" r=".9" fill="currentColor" stroke="none" /></>,
+};
+
+function ReviewIcon({ name }: { name: keyof typeof reviewIcons }) {
+  return <svg aria-hidden="true" viewBox="0 0 20 20" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{reviewIcons[name]}</svg>;
+}
 
 function pendingCategory(row: ReviewRow) {
   const canClassify = (tx: ParsedTx) => tx.status === "pending" && !tx.postings && !tx.excludedReason;
@@ -161,8 +183,9 @@ export default function App() {
   const [mappingTarget, setMappingTarget] = useState<ParsedTx | null>(null);
   const [batch, setBatch] = useState<ImportPreview | null>(null);
   const [batchId, setBatchId] = useState("");
+  const [routedBatchId, setRoutedBatchId] = useState(batchIdFromUrl);
   const [preview, setPreview] = useState<GeneratedPreview | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState(true);
   const [pendingSaves, setPendingSaves] = useState<ReviewPatches[]>([]);
   const [rowFocusedDuringSave, setRowFocusedDuringSave] = useState<string>();
   const [error, setError] = useState("");
@@ -198,6 +221,16 @@ export default function App() {
   const decisionQueue = useRef(Promise.resolve());
   const batchRef = useRef<ImportPreview | null>(null);
   const batchIdRef = useRef("");
+
+  const navigateBatch = (id: string, { replace = false, hash = window.location.hash } = {}) => {
+    const target = batchUrl(id, hash);
+    if (target !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
+      if (replace) window.history.replaceState(null, "", target);
+      else window.history.pushState(null, "", target);
+    }
+    setRoutedBatchId(id);
+    setSettings(settingsRoute());
+  };
 
   const replaceBatch = (value: ImportPreview | null, id = batchIdRef.current) => {
     batchRef.current = value;
@@ -255,9 +288,16 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    const navigate = () => setSettings(settingsRoute());
+    const navigate = () => {
+      setRoutedBatchId(batchIdFromUrl());
+      setSettings(settingsRoute());
+    };
     window.addEventListener("hashchange", navigate);
-    return () => window.removeEventListener("hashchange", navigate);
+    window.addEventListener("popstate", navigate);
+    return () => {
+      window.removeEventListener("hashchange", navigate);
+      window.removeEventListener("popstate", navigate);
+    };
   }, []);
 
   useEffect(() => {
@@ -323,8 +363,10 @@ export default function App() {
   const bulkTagErrors = invalidTags(bulkTags);
   const bulkEditDisabled = editingDisabled || detailDraftIds.length > 0 || !targets.length;
   const bulkTagDisabled = bulkEditDisabled || !parseTags(bulkTags).length || Boolean(bulkTagErrors.length);
-  const pendingHigh = active.filter((tx) => tx.status === "pending" && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 1) >= 0.9 && !tx.issues?.length);
+  const pendingHigh = active.filter((tx) => tx.status === "pending" && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 1) >= 0.9
+    && !tx.issues?.length && tx.suggestedAccount && !missingPostingAccount({ ...tx, finalAccount: tx.suggestedAccount }));
   const readyCount = active.filter((tx) => tx.status === "ready").length;
+  const showDecisionStatus = statusFilter === "all";
 
   useLayoutEffect(() => {
     if (!rowFocusedDuringSave) return;
@@ -402,9 +444,11 @@ export default function App() {
   };
 
   const prepareReview = async (id: string, value: ImportPreview, opening: ReviewOpening, mappings?: FundingMappingChoice[]) => {
+    if (batchIdFromUrl() !== id) return;
     if (!value.committed && activeTransactions(value.txs).some((tx) => !tx.merge
       && (tx.source === "wechat" || (!tx.fundingAccount && tx.status !== "excluded" && tx.status !== "duplicate")))) {
       const result = await api.funding(id, value.revision ?? 0, mappings);
+      if (batchIdFromUrl() !== id) return;
       if (result.groups.length) {
         setFundingTarget({ id, batch: value, opening, groups: result.groups });
         return;
@@ -415,6 +459,7 @@ export default function App() {
     startReview(id, value, opening !== "import");
     if (opening === "reload" && !value.committed) {
       const result = await api.recheckLedger(id, value.revision ?? 0);
+      if (batchIdFromUrl() !== id) return;
       replaceBatch(result.batch, id);
       setNotice("已重新载入并复查疑似重复");
     }
@@ -426,13 +471,13 @@ export default function App() {
     } catch (failure) {
       if (!(failure instanceof ApiError) || !failure.temporary) throw failure;
       await new Promise((resolve) => setTimeout(resolve, 1000));
-      await prepareReview(id, await api.batch(id), opening);
+      if (batchIdFromUrl() === id) await prepareReview(id, await api.batch(id), opening);
     }
   };
 
-  const openBatch = (id: string, opening: ReviewOpening = "resume") => void perform(async () => {
+  const reloadBatch = () => void perform(async () => {
     await decisionQueue.current;
-    await loadReview(id, opening);
+    await loadReview(batchId, "reload");
   });
 
   const confirmFunding = (target: FundingTarget, mappings: FundingMappingChoice[]) => void perform(async () => {
@@ -466,9 +511,12 @@ export default function App() {
       const { file, createdAt, revision, committed, txCount } = result.preview;
       const saved = { batchId: result.batchId, file, createdAt, revision, committed, txCount };
       setBatches((previous) => [saved, ...previous.filter((item) => item.batchId !== saved.batchId)]);
+      navigateBatch(saved.batchId);
       try {
         await loadReview(saved.batchId, "import");
       } catch (failure) {
+        if (batchIdFromUrl() !== saved.batchId) return;
+        navigateBatch("", { replace: true });
         setError(failure instanceof ApiError && failure.temporary
           ? "账单已保存，请点「继续审批」重试。"
           : `账单已保存。\n${operationMessage(failure)}`);
@@ -570,16 +618,14 @@ export default function App() {
       ? { rowIds: new Set(visible.slice(currentIndex + 1).map(({ tx }) => tx.id)), origin: document.activeElement } : undefined;
     const patches = blocking ? undefined : reviewPatches(decisions);
     if (patches && followedRefundIds.length) {
-      const txById = new Map(active.map((tx) => [tx.id, tx]));
-      const decisionById = new Map(decisions.map((decision) => [decision.id, decision]));
       for (const id of followedRefundIds) {
-        const refund = txById.get(id);
-        const purchase = refund?.refundCounterpartId ? txById.get(refund.refundCounterpartId) : undefined;
-        const approval = purchase && decisionById.get(purchase.id);
-        const account = approval?.account ?? purchase?.finalAccount;
-        if (account) patches.set(id, () => ({
-          finalAccount: account, status: "ready", refundReviewMode: "follow-purchase", duplicateOf: undefined,
-        }));
+        patches.set(id, (refund, rows) => {
+          const purchase = refund.refundCounterpartId ? rows.get(refund.refundCounterpartId) : undefined;
+          if (purchase?.status !== "ready" || !canFollowPurchaseRefund(refund) || isSuspectedDuplicate(refund)) return {};
+          const account = purchase.finalAccount;
+          if (!account.startsWith("Expenses:") || missingPostingAccount({ ...refund, finalAccount: account })) return {};
+          return { finalAccount: account, status: "ready", refundReviewMode: "follow-purchase", duplicateOf: undefined };
+        });
       }
     }
     const queued = saveDecisions(decisions, {
@@ -696,16 +742,36 @@ export default function App() {
 
   const clearReview = () => {
     replaceBatch(null, ""); setDrafts({}); setAllocationDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null); setMergeIds(null); invalidate();
+    setFundingTarget(null);
     setPdfPreviewTx(null);
     setMappingTarget(null);
   };
 
+  useEffect(() => {
+    if (busy || (settings && routedBatchId) || routedBatchId === (fundingTarget?.id ?? batchId)) return;
+    void perform(async () => {
+      await decisionQueue.current;
+      if (batchIdFromUrl() !== routedBatchId) return;
+      clearReview();
+      setNotice("");
+      if (!routedBatchId) {
+        setBatches(await api.batches());
+        return;
+      }
+      try {
+        await loadReview(routedBatchId, "resume");
+      } catch (failure) {
+        if (batchIdFromUrl() !== routedBatchId) return;
+        navigateBatch("", { replace: true });
+        throw failure;
+      }
+    });
+  }, [busy, settings, routedBatchId, fundingTarget?.id, batchId]);
+
   const goHome = (event: MouseEvent<HTMLAnchorElement>) => {
     if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
-    if (locked.current || blockBatchChanges) { event.preventDefault(); return; }
-    if (!batchRef.current && !settings) return;
-    clearReview(); setNotice("");
-    void perform(async () => { setBatches(await api.batches()); });
+    event.preventDefault();
+    if (!locked.current && !blockBatchChanges) navigateBatch("", { hash: "" });
   };
 
   const deleteBatch = (target: DeleteTarget) => void perform(async () => {
@@ -721,7 +787,7 @@ export default function App() {
       }
       if (error.status !== 404) throw error;
     }
-    if (batchIdRef.current === target.batchId) clearReview();
+    if (batchIdFromUrl() === target.batchId) navigateBatch("", { replace: true });
     setBatches((previous) => previous.filter((item) => item.batchId !== target.batchId));
     setNotice("已删除批次");
   });
@@ -735,6 +801,7 @@ export default function App() {
       const switched = saved.ledgerRoot !== config?.ledgerRoot || saved.mainFile !== config?.mainFile;
       if (switched) {
         clearReview();
+        navigateBatch("", { replace: true });
         setLedger(null);
         setBatches([]);
       } else invalidate();
@@ -797,11 +864,10 @@ export default function App() {
               accounts={refund ? accounts.filter(({ account }) => account.startsWith("Expenses:") || account === tx.finalAccount) : accounts}
               label={`${payee} · 分类账户`} disabled={accountDisabled} autoHighlight={tx.status === "pending"} confirmCurrent={tx.status === "pending"}
               onChange={(account) => {
-                const status = tx.status === "pending" ? "ready" : tx.status;
-                const decisions = [{ id: tx.id, account, status }];
-                if (status !== "ready") { saveReviewDecisions(decisions); return; }
+                const decision = { id: tx.id, account, status: isEditablePostingStatus(tx) ? undefined : tx.status };
+                if (decision.status || missingPostingAccount({ ...tx, finalAccount: account })) { saveReviewDecisions([decision]); return; }
                 const follows = refund && account.startsWith("Expenses:") && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund);
-                savePostingDecisions(decisions, {
+                savePostingDecisions([decision], {
                   followedRefundIds: follows ? [refund.id] : [], advanceAfter: tx.status === "pending" ? tx.id : undefined,
                 });
               }} />
@@ -811,13 +877,13 @@ export default function App() {
         <div className="account-field">
           <div className="account-caption">{detail ? "资金账户" : "资金"}</div>
           <div className="funding-control-row">
-            <AccountSelect value={tx.fundingAccount} accounts={accounts} funding label={`${payee} · 资金账户`}
+            <AccountSelect value={tx.fundingAccount} accounts={accounts} funding label={`${payee} · 资金账户`} inputId={fundingInputId(tx.id, detail)}
               matchReason={matchReason} confirmCurrent={Boolean(matchReason && tx.fundingAccount)}
               disabled={accountDisabled} onChange={(funding) => saveReviewDecisions(fundingRows.map(({ id }) => ({ id, funding })))} />
-            {matchReason && !readOnly && <button type="button" className="btn small quiet funding-map-button" aria-haspopup="dialog"
+            {matchReason && !readOnly && <button type="button" className="btn small quiet review-icon-button funding-map-button" aria-haspopup="dialog"
               aria-label={`添加映射 · ${payee}`} disabled={disabled || Boolean(mappingDisabledReason)}
-              title={mappingDisabledReason || "为此付款方式保存账本账户"}
-              onClick={() => { setError(""); setMappingTarget(tx); }}>添加映射</button>}
+              title={mappingDisabledReason ? `添加映射\n${mappingDisabledReason}` : "添加映射"}
+              onClick={() => { setError(""); setMappingTarget(tx); }}><ReviewIcon name="question" /></button>}
           </div>
         </div>
       </div>
@@ -838,19 +904,30 @@ export default function App() {
     const canInclude = tx.status !== "ready" && !tx.excludedReason && (!refund || (tx.status === "pending"
       && !tx.postings && refund.status === "pending" && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund)));
     const category = tx.finalAccount || tx.suggestedAccount || "";
-    const needsCategory = Boolean(refund) && !category.startsWith("Expenses:");
+    const needsExpenseCategory = Boolean(refund) && !category.startsWith("Expenses:");
+    const missing = missingPostingAccount({ ...tx, finalAccount: category }) ?? (needsExpenseCategory ? "category" : undefined);
+    const includeHint = missing === "category" && needsExpenseCategory ? "请先选择费用分类账户"
+      : missing ? missingPostingAccountMessage[missing] : undefined;
     const include = () => {
-      if (needsCategory) { document.getElementById(categoryInputId(tx.id))?.focus(); return; }
-      const decision: TxDecision = { id: tx.id, status: "ready", ...(refund && !tx.finalAccount ? { account: category } : {}) };
+      if (missing === "postings") { setError(missingPostingAccountMessage.postings); return; }
+      if (missing) {
+        const inputId = missing === "funding" ? fundingInputId(tx.id, !compact) : categoryInputId(tx.id, !compact);
+        document.getElementById(inputId)?.focus();
+        return;
+      }
+      const decision: TxDecision = {
+        id: tx.id, status: "ready", ...(!tx.postings && !tx.fundingAccount2 && !tx.finalAccount ? { account: category } : {}),
+      };
       savePostingDecisions([decision], { followedRefundIds: refund ? [refund.id] : [], advanceAfter: tx.id });
     };
     const excludeEntries = () => void savePostingStatus(exclude.map(({ id }) => id), "excluded");
     if (!canInclude && !exclude.length && !tx.merge) return null;
-    return <div className="decision-actions">
-      {canInclude && <button type="button" className="btn small decision-include" disabled={disabled} aria-label={`标记入账 · ${payee}`}
-        title={needsCategory ? "选择费用分类后入账" : undefined} onClick={include}>标记入账</button>}
-      {exclude.length > 0 && <button type="button" className={`btn small quiet decision-exclude${emphasizeExclude ? " is-urgent" : ""}`} disabled={disabled}
-        aria-label={`${excludeLabel} · ${payee}`} onClick={excludeEntries}>{excludeLabel}</button>}
+    const iconButton = compact ? " review-icon-button" : "";
+    return <div className={compact ? "decision-actions icon-actions" : "decision-actions"}>
+      {canInclude && <button type="button" className={`btn small decision-include${iconButton}`} disabled={disabled} aria-label={`标记入账 · ${payee}`}
+        title={includeHint ? `标记入账\n${includeHint}` : "标记入账"} onClick={include}>{compact ? <ReviewIcon name="check" /> : "标记入账"}</button>}
+      {exclude.length > 0 && <button type="button" className={`btn small quiet decision-exclude${iconButton}${emphasizeExclude ? " is-urgent" : ""}`} disabled={disabled}
+        aria-label={`${excludeLabel} · ${payee}`} title={excludeLabel} onClick={excludeEntries}>{compact ? <ReviewIcon name="cross" /> : excludeLabel}</button>}
       {compact && tx.merge && <ReviewMenu label={`更多操作 · ${payee}`} title="⋯">{(close) =>
         <button type="button" className="menu-action" disabled={disabled || narrationDrafts[tx.id] !== undefined}
           aria-label={`撤销合并 · ${payee}`} onClick={() => { close(); undoMerge(tx); }}>撤销合并</button>
@@ -906,7 +983,7 @@ export default function App() {
     {originals.map((tx) => <article className="refund-leg" key={tx.id}>
       <div className="refund-leg-heading"><h4>{tx.payee || "（无商户）"}</h4>
         <strong className={`amt ${tx.direction}`}>{tx.direction === "in" ? "+" : "−"}{amountText(tx.amount)} {tx.currency}</strong>
-        <span className={`decision-status ${tx.status}`}>{DECISION_LABELS[tx.status]}</span>
+        {showDecisionStatus && <span className={`decision-status ${tx.status}`}>{DECISION_LABELS[tx.status]}</span>}
       </div>
       <time className="tx-date" dateTime={tx.date}>{tx.date}{tx.time && ` ${tx.time}`}</time>
       <dl className="tx-meta">
@@ -928,7 +1005,7 @@ export default function App() {
       <summary>历史账本参考（{tx.matches.length}）</summary>
       {tx.matches.map((match) => <HistoryMatch key={match.id} match={match}
         disabled={disabled} hasPostings={Boolean(tx.postings)}
-        onApply={(account) => saveReviewDecisions([{ id: tx.id, account, status: tx.status === "pending" ? "ready" : tx.status }])}
+        onApply={(account) => saveReviewDecisions([{ id: tx.id, account, status: isEditablePostingStatus(tx) ? undefined : tx.status }])}
         counterpart={active.find((other) => other.id === match.id)}
         onAdopt={() => void saveDecisions([{ id: tx.id, postings: match.postings, status: "ready" }])}
         onExclude={() => savePostingStatus([match.id], "excluded")} />)}
@@ -953,7 +1030,7 @@ export default function App() {
           <h3 id="transaction-detail-heading" ref={detailHeading} tabIndex={-1}>{tx.payee || "（无商户）"}</h3>
           <div className="detail-meta">
             <time dateTime={tx.time ? `${tx.date}T${tx.time}` : tx.date}>{timestamp}</time>
-            <span>{status}</span>
+            {showDecisionStatus && <span>{status}</span>}
           </div>
         </div>
         <button type="button" className="btn small quiet close-detail" aria-label="关闭详情" title="关闭详情" onClick={closeDetails}>×</button>
@@ -964,7 +1041,7 @@ export default function App() {
           return <section className="refund-leg" aria-label={label} key={entry.id}>
             <div className="refund-leg-heading"><h3>{label}</h3>
               <strong className={`amt ${entry.direction}`}>{fmt(entry.amount)} {entry.currency}</strong>
-              <span className={`decision-status ${entry.status}`}>{postingStatusLabel(entry, readOnly)}</span></div>
+              {showDecisionStatus && <span className={`decision-status ${entry.status}`}>{postingStatusLabel(entry, readOnly)}</span>}</div>
             <time className="tx-date" dateTime={entry.time ? `${entry.date}T${entry.time}` : entry.date}>{entry.date}{entry.time && ` ${entry.time}`}</time>
             <dl className="tx-meta">
               {entry.sourceTxId && <div><dt>交易号</dt><dd><code>{entry.sourceTxId}</code></dd></div>}
@@ -1046,10 +1123,19 @@ export default function App() {
           <TransactionFlag value={entries.some((entry) => entry.flag === "!") ? "!" : "*"}
             label={`${payee} · 账本标记`} disabled={rowDisabled} onChange={(flag) => saveFlags(entries, flag)} />
           <div className="payee" title={payee}>{payee}</div>
+          <button id={`detail-toggle-${tx.id}`} type="button" className="btn small quiet review-icon-button detail-toggle"
+            aria-label={`${detailsLabel} · ${payee}`} title={detailsLabel} aria-expanded={detailsOpen}
+            aria-controls={detailsOpen ? "transaction-detail" : undefined} onClick={() => {
+              if (detailsOpen) { closeDetails(); return; }
+              focusDetailHeading.current = true;
+              setDetailTxId(tx.id);
+            }}><ReviewIcon name="info" /></button>
         </div>
         <div className="tx-secondary">
           <time className="tx-date" dateTime={tx.time ? `${tx.date}T${tx.time}` : tx.date}
-            title={tx.time ? `${tx.date} ${tx.time}` : tx.date}>{tx.date}{tx.time && <span className="tx-time"> {tx.time}</span>}</time>
+            title={tx.time ? `${tx.date} ${tx.time}` : tx.date}>
+            <span>{tx.date}</span>{tx.time && <>{" "}<span className="tx-time">{tx.time}</span></>}
+          </time>
           {tags.length > 0 && <div className="tag-list">
             {tags.slice(0, shownTags).map((tag) => <button type="button" className="tag-chip" title={`#${tag}`} key={tag} onClick={() => setFilter(tag)}>#{tag}</button>)}
             {remainingTags.length > 0 && <ReviewMenu label={`其余标签 · ${payee}`} title={`+${remainingTags.length}`}>{(close) =>
@@ -1082,16 +1168,7 @@ export default function App() {
           {tx.fundingAccount && <code className="merged-funding-account">{tx.fundingAccount}</code>}</> : renderAccountFields(tx, fieldsDisabled, refund)}
       </td>
       <td role="cell" className="tx-decision-cell">
-        <div className="row-decision-head">
-          <span className={`decision-status ${mixedStatus ? "pending" : tx.status}`}>{statusLabel}</span>
-          <button id={`detail-toggle-${tx.id}`} type="button" className="btn small quiet detail-toggle"
-            aria-label={`${detailsLabel} · ${payee}`} title={detailsLabel} aria-expanded={detailsOpen}
-            aria-controls={detailsOpen ? "transaction-detail" : undefined} onClick={() => {
-              if (detailsOpen) { closeDetails(); return; }
-              focusDetailHeading.current = true;
-              setDetailTxId(tx.id);
-            }}>详情</button>
-        </div>
+        {showDecisionStatus && <span className={`decision-status ${mixedStatus ? "pending" : tx.status}`}>{statusLabel}</span>}
         {ready && tx.duplicateOf && <div className="account-hint">人工解除重复</div>}
         {renderPostingActions(tx, rowDisabled, refund, true)}
         {hasDraft && <span className="unsaved-edit">未保存</span>}
@@ -1107,7 +1184,7 @@ export default function App() {
   const reviewNotice = busy && batch ? "处理中…" : reviewIsSaving ? "保存审批中…" : notice;
   return <main className="container">
     <header className="masthead">
-      <a className="masthead-brand" href="#" aria-label="Bean Import · 返回主页" aria-disabled={busy || blockBatchChanges || undefined}
+      <a className="masthead-brand" href={batchUrl("", "")} aria-label="Bean Import · 返回主页" aria-disabled={busy || blockBatchChanges || undefined}
         title={hasReviewDrafts ? "请先保存或放弃交易编辑" : reviewIsSaving ? "保存审批中…" : "返回主页"} onClick={goHome}>
         <img className="brand-mark" src="/bean-import.svg" width="30" height="30" alt="" /><h1>Bean Import</h1>
       </a>
@@ -1117,13 +1194,18 @@ export default function App() {
       </div>
       <div className="masthead-actions">
         <button className="btn help-toggle" aria-expanded={help} onClick={() => setHelp(!help)}>使用说明</button>
-        {settings ? batch && <a className="btn settings-entry" href="#">返回审批</a> :
+        {settings ? routedBatchId && <a className="btn settings-entry" href="#">返回审批</a> :
           <a className="btn settings-entry" href={SETTINGS_LINKS.ledger}>设置</a>}
       </div>
     </header>
     {help && <div className="help-body"><p>上传账单 → 确认账户和分类 → 预览并写入账本。</p><p>重复交易默认不入账。</p></div>}
     {error && !fundingTarget && !mappingTarget && !mergeIds && <div className="card alert" role="alert"><b>操作未完成</b><p>{error}</p><button className="btn small" onClick={() => setError("")}>关闭</button></div>}
-    {fundingTarget && <FundingDialog key={fundingTarget.id} groups={fundingTarget.groups} busy={busy} error={error} onCancel={() => { setFundingTarget(null); setError(""); }} onConfirm={(mappings) => confirmFunding(fundingTarget, mappings)} />}
+    {!settings && fundingTarget && fundingTarget.id === routedBatchId && <FundingDialog key={fundingTarget.id} groups={fundingTarget.groups} busy={busy} error={error}
+      onCancel={() => {
+        setFundingTarget(null);
+        setError("");
+        if (batchId !== fundingTarget.id) navigateBatch("", { replace: true });
+      }} onConfirm={(mappings) => confirmFunding(fundingTarget, mappings)} />}
     {mappingTarget && mappingGroup && <FundingDialog key={mappingTarget.id} mapping groups={[mappingGroup]} busy={busy} error={error}
       initialChoices={mappingGroup.accounts.includes(mappingTarget.fundingAccount) ? { [mappingTarget.id]: mappingTarget.fundingAccount } : {}}
       onCancel={() => { setMappingTarget(null); setError(""); }} onConfirm={([{ account }]) => confirmMapping(mappingTarget, account)} />}
@@ -1150,7 +1232,9 @@ export default function App() {
       settings && <section className="card" aria-busy={busy}><h2>设置</h2><p className="muted">{busy ? "正在读取设置…" : "未能读取设置"}</p></section>}
 
     {!settings && <input ref={fileInput} type="file" accept=".csv,.xlsx,.xls,.pdf" multiple hidden disabled={busy} onChange={(event) => upload(event.target.files)} />}
-    {!settings && !batch && <>
+    {!settings && routedBatchId && batchId !== routedBatchId && fundingTarget?.id !== routedBatchId &&
+      <section className="card" role="status">正在恢复审批…</section>}
+    {!settings && !routedBatchId && !batch && <>
       <section className="card"><div className={`dropzone${dragOver ? " over" : ""}`} role="button" tabIndex={0} aria-label="选择账单文件" aria-disabled={busy} onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") { event.preventDefault(); if (!busy) fileInput.current?.click(); }
       }} onClick={() => { if (!busy) fileInput.current?.click(); }} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={(event) => { event.preventDefault(); setDragOver(false); upload(event.dataTransfer.files); }}><span className="dz-glyph" aria-hidden="true" /><div className="dz-main">{busy ? "正在读取账单…" : "拖入账单，或点击选择文件"}</div><div className="dz-sub">可同时选择多个 CSV / XLSX / PDF · ZIP 请先解压</div></div></section>
@@ -1161,20 +1245,20 @@ export default function App() {
           <div className="batch-actions">
             <button type="button" className={`btn${item.committed ? "" : " primary"}`} disabled={busy}
               aria-label={`${item.committed ? "查看批次" : "继续审批"} · ${item.file}`}
-              onClick={() => openBatch(item.batchId)}>{item.committed ? "查看批次" : "继续审批"}</button>
+              onClick={() => navigateBatch(item.batchId)}>{item.committed ? "查看批次" : "继续审批"}</button>
             {!item.committed && <button type="button" className="btn batch-delete" disabled={busy} aria-label={`删除批次 ${item.file}（${batchTime(item.createdAt)}）`} onClick={() => setDeleteTarget(item)}>删除</button>}
           </div>
         </div>)}</div>}
       </section>
     </>}
 
-    {!settings && batch && <>
+    {!settings && batch && batchId === routedBatchId && <>
       <section className="card review-card">
         <div className="toolbar review-header">
           <h2 id="review-heading">审批交易</h2>
           {!emptyImportFailed && <div className="toolbar review-actions" role="group" aria-label="批次操作">
             <ReviewMenu label="批次操作" title="批次操作">{(close) => <>
-              <button className="menu-action" disabled={busy || blockBatchChanges} onClick={() => { close(); openBatch(batchId, "reload"); }}>重新载入</button>
+              <button className="menu-action" disabled={busy || blockBatchChanges} onClick={() => { close(); reloadBatch(); }}>重新载入</button>
               {!readOnly && <>
                 <button className="menu-action" disabled={editingDisabled || blockBatchChanges || !pendingHigh.length}
                   onClick={() => { close(); saveReviewDecisions(pendingHigh.map((tx) => ({ id: tx.id, account: tx.suggestedAccount, status: "ready" }))); }}>

@@ -3,8 +3,9 @@ import { lstat, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { hasPdfSource, type ParsedTx, type RawTx } from "../../shared/types.js";
 import { parsePdfBank, renderPdfRegions } from "../parsers/pdf.js";
-import type { StoredBatch } from "./batches.js";
+import type { StoredBatch, StoredPdfUpload } from "./batches.js";
 import { ImportError } from "./commit.js";
+import { isStatementFileName, ledgerUploadsDirectory } from "./statement-uploads.js";
 
 const storedPdfName = /^[a-f0-9]{32}\.pdf$/;
 const normalizedPayee = (value: string) => value.normalize("NFKC").replace(/\s/g, "");
@@ -13,9 +14,8 @@ export function createPdfPreviewLoader(uploads: string, maxBytes: number) {
   const recoveredFiles = new Map<string, string>();
   const recoveredRows = new Map<string, Promise<RawTx[]>>();
 
-  async function readMatchingFile(name: string, hash: string) {
-    if (!storedPdfName.test(name)) return undefined;
-    const file = path.join(uploads, name);
+  async function readMatchingFile(directory: string, name: string, hash: string) {
+    const file = path.join(directory, name);
     try {
       const entry = await lstat(file);
       if (!entry.isFile() || entry.size > maxBytes) return undefined;
@@ -28,16 +28,21 @@ export function createPdfPreviewLoader(uploads: string, maxBytes: number) {
     }
   }
 
-  async function locateFile(hash: string, storedName?: string) {
-    const knownName = recoveredFiles.get(hash) ?? storedName;
-    if (knownName) {
-      const match = await readMatchingFile(knownName, hash);
+  async function locateFile(hash: string, ledgerRoot: string, stored?: StoredPdfUpload) {
+    if (stored && typeof stored !== "string") {
+      const name = stored.archiveName;
+      if (typeof name !== "string" || !isStatementFileName(name) || !/\.pdf$/i.test(name)) return undefined;
+      return readMatchingFile(ledgerUploadsDirectory(ledgerRoot), name, hash);
+    }
+    const knownName = recoveredFiles.get(hash) ?? stored;
+    if (knownName && storedPdfName.test(knownName)) {
+      const match = await readMatchingFile(uploads, knownName, hash);
       if (match) return match;
     }
     // Batches created before previews retained only the original file digest.
     for (const entry of await readdir(uploads, { withFileTypes: true })) {
-      if (!entry.isFile() || entry.name === knownName) continue;
-      const match = await readMatchingFile(entry.name, hash);
+      if (!entry.isFile() || entry.name === knownName || !storedPdfName.test(entry.name)) continue;
+      const match = await readMatchingFile(uploads, entry.name, hash);
       if (match) {
         recoveredFiles.set(hash, entry.name);
         return match;
@@ -62,10 +67,10 @@ export function createPdfPreviewLoader(uploads: string, maxBytes: number) {
     return sourceRow?.pdfRegions;
   }
 
-  return async (batch: StoredBatch, tx: ParsedTx) => {
+  return async (batch: StoredBatch, tx: ParsedTx, ledgerRoot: string) => {
     if (!hasPdfSource(tx)) throw new ImportError(404, "这笔交易没有可查看的 PDF 原文。");
     const hash = tx.sourceFileHash!;
-    const original = await locateFile(hash, batch.pdfUploads?.[hash]);
+    const original = await locateFile(hash, ledgerRoot, batch.pdfUploads?.[hash]);
     if (!original) throw new ImportError(404, "找不到最初上传的 PDF。请重新上传原账单。");
     const regions = tx.pdfRegions?.length ? tx.pdfRegions : await recoverRegions(original.file, original.data, tx);
     if (!regions?.length) throw new ImportError(422, "无法定位这笔交易在 PDF 中的位置。请重新上传原账单。");

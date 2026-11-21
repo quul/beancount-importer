@@ -63,7 +63,10 @@ async function json<T>(response: Response): Promise<T> {
   const body: unknown = await response.json().catch(() => undefined);
   if (response.ok && body !== undefined) return body as T;
   if (!response.ok && body && typeof body === "object") {
-    const parsed = body as { error?: unknown; details?: unknown; errors?: unknown };
+    const parsed = body as { code?: unknown; error?: unknown; details?: unknown; errors?: unknown };
+    if (parsed.code === "review_incomplete" && typeof parsed.error === "string") {
+      throw new ApiError(response.status, parsed.error);
+    }
     const describe = (detail: unknown): string => {
       if (typeof detail === "string") return detail;
       if (!detail || typeof detail !== "object") return "";

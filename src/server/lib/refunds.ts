@@ -1,4 +1,5 @@
 import { canFollowPurchaseRefund, isSuspectedDuplicate, type ParsedTx } from "../../shared/types.js";
+import { isFundingAccount } from "../../shared/funding.js";
 import { parseAmount } from "../parsers/common.js";
 import { normalizePaymentMethod, singlePaymentMethod } from "./accounts.js";
 import { sourceKey } from "./dedup.js";
@@ -86,7 +87,7 @@ export function syncWechatRefunds(txs: readonly ParsedTx[]): boolean {
       continue;
     }
 
-    const funded = [purchase.fundingAccount, refund.fundingAccount].every((account) => /^(Assets|Liabilities):/.test(account));
+    const funded = [purchase.fundingAccount, refund.fundingAccount].every(isFundingAccount);
     const status = funded && !isSuspectedDuplicate(refund) ? "ready" : "pending";
     if (following && refund.finalAccount === purchase.finalAccount && refund.status === status) continue;
     refund.finalAccount = purchase.finalAccount;

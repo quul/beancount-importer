@@ -9,7 +9,8 @@ export type SettingsSection = keyof typeof SETTINGS_LINKS;
 function formValues(config: AppConfig) {
   return {
     ledgerRoot: config.ledgerRoot, mainFile: config.mainFile, monthlyDir: config.monthlyDir,
-    pythonPath: config.pythonPath ?? "", annualLayout: config.annualLayout ?? true, assetMapping: config.assetMapping,
+    pythonPath: config.pythonPath ?? "", annualLayout: config.annualLayout ?? true,
+    archiveUploadsInLedger: config.archiveUploadsInLedger ?? true, assetMapping: config.assetMapping,
   };
 }
 
@@ -138,6 +139,14 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
             {pathInput("pythonPath", "Python 路径（可选）", "选择文件")}
           </div>
           <label className="check-label"><input type="checkbox" checked={values.annualLayout} onChange={(event) => setValues({ ...values, annualLayout: event.target.checked })} />按年度目录和 include 链写入</label>
+          <label className="settings-switch">
+            <span>
+              <span id="archive-uploads-label">账单副本随账本保存</span>
+              <small id="archive-uploads-location">{values.archiveUploadsInLedger ? <>账本目录下的 <code>uploads</code></> : "应用的上传目录"}</small>
+            </span>
+            <input type="checkbox" role="switch" aria-labelledby="archive-uploads-label" aria-describedby="archive-uploads-location"
+              checked={values.archiveUploadsInLedger} onChange={(event) => setValues({ ...values, archiveUploadsInLedger: event.target.checked })} />
+          </label>
           <div className="toolbar settings-actions">
             <button type="button" className="btn primary" onClick={() => void save()} disabled={picking !== null || !values.ledgerRoot.trim() || !values.mainFile.trim()}>保存账本设置</button>
           </div>

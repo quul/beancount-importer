@@ -1,4 +1,5 @@
-import { transactionPostings, validateTransaction } from "../../src/shared/postings.js";
+import { isFundingAccount } from "../../src/shared/funding.js";
+import { fundingPostingSign, transactionPostings, validateTransaction } from "../../src/shared/postings.js";
 import { activeTransactions } from "../../src/shared/transactionMerge.js";
 import { canFollowPurchaseRefund, isSuspectedDuplicate, type ParsedTx, type TxDecision, type TxStatus } from "../../src/shared/types.js";
 
@@ -14,14 +15,14 @@ export interface ReviewRow {
   amount: number;
 }
 
-const fundingAccountPattern = /^(Assets|Liabilities):/;
+const assetOrLiability = /^(Assets|Liabilities):/;
 
 function usesSingleFundingAccount(tx: ParsedTx): boolean {
-  if (!fundingAccountPattern.test(tx.fundingAccount) || tx.fundingAccount2) return false;
+  if (!isFundingAccount(tx.fundingAccount) || tx.fundingAccount2) return false;
   if (!tx.postings) return true;
-  const funding = tx.postings.filter((posting) => fundingAccountPattern.test(posting.account));
+  const funding = tx.postings.filter(({ account }) => account === tx.fundingAccount || assetOrLiability.test(account));
   return funding.length === 1 && funding[0].account === tx.fundingAccount
-    && Math.abs(funding[0].amount - (tx.direction === "in" ? tx.amount : -tx.amount)) < 0.005
+    && Math.abs(funding[0].amount - fundingPostingSign(tx) * tx.amount) < 0.005
     && tx.postings.every((posting) => posting.currency === tx.currency);
 }
 

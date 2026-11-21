@@ -19,7 +19,7 @@ export function reusablePaymentMethod(tx: ParsedTx): string {
 }
 
 export const isFundingAccount = (account: string) =>
-  /^(Assets|Liabilities):/.test(account) && !/(?:^|:)(FixMe|Unknown)(?::|$)/i.test(account);
+  /^(Assets|Liabilities|Income):/.test(account) && !/(?:^|:)(FixMe|Unknown)(?::|$)/i.test(account);
 
 export const hasFundingPosting = (tx: ParsedTx) =>
   !tx.postings || (Boolean(tx.fundingAccount) && tx.postings.some(({ account }) => account === tx.fundingAccount));

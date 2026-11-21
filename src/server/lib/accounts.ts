@@ -113,7 +113,7 @@ export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: Le
 function matchFundingAccount(raw: string, tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo): FundingGuess {
   const available = ledger?.accounts;
   const valid = (name: string) => {
-    if (!/^(Assets|Liabilities):/.test(name)) return false;
+    if (!isFundingAccount(name)) return false;
     if (!available) return true; // Explicit mappings are validated at generation too.
     const a = available.find((entry) => entry.account === name);
     return !!a && accountIsActive(a, tx.date, tx.currency);
@@ -145,14 +145,14 @@ function matchFundingAccount(raw: string, tx: ParsedTx, config: AppConfig, ledge
     if (cardAccounts.length > 1) return unknown("账户映射冲突");
     if (cardAccounts.length === 1) return { account: cardAccounts[0], confidence: 0.98, reason: `卡尾号 ${suffix} 与已保存的信用卡映射一致` };
   }
-  const mappings = config.assetMapping.filter((m) => !m.exact && /^(Assets|Liabilities):/.test(m.account));
+  const mappings = config.assetMapping.filter((m) => !m.exact && isFundingAccount(m.account));
   const dynamic = available ? buildAssetMapping(available, tx.date).filter((m) => valid(m.account)) : [];
   const keywords = (m: AppConfig["assetMapping"][number]) => raw.toLowerCase().includes(m.keyword.toLowerCase());
 
   // Wallet investment products must not fall through to the cash wallet.
   const investment = /零钱通/.test(raw) ? "零钱通" : /余额宝/.test(raw) ? "余额宝" : undefined;
   const eligible = (m: AppConfig["assetMapping"][number]) => keywords(m)
-    && m.account.startsWith(m.kind === "credit" ? "Liabilities:" : "Assets:")
+    && (m.account.startsWith(m.kind === "credit" ? "Liabilities:" : "Assets:") || m.account.startsWith("Income:"))
     && (!investment || m.keyword.includes(investment))
     && (!credit || (m.kind === "credit" && m.account.startsWith("Liabilities:")))
     && (!debit || (m.kind === "debit" && m.account.startsWith("Assets:")))

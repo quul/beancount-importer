@@ -1,8 +1,9 @@
 import { allocationAmountText, amountUnits } from "./categoryAllocations.js";
+import { isFundingAccount } from "./funding.js";
 import { amountText, transactionPostings, validateTransaction } from "./postings.js";
 import { isSuspectedDuplicate, type DraftPosting, type MergedSource, type ParsedTx } from "./types.js";
 
-const fundingAccount = /^(Assets|Liabilities):/;
+const assetOrLiability = /^(Assets|Liabilities):/;
 
 export function activeTransactions(txs: readonly ParsedTx[]): ParsedTx[] {
   const mergedIds = new Set(txs.flatMap((tx) => tx.merge?.originals.map(({ id }) => id) ?? []));
@@ -26,6 +27,8 @@ export function planTransactionMerge(members: readonly ParsedTx[], accounts: Rea
   const warnings: string[] = [];
   const postings: DraftPosting[] = [];
   const totals = new Map<string, bigint>();
+  const funds = new Set<string>();
+  const incomeFundingTotals = new Map<string, bigint>();
   if (members.length < 2) errors.push("请选择至少两笔原交易");
   if (members.some((tx) => tx.merge)) errors.push("先撤销所选交易的现有合并，再选择原交易");
   if (members.some((tx) => tx.refundCounterpartId)) errors.push("已配对的消费和退款按各自的日期记账");
@@ -38,20 +41,27 @@ export function planTransactionMerge(members: readonly ParsedTx[], accounts: Rea
 
   for (const tx of members) {
     const legs = transactionPostings(tx);
+    const funding = legs.filter(({ account }) => assetOrLiability.test(account) || (account === tx.fundingAccount && isFundingAccount(account)));
     const label = `${tx.date} ${tx.payee || "（无商户）"}`;
-    const problem = legs.some(({ account }) => !account) || !legs.some(({ account }) => fundingAccount.test(account))
+    const problem = legs.some(({ account }) => !account) || !funding.length
       ? "请先补齐资金账户和分类账户"
       : validateTransaction(tx, legs)[0];
     if (problem) errors.push(`${label} · ${problem}`);
     else if (legs.some(({ account }) => !accounts.has(account))) errors.push(`${label} · 请重新选择当前账本中的账户`);
     postings.push(...legs);
+    for (const { account, amount, currency } of funding) {
+      if (!amount) continue;
+      funds.add(account);
+      if (!account.startsWith("Income:")) continue;
+      const units = amountUnits(amountText(amount));
+      if (units !== undefined) incomeFundingTotals.set(currency, (incomeFundingTotals.get(currency) ?? 0n) + units);
+    }
     const units = amountUnits(amountText(tx.amount));
     if (units === undefined) errors.push(`${label} · 金额无效`);
     else totals.set(tx.currency, (totals.get(tx.currency) ?? 0n) + (tx.direction === "in" ? units : -units));
   }
 
-  const funds = new Set(postings.filter(({ account, amount }) => amount !== 0 && fundingAccount.test(account)).map(({ account }) => account));
-  const skipsPosting = funds.size === 1 && [...totals.values()].every((units) => units === 0n);
+  const skipsPosting = funds.size === 1 && [...totals.values(), ...incomeFundingTotals.values()].every((units) => units === 0n);
   return { errors: [...new Set(errors)], warnings, postings, skipsPosting, funds: [...funds],
     totals: [...totals].map(([currency, amount]) => ({ currency, amount: Number(allocationAmountText(amount)) })) };
 }

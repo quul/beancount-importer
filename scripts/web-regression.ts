@@ -5,6 +5,7 @@ import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "..
 import { buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch } from "../web/src/reviewRows.js";
 import { LEDGER_DUPLICATE_ISSUE } from "../src/shared/types.js";
 import { planCategoryAllocations, savedCategoryAllocations } from "../src/shared/categoryAllocations.js";
+import { planTransactionMerge } from "../src/shared/transactionMerge.js";
 import type { ParsedTx } from "../src/shared/types.js";
 
 const originalFetch = globalThis.fetch;
@@ -68,6 +69,15 @@ try {
   const metadataBefore = makeDraft(projected);
   assert.deepEqual(draftDecision(rolledBack, { ...metadataBefore, reviewNote: "补充说明" }, metadataBefore),
     { id: refund.id, reviewNote: "补充说明" });
+  const incomplete = { ...refund, fundingAccount: "", finalAccount: "", status: "pending" } satisfies ParsedTx;
+  const selectFunding = reviewPatches([{ id: incomplete.id, funding: "Assets:Wallet" }]);
+  const selectCategory = reviewPatches([{ id: incomplete.id, account: "Expenses:Food" }]);
+  assert.equal(applyPendingReviewPatches([incomplete], [selectFunding, selectCategory])[0].status, "ready");
+  const [withoutFunding] = applyPendingReviewPatches([incomplete], [selectCategory]);
+  assert.equal(withoutFunding.status, "pending");
+  assert.equal(withoutFunding.finalAccount, "Expenses:Food");
+  const approve = reviewPatches([{ id: incomplete.id, status: "ready" }]);
+  assert.equal(applyPendingReviewPatches([incomplete], [selectCategory, approve])[0].status, "pending");
   console.log("✓ rolling back a queued edit keeps later choices and does not resubmit untouched draft fields");
 
   const purchase = { ...refund, id: "purchase", eventType: "expense", direction: "out", date: "2026-09-13", amount: 100,
@@ -90,6 +100,17 @@ try {
   assert.deepEqual(savedCategoryAllocations({ ...expense, postings: signedExpense.postings })?.map(({ amount }) => amount), ["0.40", "-0.10", "0.00"]);
   const signedIncome = planCategoryAllocations(income, signed.map((part) => ({ ...part, account: part.account.replace("Expenses:", "Income:") })));
   assert.deepEqual(signedIncome.postings?.map(({ amount }) => amount), [0.30, -0.40, 0.10, 0]);
+  const gift = { ...income, id: "gift", fundingAccount: "Income:Gifts", finalAccount: "Assets:Wallet" };
+  assert.deepEqual(makeDraft(gift).postings.map(({ amount }) => amount), ["0.3", "-0.3"]);
+  const giftPlan = planCategoryAllocations(gift, [{ account: "Assets:Wallet", amount: "0.10" }, { account: "Assets:Bank", amount: "0.20" }]);
+  assert.deepEqual(giftPlan.postings?.map(({ amount }) => amount), [-0.30, 0.10, 0.20]);
+  assert.deepEqual(savedCategoryAllocations({ ...gift, postings: giftPlan.postings }), [{ account: "Assets:Wallet", amount: "0.10" }, { account: "Assets:Bank", amount: "0.20" }]);
+  const giftReceipt = { ...gift, finalAccount: "Expenses:Food", sourceTxId: "gift-receipt", refundCounterpartId: undefined };
+  const giftExpense = { ...giftReceipt, id: "gift-expense", sourceTxId: "gift-expense", eventType: "expense" as const, direction: "out" as const };
+  const giftMerge = planTransactionMerge([giftReceipt, giftExpense], new Set(["Income:Gifts", "Expenses:Food"]));
+  assert.deepEqual(giftMerge.errors, []);
+  assert.deepEqual(giftMerge.funds, ["Income:Gifts"]);
+  assert.equal(giftMerge.skipsPosting, false);
   console.log("✓ signed category allocations reconcile exactly and preserve both posting directions");
   const grouped = buildReviewRows([credit, purchase]);
   assert.equal(grouped.length, 1);
@@ -128,11 +149,15 @@ try {
   assert.deepEqual(buildBulkPostingPlan(needsRefundReview, accounts).approvals, []);
   console.log("✓ bulk decisions honor the scope, keep paired refunds automatic, and leave unresolved rows for review");
 
-  status = 422; nextResponse = { error: "校验未通过", details: [{ file: "fixture.bean", line: 12, message: "账户未开户" }] };
+  status = 422;
+  const reviewReminder = "请将待确认内容处理完毕后，再点击「生成预览」。";
+  nextResponse = { code: "review_incomplete", error: reviewReminder, errors: ["微信支付账单.xlsx:50 请选择转账对方账户"] };
+  await assert.rejects(() => api.generate("batch", 8), (error: unknown) => error instanceof ApiError && error.status === 422 && error.message === reviewReminder);
+  nextResponse = { error: "校验未通过", details: [{ file: "fixture.bean", line: 12, message: "账户未开户" }] };
   await assert.rejects(() => api.generate("batch", 8), (error: unknown) => error instanceof ApiError && error.status === 422 && /fixture.bean:12/.test(error.message) && /账户未开户/.test(error.message));
   status = 409; nextResponse = { error: "版本已更新" };
   await assert.rejects(() => api.decide("batch", 1, []), (error: unknown) => error instanceof ApiError && error.status === 409);
-  console.log("✓ stale revisions and native validation details stay visible to reviewers");
+  console.log("✓ preview review failures are concise while stale revisions and native validation details stay visible");
   status = 500; nextResponse = undefined;
   await assert.rejects(() => api.funding("batch", 1), (error: unknown) => error instanceof ApiError && error.temporary);
   nextResponse = { error: "账本读取失败" };

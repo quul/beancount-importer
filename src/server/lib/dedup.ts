@@ -1,6 +1,8 @@
 /** Only durable source identity proves a duplicate; amount matches are review candidates. */
 import type { DraftPosting, LedgerMatch, LedgerTx, ParsedTx } from "../../shared/types.js";
 import { CROSS_SOURCE_ISSUE, ledgerDuplicateReviewIssue, LEDGER_DUPLICATE_ISSUE } from "../../shared/types.js";
+import { isFundingAccount } from "../../shared/funding.js";
+import { fundingPostingSign } from "../../shared/postings.js";
 import { sourceKey } from "../../shared/transactionMerge.js";
 
 export { sourceKey };
@@ -16,8 +18,7 @@ export function looseFingerprint(tx: { date: string; amount: number; direction: 
 export function sourcePriority(source: string): number { return /alipay|wechat/.test(source) ? 3 : source === "yunshanfu" ? 2 : source.startsWith("bank-") ? 1 : 0; }
 export interface DedupResult { txs: ParsedTx[]; stats: { crossSourceDuplicates: number; ledgerDuplicates: number } }
 
-const usableAccount = (account: string) => /^(Assets|Liabilities):/.test(account) && !/FixMe|Unknown/i.test(account);
-const signedAmount = (tx: ParsedTx) => tx.direction === "in" ? tx.amount : -tx.amount;
+const usableAccount = (account: string) => isFundingAccount(account) && !/FixMe|Unknown/i.test(account);
 const sameAmount = (a: number, b: number) => Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) < 0.005;
 const SAME_PAYEE_REASON = "日期、金额、商户相同";
 const OTHER_PAYEE_REASON = "日期、金额相同，商户不同";
@@ -45,7 +46,7 @@ function ledgerSourceKeys(tx: LedgerTx): string[] {
 function ledgerDuplicateCandidates(tx: ParsedTx, ledgerTxs: LedgerTx[], assignedLedger: Set<string>): LedgerMatch[] {
   if (!usableAccount(tx.fundingAccount)) return [];
   const payment = (posting: DraftPosting) => posting.account === tx.fundingAccount && posting.currency === tx.currency;
-  const amount = signedAmount(tx);
+  const amount = fundingPostingSign(tx) * tx.amount;
   const candidates: LedgerMatch[] = [];
   for (const ledger of ledgerTxs) {
     if (assignedLedger.has(ledger.id) || ledger.date !== tx.date) continue;

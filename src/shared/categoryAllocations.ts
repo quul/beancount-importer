@@ -1,4 +1,5 @@
-import { accountPattern, amountText } from "./postings.js";
+import { isFundingAccount } from "./funding.js";
+import { accountPattern, amountText, fundingPostingSign } from "./postings.js";
 import type { CategoryAllocation, DraftPosting, ParsedTx } from "./types.js";
 
 export const MAX_CATEGORY_ALLOCATIONS = 39;
@@ -32,12 +33,12 @@ export function planCategoryAllocations(tx: ParsedTx, allocations: readonly Cate
   let error: string | undefined;
   if (!supportsCategoryAllocations(tx)) error = "请在详情中核对这笔交易的分录";
   else if (target === undefined || target <= 0n || !allocations.length || allocations.length > MAX_CATEGORY_ALLOCATIONS) error = "交易金额或分类数量无效";
-  else if (!/^(Assets|Liabilities):/.test(tx.fundingAccount)) error = "请选择资金账户";
+  else if (!isFundingAccount(tx.fundingAccount)) error = "请选择资金账户";
   else if (allocations.some(({ account }) => !accountPattern.test(account) || account === tx.fundingAccount)) error = "请选择有效的分类账户";
   else if (tx.eventType === "refund" && allocations.some(({ account }) => account.startsWith("Income:"))) error = "退款请冲回原费用";
   else if (amounts.some(({ units, amount }) => units === undefined || amountUnits(amountText(amount)) !== units)) error = "请为每个分类填写有效金额";
   else if (remaining !== 0n) error = "分类金额合计须等于交易金额";
-  const sign = tx.direction === "in" ? 1 : -1;
+  const sign = fundingPostingSign(tx);
   const postings: DraftPosting[] | undefined = error ? undefined : [
     { account: tx.fundingAccount, amount: sign * tx.amount, currency: tx.currency },
     ...allocations.map(({ account }, index) => {
@@ -50,7 +51,7 @@ export function planCategoryAllocations(tx: ParsedTx, allocations: readonly Cate
 
 export function savedCategoryAllocations(tx: ParsedTx): CategoryAllocation[] | undefined {
   if (!supportsCategoryAllocations(tx) || !tx.postings || tx.postings.length < 3) return;
-  const sign = tx.direction === "in" ? 1 : -1;
+  const sign = fundingPostingSign(tx);
   const funding = tx.postings.filter(({ account }) => account === tx.fundingAccount);
   if (funding.length !== 1 || amountText(funding[0].amount) !== amountText(sign * tx.amount)
     || tx.postings.some(({ currency }) => currency !== tx.currency)) return;

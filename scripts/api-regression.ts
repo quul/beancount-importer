@@ -1,5 +1,6 @@
 /** API regression uses disposable ledgers only. Real statements, when supplied, are read-only. */
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -144,6 +145,8 @@ try {
     const importBase = await boot(config, failureData);
     const store = new BatchStore(path.join(failureData, "batches"));
     const uploadDirectory = path.join(failureData, "uploads");
+    const archiveDirectory = path.join(root, "uploads");
+    const previousArchives = fs.readdirSync(archiveDirectory);
     const header = csv().split("\n")[0];
     const unreadable = "2026-01-03 10:00:00,日用百货,测试商店,商品,支出,错误金额,中国银行储蓄卡(1111),交易成功,unreadable-row";
     const workbook = XLSX.utils.book_new();
@@ -165,6 +168,7 @@ try {
     assert.deepEqual(await request(importBase, "/api/batches"), []);
     assert.deepEqual(store.list(), []);
     assert.deepEqual(fs.readdirSync(uploadDirectory), []);
+    assert.deepEqual(fs.readdirSync(archiveDirectory), previousArchives);
 
     const good = "支付宝-部分交易.csv";
     const mixed = await postStatements(importBase, [
@@ -180,7 +184,8 @@ try {
     assert.ok(imported.txs.every((tx) => tx.sourceFile === good));
     assert.equal(imported.errors.filter(({ row }) => row === 0).length, 2);
     assert.equal(imported.errors.filter(({ row }) => row > 0).length, 1);
-    assert.equal(fs.readdirSync(uploadDirectory).length, 1);
+    assert.deepEqual(fs.readdirSync(uploadDirectory), []);
+    assert.equal(fs.readFileSync(path.join(archiveDirectory, good), "utf8"), `${csv("partial-import")}\n${unreadable}`);
 
     const malformed = { ...imported.txs[2], sourceFile: failedFiles[1][0] };
     const hidden = store.create({ ...imported, file: malformed.sourceFile, txCount: 1, txs: [malformed] });
@@ -192,6 +197,49 @@ try {
     assert.ok(store.get(hidden.batchId));
     assert.equal((await request(importBase, `/api/batch/${legacyMixed.batchId}`)).file, good);
     passed("empty and unreadable tabular files create no batches; mixed uploads keep only imported files and their row diagnostics");
+  }
+  {
+    const archiveRoot = path.join(temporary, "statement-archive-ledger");
+    const archiveData = path.join(temporary, "statement-archive-data");
+    fs.mkdirSync(archiveRoot);
+    fs.writeFileSync(path.join(archiveRoot, "main.bean"), definitions);
+    const archiveBase = await boot({ ...config, ledgerRoot: archiveRoot }, archiveData);
+    const directory = path.join(archiveRoot, "uploads");
+    const staged = path.join(archiveData, "uploads");
+    const filename = "支付宝-测试账单.csv", first = csv("archive-original"), second = csv("archive-collision");
+    const suffix = createHash("sha256").update(second).digest("hex").slice(-4);
+    assert.equal((await request(archiveBase, "/api/config")).archiveUploadsInLedger, true);
+    await upload(archiveBase, first, filename);
+    await Promise.all([upload(archiveBase, second, filename), upload(archiveBase, second, filename)]);
+    assert.equal(fs.readFileSync(path.join(directory, filename), "utf8"), first);
+    for (const name of [`支付宝-测试账单-${suffix}.csv`, `支付宝-测试账单-2-${suffix}.csv`]) {
+      assert.equal(fs.readFileSync(path.join(directory, name), "utf8"), second);
+    }
+    assert.deepEqual(fs.readdirSync(staged), []);
+    await request(archiveBase, "/api/config", { archiveUploadsInLedger: "false" }, 400);
+    const saved = await request(archiveBase, "/api/config", { archiveUploadsInLedger: false });
+    assert.equal(saved.archiveUploadsInLedger, false);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(archiveRoot, ".beancount-importer.json"), "utf8")).archiveUploadsInLedger, false);
+    const applicationCopy = csv("application-copy");
+    await upload(archiveBase, applicationCopy, "支付宝-关闭归档.csv");
+    assert.equal(fs.readdirSync(directory).length, 3);
+    const internalFiles = fs.readdirSync(staged);
+    assert.equal(internalFiles.length, 1);
+    assert.match(internalFiles[0], /^[a-f0-9]{32}\.csv$/);
+    assert.equal(fs.readFileSync(path.join(staged, internalFiles[0]), "utf8"), applicationCopy);
+
+    const nextRoot = path.join(temporary, "new-archive-ledger");
+    fs.mkdirSync(nextRoot);
+    fs.writeFileSync(path.join(nextRoot, "main.bean"), definitions);
+    fs.writeFileSync(path.join(nextRoot, "uploads"), "existing file");
+    assert.equal((await request(archiveBase, "/api/config", { ledgerRoot: nextRoot })).archiveUploadsInLedger, true);
+    const failed = await postStatements(archiveBase, [[filename, first]]);
+    assert.equal(failed.status, 422);
+    assert.match((await failed.json()).details[0], /无法保存账单副本/);
+    assert.deepEqual(await request(archiveBase, "/api/batches"), []);
+    assert.deepEqual(fs.readdirSync(staged), internalFiles);
+    assert.equal((await request(archiveBase, "/api/config", { ledgerRoot: archiveRoot })).archiveUploadsInLedger, false);
+    passed("statement archives preserve filenames, resolve concurrent collisions, and use the saved preference of each ledger");
   }
   {
     const pdfRoot = path.join(temporary, "pdf-statements");
@@ -299,8 +347,13 @@ try {
     }
     const pdfStore = new BatchStore(path.join(temporary, "pdf-data", "batches"));
     const savedPdfBatch = pdfStore.get(creditSample.batchId)!;
-    assert.ok(savedPdfBatch.pdfUploads?.[continued.sourceFileHash!]);
+    assert.deepEqual(savedPdfBatch.pdfUploads?.[continued.sourceFileHash!], { archiveName: "card-statement.pdf" });
     assert.equal("pdfUploads" in creditSample, false);
+    const ledgerPdfDirectory = path.join(pdfRoot, "uploads");
+    const pdfUploadsDirectory = path.join(temporary, "pdf-data", "uploads");
+    assert.deepEqual(fs.readFileSync(path.join(ledgerPdfDirectory, "card-statement.pdf")), Buffer.from(citicPdf));
+    assert.deepEqual(fs.readdirSync(pdfUploadsDirectory), []);
+    fs.writeFileSync(path.join(pdfUploadsDirectory, `${"a".repeat(32)}.pdf`), citicPdf);
     const legacy = pdfStore.create({ file: creditSample.file, source: creditSample.source, txCount: 1,
       txs: [{ ...continued, pdfRegions: undefined }], errors: [], accountsDetected: [], ledgerProfile: savedPdfBatch.ledgerProfile });
     const restoredPreview = await request(pdfBase, previewOf(legacy.batchId, continued.id));
@@ -313,13 +366,14 @@ try {
     passed("source screenshots crop the selected transaction across pages, recover older batches and honor ledger boundaries");
 
     const beforeBroken = await request(pdfBase, "/api/batches");
-    const pdfUploadsDirectory = path.join(temporary, "pdf-data", "uploads");
     const beforeUploads = fs.readdirSync(pdfUploadsDirectory);
+    const beforeArchives = fs.readdirSync(ledgerPdfDirectory);
     const broken = await postStatements(pdfBase, [["损坏.pdf", Buffer.from("%PDF-1.7\ntruncated PDF")]]);
     assert.equal(broken.status, 422);
     assert.deepEqual(await broken.json(), { error: "未导入任何账单。", details: ["损坏.pdf：这份 PDF 无法打开。请重新下载原账单后上传。"] });
     assert.deepEqual(await request(pdfBase, "/api/batches"), beforeBroken);
     assert.deepEqual(fs.readdirSync(pdfUploadsDirectory), beforeUploads);
+    assert.deepEqual(fs.readdirSync(ledgerPdfDirectory), beforeArchives);
     const old = pdfStore.create({ file: "old.pdf", source: "bank-generic", txs: [], txCount: 0, accountsDetected: [],
       ledgerProfile: profileId(pdfRoot, "main.bean"), errors: [
         { row: 0, message: "old.pdf：PDF 解析失败：Promise.withResolvers is not a function" },
@@ -341,6 +395,13 @@ try {
       assert.match(String(log[0]?.[1]), /internal-only-missing/);
     } finally { console.error = originalLog; }
     passed("unreadable PDFs and older batches give re-upload guidance while runtime details stay in the server log");
+
+    await request(pdfBase, "/api/config", { archiveUploadsInLedger: false });
+    const internal = await upload(pdfBase, await generic.save(), "应用目录.pdf");
+    assert.equal(typeof pdfStore.get(internal.batchId)!.pdfUploads?.[internal.txs[0].sourceFileHash!], "string");
+    assert.equal((await request(pdfBase, previewOf(internal.batchId, internal.txs[0].id))).screenshots.length, 1);
+    assert.deepEqual((await request(pdfBase, previewOf(creditSample.batchId, continued.id))).screenshots, body.screenshots);
+    passed("PDF previews read their saved copy after the ledger archive setting changes");
   }
   {
     const statusData = path.join(temporary, "status-only-data");
@@ -399,6 +460,74 @@ try {
     });
     assert.deepEqual(updated.changes.txs.map((tx: ParsedTx) => [tx.id, tx.finalAccount]), [[id, newAccount]]);
     passed("compact approval remains current when an included account definition changes");
+  }
+  {
+    const approvalData = path.join(temporary, "approval-accounts");
+    const approvalBase = await boot(config, approvalData);
+    const store = new BatchStore(path.join(approvalData, "batches"));
+    const funding = "Assets:CN:BOC:1111", category = "Expenses:Food:Meals:Dine";
+    const fixture: ParsedTx = { ...batch.txs[0], status: "pending", fundingAccount: "", finalAccount: "", suggestedAccount: "" };
+    const txs: ParsedTx[] = [
+      { ...fixture, id: "unfunded", finalAccount: category },
+      { ...fixture, id: "unclassified", fundingAccount: funding },
+      { ...fixture, id: "categorized-later" },
+      { ...fixture, id: "explicit-postings", postings: [
+        { account: funding, amount: -fixture.amount, currency: fixture.currency },
+        { account: category, amount: fixture.amount, currency: fixture.currency },
+      ] },
+    ];
+    const saved = store.create({ file: "approval-accounts.csv", source: "alipay", txs, txCount: txs.length, errors: [], accountsDetected: [],
+      ledgerProfile: profileId(root, "main.bean") });
+    const route = `/api/batch/${saved.batchId}/decide`;
+    const unfunded = await request(approvalBase, route, { revision: saved.revision, decisions: [
+      { id: "explicit-postings", status: "ready" }, { id: "unfunded", status: "ready" },
+    ] }, 422);
+    assert.equal(unfunded.error, "请先选择资金账户");
+    assert.equal(store.get(saved.batchId)!.txs[3].status, "pending");
+    const unclassified = await request(approvalBase, route, { revision: saved.revision, decisions: [{ id: "unclassified", status: "ready" }] }, 422);
+    assert.equal(unclassified.error, "请先选择分类账户");
+    const savedCategory = await request(approvalBase, route, { revision: saved.revision, decisions: [
+      { id: "categorized-later", account: category }, { id: "unclassified", account: category }, { id: "explicit-postings", status: "ready" },
+    ], changesOnly: true });
+    assert.deepEqual(savedCategory.changes.txs.map((tx: ParsedTx) => [tx.id, tx.status, tx.finalAccount]), [
+      ["unclassified", "ready", category], ["categorized-later", "pending", category], ["explicit-postings", "ready", ""],
+    ]);
+    const completed = await request(approvalBase, route, { revision: savedCategory.revision, decisions: [
+      { id: "categorized-later", funding, status: "ready" },
+    ], changesOnly: true });
+    assert.equal(completed.changes.txs[0].status, "ready");
+    passed("approval checks posting accounts before saving and keeps a category selected without funding");
+  }
+  {
+    const giftRoot = path.join(temporary, "income-funding-ledger");
+    const giftData = path.join(temporary, "income-funding-data");
+    const income = "Income:Gifts", wallet = "Assets:CN:BOC:1111";
+    const giftDefinitions = `${definitions}2025-01-01 open ${income} CNY\n`;
+    fs.mkdirSync(giftRoot);
+    fs.writeFileSync(path.join(giftRoot, "main.bean"), giftDefinitions);
+    const giftBase = await boot({ ...config, ledgerRoot: giftRoot }, giftData);
+    const header = "交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号";
+    const row = (payment: string, id: string) => `2026-11-06 12:00:00,微信红包,发送人,红包,收入,12.34,${payment},已存入零钱,${id}`;
+    const file = "微信支付红包.csv";
+    const gift = await upload(giftBase, `${header}\n${row("/", "gift-source")}`, file);
+    const tx = gift.txs[0], route = `/api/batch/${gift.batchId}`;
+    assert.equal(tx.eventType, "income");
+    assert.equal(tx.fundingAccount, "");
+    const reviewed = await request(giftBase, `${route}/decide`, {
+      revision: gift.revision, decisions: [{ id: tx.id, funding: income, account: wallet, status: "ready" }],
+    });
+    assert.equal(reviewed.batch.txs[0].fundingAccount, income);
+    const preview = await request(giftBase, `${route}/generate`, { revision: reviewed.revision });
+    const parsed = parseLedgerText(giftDefinitions + preview.entries, python);
+    assert.deepEqual(parsed.errors, []);
+    assert.deepEqual(parsed.transactions[0].postings, [
+      { account: income, amount: -12.34, currency: "CNY" }, { account: wallet, amount: 12.34, currency: "CNY" },
+    ]);
+    const mapping = { keyword: "红包收入凭据", account: income, source: "wechat", kind: "debit" };
+    await request(giftBase, "/api/config", { assetMapping: [...config.assetMapping, mapping] });
+    const mapped = await upload(giftBase, `${header}\n${row("红包收入凭据", "gift-mapped")}`, file);
+    assert.equal(mapped.txs[0].fundingAccount, income);
+    passed("an income account can fund a red-envelope receipt and its saved mapping can be reused");
   }
   {
     const splitRoot = path.join(temporary, "category-allocations");
@@ -705,6 +834,8 @@ try {
     assert.deepEqual(resumed.config.assetMapping, splitConfig.assetMapping);
     assert.deepEqual(await request(splitBase, `${route}/funding`, { revision: 4 }), { groups: [] });
     const preview = await request(splitBase, `${route}/generate`, { revision: 4 }, 422);
+    assert.equal(preview.code, "review_incomplete");
+    assert.equal(preview.error, "请将待确认内容处理完毕后，再点击「生成预览」。");
     assert.ok(preview.errors.some((error: string) => error.includes("请拆分组合支付")));
     passed("combined payment defaults work on import and resume while preserving review and split validation");
   }

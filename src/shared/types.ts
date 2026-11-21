@@ -255,6 +255,8 @@ export interface AppConfig {
   pythonPath?: string;
   /** Real ledgers use years/YYYY/imported and the annual include chain. */
   annualLayout?: boolean;
+  /** Store new statement copies in uploads under the ledger directory. Defaults to true. */
+  archiveUploadsInLedger?: boolean;
   /** keyword → account mapping, supports multiple cards per bank */
   assetMapping: Array<{
     /** match keyword against raw payment-method text */
