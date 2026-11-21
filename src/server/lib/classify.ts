@@ -3,24 +3,79 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AppConfig, LedgerInfo, ParsedTx } from "../../shared/types.js";
 import { accountIsActive } from "./accounts.js";
+import { atomicJson, profileId } from "./batches.js";
+import { acquireWriteLock, ImportError } from "./commit.js";
 
 export interface MemoryStore { mapping: Record<string, string> }
 export interface ClassifyOutcome { account: string; confidence: number; reason: string }
 
-export function loadMemory(file: string): MemoryStore {
-  try {
-    const value = JSON.parse(fs.readFileSync(file, "utf-8"));
-    return { mapping: value && typeof value === "object" && !Array.isArray(value) ? value : {} };
-  } catch { return { mapping: {} }; }
+const MEMORY_FILENAME = ".beancount-importer-memory.json";
+type Mapping = MemoryStore["mapping"];
+type MemoryLocation = { file: string; entry: string; legacyFile: string };
+
+export function classificationMemoryLocation(dataDir: string, ledgerRoot: string, mainFile: string): MemoryLocation {
+  const root = path.resolve(ledgerRoot);
+  const entry = path.relative(root, path.resolve(root, mainFile)).split(path.sep).join("/");
+  return { file: path.join(root, MEMORY_FILENAME), entry, legacyFile: path.join(dataDir, "profiles", profileId(root, mainFile), "memory.json") };
 }
 
-export function saveMemory(file: string, mem: MemoryStore) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(mem.mapping, null, 2), { encoding: "utf-8", mode: 0o600 });
+function readMemoryJson(file: string): unknown {
+  const entry = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!entry) return undefined;
+  if (!entry.isFile()) throw new Error("分类记忆路径必须是普通文件");
+  return JSON.parse(fs.readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isMapping(value: unknown): value is Mapping {
+  return isRecord(value) && Object.values(value).every((account) => typeof account === "string");
+}
+
+function readLedgerMemory(file: string): Record<string, Mapping> {
+  try {
+    const value = readMemoryJson(file);
+    if (value === undefined) return {};
+    if (isRecord(value) && Object.values(value).every(isMapping)) return value as Record<string, Mapping>;
+  } catch {
+    throw new ImportError(422, `无法读取分类记忆。请检查账本目录中的 ${MEMORY_FILENAME}。`);
+  }
+  throw new ImportError(422, `分类记忆格式无效。请检查账本目录中的 ${MEMORY_FILENAME}。`);
+}
+
+function readLegacyMemory(file: string): Mapping {
+  try {
+    const value = readMemoryJson(file);
+    return isMapping(value) ? value : {};
+  } catch { return {}; }
+}
+
+export function loadMemory(location: MemoryLocation): MemoryStore {
+  const ledgers = readLedgerMemory(location.file);
+  return { mapping: Object.hasOwn(ledgers, location.entry) ? ledgers[location.entry] : readLegacyMemory(location.legacyFile) };
+}
+
+export function saveMemory(location: MemoryLocation, updates: Mapping, { mergeLegacy = false } = {}): MemoryStore {
+  try {
+    const release = acquireWriteLock(`${location.file}.lock`, "分类记忆正在保存，请稍后重试");
+    try {
+      const ledgers = readLedgerMemory(location.file);
+      const current = Object.hasOwn(ledgers, location.entry) ? ledgers[location.entry] : undefined;
+      const legacy = mergeLegacy || !current ? readLegacyMemory(location.legacyFile) : undefined;
+      const mapping = { ...legacy, ...current, ...updates };
+      atomicJson(location.file, { ...ledgers, [location.entry]: mapping });
+      return { mapping };
+    } finally { release(); }
+  } catch (error) {
+    if (error instanceof ImportError) throw error;
+    throw new ImportError(500, "无法保存分类记忆。请检查账本目录的写入权限。");
+  }
 }
 
 function norm(s: string) { return s.replace(/\s+/g, "").toLowerCase(); }
-function normKey(payee: string, category: string) { return `${payee.replace(/\s+/g, "").slice(0, 32)}|${category.slice(0, 24)}`; }
+export function classificationMemoryKey(payee: string, category: string) { return `${payee.replace(/\s+/g, "").slice(0, 32)}|${category.slice(0, 24)}`; }
 function isRefund(tx: ParsedTx) { return tx.eventType === "refund" || (tx.direction === "in" && /退款|退货|退回/.test(`${tx.rawCategory} ${tx.note}`)); }
 function isTransfer(tx: ParsedTx) {
   return tx.eventType === "transfer" || (!isRefund(tx) && /还款|转账|转出|转入|提现|充值|取现|存现/.test(`${tx.payee} ${tx.note} ${tx.rawCategory}`));
@@ -65,7 +120,7 @@ function refundSuggestion(tx: ParsedTx, ledger: LedgerInfo): ClassifyOutcome | n
 
 export function classifyLocal(tx: ParsedTx, mem: MemoryStore, ledger: LedgerInfo): ClassifyOutcome | null {
   if (isRefund(tx)) return refundSuggestion(tx, ledger);
-  for (const [key, confidence] of [[normKey(tx.payee, tx.rawCategory), 0.95], [normKey(tx.payee, ""), 0.9]] as const) {
+  for (const [key, confidence] of [[classificationMemoryKey(tx.payee, tx.rawCategory), 0.95], [classificationMemoryKey(tx.payee, ""), 0.9]] as const) {
     const account = mem.mapping[key];
     if (account && allowed(account, tx, ledger)) return { account, confidence: isTransfer(tx) ? Math.min(confidence, 0.75) : confidence, reason: "已确认的分类记忆" };
   }

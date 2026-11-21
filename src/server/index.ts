@@ -17,7 +17,7 @@ import { discoverPython, LedgerAccessError, parseLedger, parseLedgerAsync, valid
 import { markDuplicates, refreshLedgerDuplicateHints, sourceKey } from "./lib/dedup.js";
 import { matchStatementRefunds, restoreFullRefundPurchases, syncStatementRefunds } from "./lib/refunds.js";
 import { availableReviewUndo, rememberReviewStatusChange, reviewStatuses } from "./lib/review-undo.js";
-import { classifyLocal, classifyWithLlm, loadMemory, saveMemory, suggestRefundsFromBatch } from "./lib/classify.js";
+import { classificationMemoryKey, classificationMemoryLocation, classifyLocal, classifyWithLlm, loadMemory, saveMemory, suggestRefundsFromBatch } from "./lib/classify.js";
 import {
   accountIsActive, confirmFundingAccount, detectAccounts, fundingMappingIssue, inferFundingAccount, isMissingPaymentMethod,
   isPaymentAccountPart, matchFundingAccount, normalizePaymentMethod, setExactFundingMapping, singlePaymentMethod, unallocatedFundingParts,
@@ -246,7 +246,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     }
     return rememberAccountNames(key, parseLedger(root, mainFile, pythonPath, true));
   };
-  const memoryFile = () => path.join(dataDir, "profiles", profile(), "memory.json");
+  const memoryLocation = () => classificationMemoryLocation(dataDir, ledgerRoot(), config.mainFile);
   const app = express();
   app.use(express.json({ limit: "10mb" }));
   const uploads = path.join(dataDir, "uploads");
@@ -395,7 +395,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       for (const id of [...selectedIds].sort()) releases.push(lockBatch(id));
       const selected = mergeInputs(selection);
       const sources = applyStatementNames(statementsForBatches(selected), req.body?.names);
-      const currentLedger = ledger(), memory = loadMemory(memoryFile());
+      const currentLedger = ledger(), memory = loadMemory(memoryLocation());
       const rules = wechatRulesFor(selected.flatMap(({ txs }) => txs));
       const resetReview = (original: ParsedTx): ParsedTx => {
         const tx: ParsedTx = {
@@ -452,7 +452,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       const archiveDirectory = ledgerUploadsDirectory(uploadRoot);
       const uploadProfile = profileId(uploadRoot, uploadConfig.mainFile);
       const currentLedger = parseLedger(uploadRoot, uploadConfig.mainFile, uploadConfig.pythonPath);
-      const memory = loadMemory(path.join(dataDir, "profiles", uploadProfile, "memory.json"));
+      const memory = loadMemory(classificationMemoryLocation(dataDir, uploadRoot, uploadConfig.mainFile));
       const txs: ParsedTx[] = [], errors: ImportPreview["errors"] = [];
       const pdfUploads: Record<string, StoredPdfUpload> = {};
       const instances = new Map<string, number>(), sources = new Set<ImportPreview["source"]>();
@@ -883,7 +883,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const changesOnly = req.body.changesOnly === true;
     const before = changesOnly ? publicBatch(batch).txs.map((tx) => ({ ...tx })) : undefined;
     const previousStatuses = reviewStatuses(active);
-    let memory: ReturnType<typeof loadMemory> | undefined;
+    let memoryUpdates: Record<string, string> | undefined;
     for (const decision of decisions) {
       const tx = txById.get(decision.id)!;
       if (tx.eventType === "refund"
@@ -894,8 +894,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
         else if (tx.fundingAccount2) tx.fundingAccount2 = account;
         tx.finalAccount = account;
         if (/^(Expenses|Income):/.test(account)) {
-          memory ??= loadMemory(memoryFile());
-          memory.mapping[`${tx.payee.replace(/\s+/g, "").slice(0, 32)}|${tx.rawCategory.slice(0, 24)}`] = account;
+          memoryUpdates ??= {};
+          memoryUpdates[classificationMemoryKey(tx.payee, tx.rawCategory)] = account;
         }
       }
       if (decision.funding !== undefined) confirmFundingAccount(tx, decision.funding);
@@ -918,8 +918,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const undoAction = decisions.every(({ status }) => status === "ready") ? "approve"
       : decisions.every(({ status }) => status === "excluded") ? "exclude" : "update";
     rememberReviewStatusChange(batch, active, previousStatuses, undoAction, sessionId);
+    if (memoryUpdates) saveMemory(memoryLocation(), memoryUpdates);
     saveBatchRevision(batch);
-    if (memory) saveMemory(memoryFile(), memory);
     const reviewed = publicReviewBatch(batch);
     const result = { ok: true, revision: reviewed.revision, ready: reviewed.parseStats.ready, reviewUndo: reviewed.reviewUndo };
     if (before) {

@@ -38,6 +38,8 @@ $env:ACCOUNT_IMPORT_LEDGER_ROOT = 'D:\账本'
 pnpm start
 ```
 
+分类记忆保存在账本根目录的 `.beancount-importer-memory.json`，按主入口的相对路径区分，可以随账本目录同步。账本中尚无对应记忆时，程序会读取旧项目数据目录中的记忆，并在首次保存分类时迁移。
+
 写入格式默认按年度组织：
 
 ```text

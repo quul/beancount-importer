@@ -16,6 +16,7 @@ import { parsePdfBank } from "../src/server/parsers/pdf.js";
 import { loadPdfRules } from "../src/server/parsers/pdf-rules.js";
 import { discoverPython, parseLedger, parseLedgerText } from "../src/server/lib/ledger.js";
 import { BatchStore, profileId } from "../src/server/lib/batches.js";
+import { classificationMemoryKey, classificationMemoryLocation, saveMemory } from "../src/server/lib/classify.js";
 import { markDuplicates } from "../src/server/lib/dedup.js";
 import type { AppConfig, ImportPreview, ParsedTx } from "../src/shared/types.js";
 
@@ -542,6 +543,58 @@ try {
     ], changesOnly: true });
     assert.equal(completed.changes.txs[0].status, "ready");
     passed("approval checks posting accounts before saving and keeps a category selected without funding");
+  }
+  {
+    const memoryRoot = path.join(temporary, "classification-ledger");
+    const memoryData = path.join(temporary, "classification-data");
+    const ledgerEntry = "main.bean";
+    const legacyAccount = "Expenses:Food:Meals:Dine", reviewedAccount = "Expenses:Food:Snacks";
+    const key = classificationMemoryKey("测试餐厅", "餐饮美食");
+    const extraKey = classificationMemoryKey("旧商户", "餐饮美食");
+    const legacy = { [key]: legacyAccount, [extraKey]: legacyAccount };
+    const otherEntry = { "other.bean": { [key]: legacyAccount } };
+    const memoryDefinitions = definitions + `2025-01-01 open ${reviewedAccount} CNY\n`;
+    fs.mkdirSync(memoryRoot);
+    fs.writeFileSync(path.join(memoryRoot, ledgerEntry), memoryDefinitions);
+    const memory = classificationMemoryLocation(memoryData, memoryRoot, ledgerEntry);
+    fs.mkdirSync(path.dirname(memory.legacyFile), { recursive: true });
+    fs.writeFileSync(memory.legacyFile, JSON.stringify(legacy));
+    fs.writeFileSync(memory.file, JSON.stringify(otherEntry));
+
+    const memoryBase = await boot({ ...config, ledgerRoot: memoryRoot }, memoryData);
+    const imported = await upload(memoryBase, csv("legacy-classification"));
+    assert.equal(imported.txs[0].suggestedAccount, legacyAccount);
+    assert.equal(imported.txs[0].reason, "已确认的分类记忆");
+    await request(memoryBase, `/api/batch/${imported.batchId}/decide`, {
+      revision: imported.revision, decisions: [{ id: imported.txs[0].id, account: reviewedAccount }],
+    });
+    const expected = { ...legacy, [key]: reviewedAccount };
+    assert.deepEqual(JSON.parse(fs.readFileSync(memory.file, "utf8")), { ...otherEntry, [ledgerEntry]: expected });
+    assert.deepEqual(saveMemory(memory, {}, { mergeLegacy: true }).mapping, expected);
+    assert.deepEqual(JSON.parse(fs.readFileSync(memory.legacyFile, "utf8")), legacy);
+
+    const syncedRoot = path.join(temporary, "synced-classification-ledger");
+    const syncedData = path.join(temporary, "synced-classification-data");
+    fs.mkdirSync(syncedRoot);
+    fs.copyFileSync(path.join(memoryRoot, ledgerEntry), path.join(syncedRoot, ledgerEntry));
+    const syncedMemory = classificationMemoryLocation(syncedData, syncedRoot, ledgerEntry);
+    fs.copyFileSync(memory.file, syncedMemory.file);
+    const syncedBase = await boot({ ...config, ledgerRoot: syncedRoot }, syncedData);
+    const synced = await upload(syncedBase, csv("synced-classification"));
+    assert.equal(synced.txs[0].suggestedAccount, reviewedAccount);
+    assert.equal(synced.txs[0].reason, "已确认的分类记忆");
+    assert.equal(fs.existsSync(syncedMemory.legacyFile), false);
+
+    const damaged = '{"main.bean":';
+    fs.writeFileSync(syncedMemory.file, damaged);
+    const syncedRoute = `/api/batch/${synced.batchId}`;
+    const failed = await request(syncedBase, syncedRoute + "/decide", {
+      revision: synced.revision, decisions: [{ id: synced.txs[0].id, account: legacyAccount }],
+    }, 422);
+    assert.match(failed.error, /\.beancount-importer-memory\.json/);
+    assert.equal((await request(syncedBase, syncedRoute)).revision, synced.revision);
+    assert.equal(fs.readFileSync(syncedMemory.file, "utf8"), damaged);
+    passed("classification memory migrates safely, follows the ledger and keeps entry files isolated");
   }
   {
     const giftRoot = path.join(temporary, "income-funding-ledger");
