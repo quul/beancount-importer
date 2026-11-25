@@ -1,5 +1,7 @@
 import type { ParsedTx, TxDecision } from "../../src/shared/types.js";
+import { reviewStatusPatch } from "../../src/shared/exclusions.js";
 import { missingPostingAccount, statusAfterCategorization } from "../../src/shared/postings.js";
+import { needsCnySettlement } from "../../src/shared/settlement.js";
 
 type ReviewPatch = (tx: ParsedTx, rows: ReadonlyMap<string, ParsedTx>) => Partial<ParsedTx>;
 export type ReviewPatches = ReadonlyMap<string, ReviewPatch>;
@@ -17,13 +19,13 @@ export function reviewPatches(decisions: readonly TxDecision[]): Map<string, Rev
       const updated = { ...fields };
       if (account !== undefined && tx.fundingAccount2 && !tx.postings) updated.fundingAccount2 = account;
       const edited = { ...tx, ...updated };
-      const nextStatus = status === "ready" && missingPostingAccount(edited) ? undefined
+      const nextStatus = status === "ready" && (needsCnySettlement(edited) || missingPostingAccount(edited)) ? undefined
         : status ?? (account === undefined ? undefined : statusAfterCategorization(edited));
       const manualRefund = tx.eventType === "refund"
         && (account !== undefined || status !== undefined);
       return {
         ...updated,
-        ...(nextStatus !== undefined && { status: nextStatus }),
+        ...(nextStatus !== undefined && reviewStatusPatch(tx, nextStatus)),
         ...(nextStatus !== undefined && nextStatus !== "duplicate" && { duplicateOf: undefined }),
         ...(manualRefund && { refundReviewMode: "manual" }),
       };

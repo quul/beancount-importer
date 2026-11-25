@@ -13,6 +13,7 @@ import type { RawTx, SourceType } from "../../shared/types.js";
 import {
   col,
   findHeader,
+  normalizeStatementCurrency,
   parseAmount,
   parseDate,
   readSheet,
@@ -237,7 +238,7 @@ export function parseBank(file: string, def: BankDef): ParseResult {
       time: dateParsed.time,
       amount: Math.abs(amount),
       direction,
-      currency: /人民币|RMB/.test(cell(iCurrency)) ? "CNY" : cell(iCurrency) || "CNY",
+      currency: normalizeStatementCurrency(cell(iCurrency)),
       payee,
       note: cell(iNote),
       rawCategory: cell(iNote).slice(0, 40),

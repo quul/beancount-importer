@@ -99,7 +99,7 @@ def run(request):
         load_started = time.time_ns()
         entries, errors, options = loader._uncached_load_file(filename, None, None, None)
     else:
-        entries, errors, _ = loader.load_string(request["text"])
+        entries, errors, options = loader.load_string(request["text"])
 
     diagnostics = [
         {"file": error.source.get("filename"), "line": error.source.get("lineno"), "message": error.message, "type": type(error).__name__}
@@ -108,6 +108,7 @@ def run(request):
     result = {"ok": not diagnostics, "loader": "beancount-native", "errors": diagnostics}
     if request["operation"] == "validate":
         return result
+    result["operatingCurrencies"] = options.get("operating_currency", [])
     if "file" in request and request.get("trackAccountSources") and not errors:
         sources = account_sources(filename, options, load_started)
         if sources:

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import { hasPdfSource, type ParsedTx, type RawTx } from "../../shared/types.js";
+import { originalForeignAmount } from "../../shared/settlement.js";
 import { parsePdfBank, renderPdfRegions } from "../parsers/pdf.js";
 import type { StoredBatch, StoredPdfUpload } from "./batches.js";
 import { ImportError } from "./commit.js";
@@ -60,9 +61,13 @@ export function createPdfPreviewLoader(uploads: string, maxBytes: number) {
       recoveredRows.set(key, pending);
     }
     const rows = await pending;
-    const sourceRow = rows.find((row) => row.row === tx.row && row.date === tx.date && row.time === tx.time
-      && row.amount === tx.amount && row.direction === tx.direction && row.currency === tx.currency
-      && normalizedPayee(row.payee) === normalizedPayee(tx.payee));
+    const sourceRow = rows.find((row) => {
+      if (row.row !== tx.row || row.date !== tx.date || row.time !== tx.time || row.direction !== tx.direction
+        || normalizedPayee(row.payee) !== normalizedPayee(tx.payee)) return false;
+      if (row.amount === tx.amount && row.currency === tx.currency) return true;
+      const original = tx.cnySettlement && originalForeignAmount(row);
+      return original && original.amount === tx.originalAmount?.amount && original.currency === tx.originalAmount.currency;
+    });
     if (!sourceRow?.pdfRegions?.length) recoveredRows.delete(key);
     return sourceRow?.pdfRegions;
   }

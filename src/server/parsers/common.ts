@@ -12,6 +12,14 @@ import { validDate } from "../../shared/postings.js";
 
 export const UNREADABLE_TRANSACTION = "日期或金额无法解析";
 
+export function normalizeStatementCurrency(value: string): string {
+  const raw = value.normalize("NFKC").trim().toUpperCase();
+  if (/人民币|RMB|^CN¥$/.test(raw)) return "CNY";
+  if (/^(?:美元|美金|US\$)$/.test(raw)) return "USD";
+  if (/^(?:日元|日圆|日本円)$/.test(raw)) return "JPY";
+  return raw || "CNY";
+}
+
 export function isParsedStatementRow({ date, amount, excludedReason }: RawTx): boolean {
   return validDate(date) && Number.isFinite(amount) && excludedReason !== UNREADABLE_TRANSACTION;
 }

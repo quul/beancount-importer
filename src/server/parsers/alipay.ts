@@ -12,14 +12,14 @@ const requiredColumns = {
 };
 
 interface TimedRow { tx: RawTx; timestamp: number }
-const walletTransferWindowMs = 30_000;
+export const alipayWalletExclusion = { title: "支付宝余额转入余额宝", receiptWindowSeconds: 30 };
 
 function excludePairedWalletTransfers(transfers: TimedRow[], receiptsByAmount: Map<number, TimedRow[]>) {
   const candidates = new Map<RawTx, TimedRow[]>();
   const transferCounts = new Map<RawTx, number>();
   for (const { tx, timestamp } of transfers) {
     const receipts = (receiptsByAmount.get(tx.amount) ?? []).filter((receipt) =>
-      receipt.timestamp < timestamp && timestamp - receipt.timestamp <= walletTransferWindowMs);
+      receipt.timestamp < timestamp && timestamp - receipt.timestamp <= alipayWalletExclusion.receiptWindowSeconds * 1000);
     candidates.set(tx, receipts);
     for (const receipt of receipts) {
       transferCounts.set(receipt.tx, (transferCounts.get(receipt.tx) ?? 0) + 1);
@@ -28,7 +28,7 @@ function excludePairedWalletTransfers(transfers: TimedRow[], receiptsByAmount: M
   for (const [tx, receipts] of candidates) {
     if (receipts.length !== 1 || transferCounts.get(receipts[0].tx) !== 1) continue;
     tx.eventType = "transfer";
-    tx.excludedReason = "支付宝余额转入余额宝";
+    tx.excludedReason = alipayWalletExclusion.title;
     tx.issues = tx.issues?.filter((issue) => issue !== "收支待确认");
   }
 }

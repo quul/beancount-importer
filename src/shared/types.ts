@@ -1,3 +1,5 @@
+import { needsCnySettlement } from "./settlement.js";
+
 /**
  * Shared types between server and web UI.
  */
@@ -22,6 +24,31 @@ export interface DraftPosting {
   account: string;
   amount: number;
   currency: string;
+}
+
+export interface OriginalAmount {
+  amount: number;
+  currency: string;
+}
+
+export interface CnyRepayment {
+  key: string;
+  batchId: string;
+  txId: string;
+  date: string;
+  amount: number;
+  payee: string;
+  sourceFile: string;
+  row: number;
+}
+
+export interface CnyRepaymentChoice extends CnyRepayment {
+  remaining: number;
+}
+
+export interface CnySettlement {
+  method: "manual" | "repayment";
+  repayment?: CnyRepayment;
 }
 
 export interface CategoryAllocation {
@@ -73,6 +100,7 @@ export interface RawTx {
   currency: string;
   payee: string;
   note: string;
+  originalAmount?: OriginalAmount;
   /** original category column from the statement (Alipay 标签, bank 摘要 etc.) */
   rawCategory: string;
   /** raw payment-method / card description, e.g. "中国工商银行(1234)" */
@@ -107,9 +135,19 @@ export type TxStatus =
   | "pending" // not yet reviewed
   | "ready" // user confirmed / auto-accepted
   | "duplicate" // dedup engine flagged it
-  | "excluded"; // user manually unchecked
+  | "excluded"; // omitted from posting by a rule or review action
 
-export type MergedSource = Pick<RawTx, "id" | "source" | "sourceTxId" | "sourceFile" | "sourceFileHash" | "row" | "date" | "time" | "amount" | "currency" | "direction">;
+export type ReviewExclusionKind = "manual" | "deduplicate";
+export type ExclusionKind = ReviewExclusionKind | "automatic";
+
+export interface AutomaticExclusionRule {
+  source: string;
+  title: string;
+  description?: string;
+}
+
+export type MergedSource = Pick<RawTx, "id" | "source" | "sourceTxId" | "sourceFile" | "sourceFileHash" | "row" | "date" | "time" | "amount" | "currency" | "direction" | "originalAmount">
+  & { cnySettlement?: CnySettlement };
 
 export interface TransactionMerge {
   originals: MergedSource[];
@@ -125,6 +163,10 @@ export const duplicateReviewIssue = (issue: string) => ledgerDuplicateReviewIssu
 
 export interface ParsedTx extends RawTx {
   status: TxStatus;
+  requireCnySettlement?: boolean;
+  cnySettlement?: CnySettlement;
+  /** The review action that excluded this row. Statement rules use excludedReason. */
+  reviewExclusion?: ReviewExclusionKind;
   /** inferred beancount asset/liability account for the funding leg */
   fundingAccount: string;
   /** second leg when the engine can infer a transfer (e.g. credit card repayment) */
@@ -177,7 +219,7 @@ export function isSuspectedDuplicate(tx: ParsedTx): boolean {
 }
 
 export function canFollowPurchaseRefund(refund: ParsedTx): boolean {
-  if (refund.eventType !== "refund" || refund.direction !== "in" || refund.excludedReason
+  if (refund.eventType !== "refund" || refund.direction !== "in" || refund.excludedReason || needsCnySettlement(refund)
     || refund.status === "excluded" || refund.status === "duplicate"
     || refund.reviewConflictId || refund.postings || refund.fundingAccount2 || refund.refundReviewMode === "manual") return false;
   return refund.refundReviewMode === "follow-purchase"
@@ -230,6 +272,7 @@ export interface LedgerInfo {
   payeeIndex: Record<string, { account: string; count: number }[]>;
   errors?: LedgerError[];
   loader?: string;
+  operatingCurrencies?: string[];
   /** Explicit native ledger inputs for reusing a verified account list. */
   accountSources?: { file: string; sha256: string }[];
 }
@@ -265,6 +308,8 @@ export interface ImportPreview {
   source: SourceType;
   txCount: number;
   txs: ParsedTx[];
+  /** Separate approval batch for foreign transactions pending when this batch was committed. */
+  settlementBatchId?: string;
   errors: Array<{ row: number; message: string }>;
   /** account candidates detected in this file (e.g. two ICBC cards) */
   accountsDetected: Array<{ raw: string; guess: string; txCount: number }>;
@@ -301,6 +346,8 @@ export interface AppConfig {
   annualLayout?: boolean;
   /** Store new statement copies in uploads under the ledger directory. Defaults to true. */
   archiveUploadsInLedger?: boolean;
+  /** Require a confirmed CNY amount for foreign transactions in a CNY ledger. */
+  requireCnySettlement?: boolean;
   /** keyword → account mapping, supports multiple cards per bank */
   assetMapping: Array<{
     /** match keyword against raw payment-method text */
@@ -317,7 +364,7 @@ export interface AppConfig {
   llm: LlmConfig;
 }
 
-export type ReviewField = "funding" | "category" | "postings" | "tags";
+export type ReviewField = "funding" | "category" | "postings" | "tags" | "settlement";
 
 export interface ReviewProblem {
   id: string;

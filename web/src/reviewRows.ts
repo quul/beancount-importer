@@ -1,9 +1,14 @@
 import { accountIsActive, isFundingAccount } from "../../src/shared/funding.js";
+import { exclusionKind } from "../../src/shared/exclusions.js";
+import { needsCnySettlement, originalForeignAmount } from "../../src/shared/settlement.js";
 import { fundingPostingSign, transactionPostings, transactionReviewProblems } from "../../src/shared/postings.js";
 import { activeTransactions } from "../../src/shared/transactionMerge.js";
-import { canFollowPurchaseRefund, isSuspectedDuplicate, type ParsedAccount, type ParsedTx, type ReviewProblem, type TxDecision, type TxStatus } from "../../src/shared/types.js";
+import { canFollowPurchaseRefund, isSuspectedDuplicate, type ExclusionKind, type ParsedAccount, type ParsedTx, type ReviewProblem, type TxDecision, type TxStatus } from "../../src/shared/types.js";
 
-export type ReviewFilter = "all" | "suspectedDuplicate" | TxStatus;
+export type ExclusionFilter = "excluded" | `excluded:${ExclusionKind}`;
+export type ReviewFilter = "all" | "suspectedDuplicate" | "pending:settlement" | TxStatus | ExclusionFilter;
+export const isExclusionFilter = (filter: ReviewFilter): filter is ExclusionFilter =>
+  filter === "excluded" || filter.startsWith("excluded:");
 export type ReviewTarget = Pick<ReviewProblem, "id" | "field">;
 export interface ReviewDateRange { start: string; end: string; }
 export const EMPTY_REVIEW_DATE_RANGE: ReviewDateRange = { start: "", end: "" };
@@ -152,7 +157,9 @@ export function remainingReviewProblems(problems: ReviewProblem[], before: Parse
 
 export function matchesReviewFilter(row: ReviewRow, filter: ReviewFilter): boolean {
   if (filter === "all") return true;
-  if (filter === "suspectedDuplicate") return row.entries.some(isSuspectedDuplicate);
+  if (filter === "pending:settlement") return row.entries.some((tx) => tx.status === "pending" && needsCnySettlement(tx));
+  if (filter === "suspectedDuplicate") return row.entries.some((tx) => tx.status !== "excluded" && isSuspectedDuplicate(tx));
+  if (isExclusionFilter(filter) && filter !== "excluded") return row.entries.some((tx) => `excluded:${exclusionKind(tx)}` === filter);
   return row.entries.some((tx) => tx.status === filter);
 }
 
@@ -164,8 +171,12 @@ export function matchesReviewDateRange({ tx }: ReviewRow, { start, end }: Review
 export function matchesReviewSearch(row: ReviewRow, query: string): boolean {
   if (!query || row.amount.toFixed(2).includes(query)
     || row.tx.merge?.totals.some(({ amount, currency }) => `${amount.toFixed(2)} ${currency}`.toLowerCase().includes(query))) return true;
-  return [...row.entries, ...(row.originals ?? [])].some((tx) => [tx.payee, tx.note, tx.narration, tx.rawAccount, tx.recognition?.label, tx.recognition?.fundingMethod,
-    tx.finalAccount, tx.fundingAccount, tx.reviewNote, tx.sourceStatus, tx.sourceTxId, tx.amount.toFixed(2), ...(tx.tags ?? []),
+  return [...row.entries, ...(row.originals ?? [])].some((tx) => {
+    const original = originalForeignAmount(tx);
+    return [tx.payee, tx.note, tx.narration, tx.rawAccount, tx.recognition?.label, tx.recognition?.fundingMethod,
+    tx.finalAccount, tx.fundingAccount, tx.reviewNote, tx.sourceStatus, tx.excludedReason, tx.sourceTxId, tx.amount.toFixed(2), ...(tx.tags ?? []),
+    original && `${original.amount} ${original.currency}`,
     ...(tx.postings?.map(({ account }) => account) ?? [])]
-    .join(" ").toLowerCase().includes(query));
+      .join(" ").toLowerCase().includes(query);
+  });
 }

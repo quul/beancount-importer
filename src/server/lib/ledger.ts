@@ -66,8 +66,8 @@ function ledgerFile(rootDir: string, mainFile: string): string {
   return file;
 }
 
-function ledgerInfo({ accounts, transactions, payeeIndex, errors, loader, accountSources }: BridgeResult): LedgerInfo {
-  return { accounts, transactions, payeeIndex, errors, loader, ...(accountSources ? { accountSources } : {}) };
+function ledgerInfo({ accounts, transactions, payeeIndex, errors, loader, accountSources, operatingCurrencies }: BridgeResult): LedgerInfo {
+  return { accounts, transactions, payeeIndex, errors, loader, operatingCurrencies, ...(accountSources ? { accountSources } : {}) };
 }
 
 export function parseLedger(rootDir: string, mainFile: string, pythonPath?: string, trackAccountSources = false): LedgerInfo {

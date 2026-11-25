@@ -1,6 +1,7 @@
 import { allocationAmountText, amountUnits } from "./categoryAllocations.js";
 import { isFundingAccount } from "./funding.js";
 import { amountText, transactionPostings, validateTransaction } from "./postings.js";
+import { originalForeignAmount } from "./settlement.js";
 import { isSuspectedDuplicate, type DraftPosting, type MergedSource, type ParsedTx } from "./types.js";
 
 const assetOrLiability = /^(Assets|Liabilities):/;
@@ -18,8 +19,10 @@ export function sourceKey(source?: string, id?: string, fileHash?: string, row?:
 }
 
 export function mergeSource(tx: ParsedTx): MergedSource {
-  const { id, source, sourceTxId, sourceFile, sourceFileHash, row, date, time, amount, currency, direction } = tx;
-  return { id, source, sourceTxId, sourceFile, sourceFileHash, row, date, time, amount, currency, direction };
+  const { id, source, sourceTxId, sourceFile, sourceFileHash, row, date, time, amount, currency, direction, cnySettlement } = tx;
+  const originalAmount = originalForeignAmount(tx);
+  return { id, source, sourceTxId, sourceFile, sourceFileHash, row, date, time, amount, currency, direction,
+    ...(originalAmount && { originalAmount }), ...(cnySettlement && { cnySettlement }) };
 }
 
 export function planTransactionMerge(members: readonly ParsedTx[], accounts: ReadonlySet<string>) {

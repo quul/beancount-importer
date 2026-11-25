@@ -182,6 +182,30 @@ try {
   assert.ok(!matchesReviewDateRange(grouped[0], { start: credit.date, end: credit.date }));
   console.log("✓ date bounds are inclusive and the grouped row keeps its displayed purchase date");
 
+  const flagged = { ...expense, id: "flagged", status: "pending", refundCounterpartId: undefined,
+    issues: [LEDGER_DUPLICATE_ISSUE] } satisfies ParsedTx;
+  const manual = applyPendingReviewPatches([flagged], [reviewPatches([{ id: flagged.id, status: "excluded" }])])[0];
+  const exclusionRows = buildReviewRows([
+    manual,
+    { ...flagged, id: "automatic", status: "excluded", excludedReason: "支付宝余额转入余额宝" },
+    { ...flagged, id: "deduplicate", status: "excluded", reviewExclusion: "deduplicate" },
+    { ...flagged, id: "old", status: "excluded" },
+    { ...flagged, id: "confirmed", status: "duplicate" },
+    { ...flagged, id: "needs-review" },
+  ]);
+  const matchingIds = (filter: Parameters<typeof matchesReviewFilter>[1]) =>
+    exclusionRows.filter((row) => matchesReviewFilter(row, filter)).map(({ tx }) => tx.id);
+  assert.deepEqual(matchingIds("excluded"), ["flagged", "automatic", "deduplicate", "old"]);
+  assert.deepEqual(matchingIds("excluded:manual"), ["flagged"]);
+  assert.deepEqual(matchingIds("excluded:automatic"), ["automatic"]);
+  assert.deepEqual(matchingIds("excluded:deduplicate"), ["deduplicate"]);
+  assert.deepEqual(matchingIds("suspectedDuplicate"), ["needs-review"]);
+  assert.deepEqual(matchingIds("duplicate"), ["confirmed"]);
+  assert.ok(matchesReviewSearch(exclusionRows[1], "余额宝"));
+  const [included] = applyPendingReviewPatches([manual], [reviewPatches([{ id: manual.id, status: "pending" }])]);
+  assert.equal(included.reviewExclusion, undefined);
+  console.log("✓ exclusion filters follow the approval action, and hide resolved rows from suspected duplicates");
+
   const pendingPurchase = { ...purchase, source: "wechat", status: "pending", finalAccount: "", suggestedAccount: "Expenses:Food" } satisfies ParsedTx;
   const pendingRefund = { ...credit, source: "wechat", finalAccount: "", suggestedAccount: "" } satisfies ParsedTx;
   const missing = { ...pendingPurchase, id: "missing", suggestedAccount: "" };
@@ -263,5 +287,5 @@ try {
   await assert.rejects(() => api.upload([]), (error: unknown) => error instanceof ApiError && error.temporary
     && error.message === "服务连接中断，请重试");
   console.log("✓ empty responses, proxy pages and network exceptions get friendly retry messages");
-  console.log("Web contract regression passed (12 groups).");
+  console.log("Web contract regression passed (13 groups).");
 } finally { globalThis.fetch = originalFetch; }

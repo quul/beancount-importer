@@ -1,4 +1,4 @@
-import type { AppConfig, BatchRevision, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, StatementName, StatementSource, TxDecision } from "../../src/shared/types.js";
+import type { AppConfig, AutomaticExclusionRule, BatchRevision, CnyRepaymentChoice, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, StatementName, StatementSource, TxDecision } from "../../src/shared/types.js";
 
 export type ConfigResponse = AppConfig & { nativePathPicker?: boolean };
 export type PathField = "ledgerRoot" | "pythonPath";
@@ -76,7 +76,7 @@ async function json<T>(response: Response): Promise<T> {
     if (parsed.code === "review_incomplete" && typeof parsed.error === "string") {
       const problems = Array.isArray(parsed.reviewProblems) ? parsed.reviewProblems.filter((item): item is ReviewProblem =>
         item && typeof item.id === "string" && typeof item.message === "string"
-        && (item.field === undefined || ["funding", "category", "postings", "tags"].includes(item.field))) : [];
+        && (item.field === undefined || ["funding", "category", "postings", "tags", "settlement"].includes(item.field))) : [];
       throw new IncompleteReviewError(response.status, parsed.error, problems);
     }
     const describe = (detail: unknown): string => {
@@ -113,6 +113,7 @@ export const api = {
     return send<UploadSummary>("/api/upload", { method: "POST", body });
   },
   batches: (signal?: AbortSignal) => send<BatchSummary[]>("/api/batches", { signal }),
+  exclusionRules: () => send<AutomaticExclusionRule[]>("/api/exclusion-rules"),
   batchMergeOptions: (batches: BatchRevision[]) => post<BatchMergeOptions>("/api/batches/merge-options", { batches }),
   mergeBatches: (batches: BatchRevision[], keepProgress: string[], names: StatementName[]) =>
     post<{ batch: ImportPreview & BatchRevision; batches: BatchSummary[] }>("/api/batches/merge", { batches, keepProgress, names }),
@@ -121,6 +122,10 @@ export const api = {
   resolveReviewConflict: (id: string, revision: number, conflictId: string, sourceBatchId: string | null) =>
     post<{ batch: ImportPreview }>("/api/batch/" + encodeURIComponent(id) + "/review-conflicts", { revision, conflictId, sourceBatchId }),
   batch: (id: string) => send<ImportPreview>(`/api/batch/${encodeURIComponent(id)}`),
+  cnyRepayments: (id: string, txId: string) =>
+    send<CnyRepaymentChoice[]>(`/api/batch/${encodeURIComponent(id)}/cny-repayments/${encodeURIComponent(txId)}`),
+  settleInCny: (id: string, revision: number, txId: string, amount: string, repaymentKey?: string) =>
+    post<{ batch: ImportPreview }>(`/api/batch/${encodeURIComponent(id)}/cny-settlement`, { revision, id: txId, amount, repaymentKey }),
   pdfPreview: (id: string, txId: string, signal?: AbortSignal) =>
     send<PdfPreview>(`/api/batch/${encodeURIComponent(id)}/pdf-preview/${encodeURIComponent(txId)}`, { signal }),
   recheckLedger: (id: string, revision: number) => post<{ batch: ImportPreview; suspected: number }>(`/api/batch/${encodeURIComponent(id)}/recheck-ledger`, { revision }),

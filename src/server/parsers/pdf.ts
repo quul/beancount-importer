@@ -269,10 +269,17 @@ function parseTableStatement(file: string, pages: TextLine[][], title: string, r
     const cardIdentity = suffix && rule.account?.suffixPattern.test(suffix) ? `${rule.account.label}(${suffix})` : undefined;
     const rawAccount = cardIdentity ?? rule.account?.label ?? file;
     const original = cell(line, columns, "originalAmount");
-    const note = original && compactPdfText(original).replaceAll("−", "-") !== settled ? `${description} · 原交易 ${original}` : description;
+    const originalCell = compactPdfText(original).replaceAll("−", "-");
+    const originalParts = originalCell.match(/^(?<currency>[A-Z]{3,5})(?<amount>[+-]?[\d,]+(?:\.\d+)?)$/)?.groups;
+    const originalValue = originalParts ? parseAmount(originalParts.amount) : null;
+    const originalAmount = originalParts && originalParts.currency !== "CNY" && originalValue !== null
+      ? { amount: Math.abs(originalValue), currency: originalParts.currency }
+      : currency !== "CNY" ? { amount: Math.abs(amount), currency } : undefined;
+    const note = original && originalCell !== settled ? `${description} · 原交易 ${original}` : description;
     txs.push({
       id: txId(date, Math.abs(amount), direction, description, row, source), date, amount: Math.abs(amount),
       direction, currency, payee: description, note, rawCategory: section || rule.category,
+      ...(originalAmount && { originalAmount }),
       rawAccount, source, sourceFile: file, row, eventType, pdfRegions: sourceRegions(evidence), issues: [PDF_REVIEW_ISSUE],
       ...(cardIdentity && (eventType === "expense" || eventType === "refund") ? { refundEvidence: { cardIdentity } } : {}),
     });
@@ -321,7 +328,7 @@ function parseGenericStatement(file: string, source: ParseResult["source"], line
   const drafts: Draft[] = [];
 
   for (const origin of lines) {
-    const line = origin.text;
+    const line = signedAmount ? origin.text.replaceAll("−", "-") : origin.text;
     const dateParsed = parseDate(line);
     // a transaction line must start with a date and contain an amount
     const amounts = (line.match(rule.amountPattern) ?? []).map((s) => parseAmount(s) ?? 0);
@@ -352,6 +359,9 @@ function parseGenericStatement(file: string, source: ParseResult["source"], line
     const firstAmtIdx = afterDate.search(rule.amountPattern);
     const payee =
       firstAmtIdx > 0 ? afterDate.slice(0, firstAmtIdx).trim() : "";
+    const rowCurrency = signedAmount ? afterDate.match(/^(?:\d{1,2}:\d\d(?::\d\d)?\s+)?([A-Z]{3,5})\s+[+-]?\d/)?.[1] : undefined;
+    const currency = rowCurrency ?? rule.currency;
+    const transfer = rule.transferPattern.test(d.text) || (signedAmount && /结售汇|柜台取现/.test(d.text));
 
     txs.push({
       id: txId(d.date, Math.abs(amount), direction, payee, `${d.time ?? ""}|${d.text}`, source),
@@ -359,7 +369,8 @@ function parseGenericStatement(file: string, source: ParseResult["source"], line
       time: d.time,
       amount: Math.abs(amount),
       direction,
-      currency: rule.currency,
+      currency,
+      ...(currency !== "CNY" && { originalAmount: { amount: Math.abs(amount), currency } }),
       payee,
       note: d.text.slice(0, 80),
       rawCategory: rule.category,
@@ -368,7 +379,7 @@ function parseGenericStatement(file: string, source: ParseResult["source"], line
       source,
       sourceFile: file,
       row: txs.length + 1,
-      eventType: rule.transferPattern.test(d.text) ? "transfer" : direction === "in" ? "income" : "expense",
+      eventType: transfer ? "transfer" : direction === "in" ? "income" : "expense",
       pdfRegions: sourceRegions([d.origin]),
       issues: [PDF_REVIEW_ISSUE],
     });

@@ -1,4 +1,5 @@
 import { defaultNarration, type DraftPosting, type ParsedTx, type ReviewProblem } from "./types.js";
+import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement, originalForeignAmount } from "./settlement.js";
 
 export const accountPattern = /^(Assets|Liabilities|Equity|Income|Expenses)(?::[\p{Lu}\p{Nd}][\p{L}\p{Nd}-]*)+$/u;
 const isPostingAccount = (account: string) => accountPattern.test(account) && !/(?:^|:)(FixMe|Unknown)(?::|$)/i.test(account);
@@ -34,7 +35,7 @@ export function missingPostingAccount(tx: ParsedTx): keyof typeof missingPosting
 }
 
 export function statusAfterCategorization(tx: ParsedTx): ParsedTx["status"] {
-  if (!missingPostingAccount(tx)) return "ready";
+  if (!needsCnySettlement(tx) && !missingPostingAccount(tx)) return "ready";
   return tx.status === "ready" ? "pending" : tx.status;
 }
 
@@ -44,6 +45,7 @@ export function transactionReviewProblems(tx: ParsedTx, postings: DraftPosting[]
     if (!problems.some((problem) => problem.field === field && problem.message === message)) problems.push({ id: tx.id, field, message });
   };
   if (!validDate(tx.date)) add("交易日期无效");
+  if (needsCnySettlement(tx)) add(CNY_SETTLEMENT_REQUIRED, "settlement");
   if (tx.excludedReason) add(`原始流水不可入账：${tx.excludedReason}`);
   if (!Number.isFinite(tx.amount) || tx.amount < 0 || (!tx.merge && tx.amount === 0)) add("交易金额须大于零");
   if (!tx.postings && (tx.fundingParts?.length ?? 0) > 1) add("请拆分组合支付", "postings");
@@ -94,6 +96,16 @@ export function formatTransactionEntry(tx: ParsedTx, postings: readonly DraftPos
     ...(tx.merge ? { "import-members": JSON.stringify(tx.merge.originals) } : {}),
   };
   for (const [key, value] of Object.entries(metadata)) lines.push(`  ${key}: ${quote(value)}`);
+  const originalAmount = tx.merge ? undefined : originalForeignAmount(tx);
+  if (originalAmount && originalAmount.currency !== "CNY" && Number.isFinite(originalAmount.amount)
+    && currencyPattern.test(originalAmount.currency)) {
+    lines.push(`  original-amount: ${amountText(originalAmount.amount)} ${originalAmount.currency}`);
+    if (tx.currency === "CNY") {
+      lines.push(`  settlement-source: ${quote(tx.cnySettlement?.method ?? "statement")}`);
+      const repayment = tx.cnySettlement?.repayment;
+      if (repayment) lines.push(`  settlement-repayment: ${quote(JSON.stringify(repayment))}`);
+    }
+  }
   lines.push(`  source-row: ${tx.row}`);
   for (const posting of postings) lines.push(formatPosting(posting));
   return lines.join("\n");

@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import type { AppConfig, EventType, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerMatch, ParsedTx, ReviewProblem, StatementName, TxDecision, TxStatus } from "../../src/shared/types.js";
 import {
-  canFollowPurchaseRefund, CROSS_SOURCE_ISSUE, defaultNarration, hasPdfSource, isSuspectedDuplicate,
+  canFollowPurchaseRefund, CROSS_SOURCE_ISSUE, defaultNarration, duplicateReviewIssue, hasPdfSource, isSuspectedDuplicate,
   LEDGER_DUPLICATE_ISSUE, MAX_NARRATION_LENGTH, PDF_REVIEW_ISSUE,
 } from "../../src/shared/types.js";
 import { planSuspectedDuplicateExclusions } from "../../src/shared/duplicateExclusions.js";
+import { exclusionKind, reviewStatusPatch } from "../../src/shared/exclusions.js";
+import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement, originalForeignAmount } from "../../src/shared/settlement.js";
 import { savedCategoryAllocations } from "../../src/shared/categoryAllocations.js";
 import { amountText, missingPostingAccount, missingPostingAccountMessage } from "../../src/shared/postings.js";
 import { accountIsActive, hasFundingPosting, isCombinedPayment, isFundingAccount, reusablePaymentMethod } from "../../src/shared/funding.js";
@@ -15,8 +17,10 @@ import AccountSelect from "./AccountSelect";
 import BatchReviewDialog from "./BatchReviewDialog";
 import BeancountCode from "./BeancountCode";
 import ConfigPanel, { SETTINGS_LINKS, type SettingsSection } from "./ConfigPanel";
+import CnySettlement from "./CnySettlement";
 import DateRangeFilter from "./DateRangeFilter";
 import EntryPreview from "./EntryPreview";
+import ExclusionFilters from "./ExclusionFilters";
 import FundingDialog from "./FundingDialog";
 import MergeDialog from "./MergeDialog";
 import PdfPreviewDialog from "./PdfPreviewDialog";
@@ -26,7 +30,7 @@ import StatementSources from "./StatementSources";
 import TransactionFlag from "./TransactionFlag";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "./reviewChanges";
 import {
-  buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, EMPTY_REVIEW_DATE_RANGE, isEditablePostingStatus, matchesReviewDateRange,
+  buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, EMPTY_REVIEW_DATE_RANGE, isEditablePostingStatus, isExclusionFilter, matchesReviewDateRange,
   matchesReviewFilter, matchesReviewSearch, refundFollowsCategory, remainingReviewProblems, reviewCategoryOptions, type ReviewFilter, type ReviewRow, type ReviewTarget,
 } from "./reviewRows";
 
@@ -52,6 +56,7 @@ function batchUrl(id: string, hash = window.location.hash): string {
 }
 
 const DECISION_LABELS: Record<TxStatus, string> = { pending: "待确认", ready: "待入账", duplicate: "重复", excluded: "已排除" };
+const EXCLUSION_LABELS = { manual: "手动排除", automatic: "自动排除", deduplicate: "重复剔除" };
 const operationMessage = (failure: unknown) => failure instanceof ApiError ? failure.message : "暂时无法完成操作。请重试。";
 const EVENT_LABELS: Record<EventType, string> = { expense: "支出", income: "收入", refund: "退款", transfer: "转账", familyCard: "亲情卡", unknown: "待识别" };
 const PAGE_SIZE = 50;
@@ -92,7 +97,7 @@ function ReviewIcon({ name }: { name: keyof typeof reviewIcons }) {
 }
 
 function pendingCategory(row: ReviewRow) {
-  const canClassify = (tx: ParsedTx) => tx.status === "pending" && !tx.postings && !tx.excludedReason && !tx.reviewConflictId;
+  const canClassify = (tx: ParsedTx) => tx.status === "pending" && !tx.postings && !tx.excludedReason && !tx.reviewConflictId && !needsCnySettlement(tx);
   if (canClassify(row.tx) && !row.refund?.postings) return { id: row.tx.id, detail: false };
   const entry = row.refund && row.entries.find(canClassify);
   return entry ? { id: entry.id, detail: true } : undefined;
@@ -195,7 +200,9 @@ function HeaderDetails({ config, ledger, batch }: { config: ConfigResponse | nul
 }
 
 function duplicateEvidence(tx: ParsedTx): LedgerMatch | undefined {
-  return isSuspectedDuplicate(tx) ? tx.matches?.find(({ reason }) => !/^(历史分类参考|转账配对建议|未提交批次已有此交易)/.test(reason)) : undefined;
+  return isSuspectedDuplicate(tx) || exclusionKind(tx) === "deduplicate"
+    ? tx.matches?.find(({ reason }) => !/^(历史分类参考|转账配对建议|未提交批次已有此交易)/.test(reason))
+    : undefined;
 }
 
 function FundingAllocationDetails({ tx, issue, leg, readOnly }: { tx: ParsedTx; issue: string; leg?: string; readOnly: boolean }) {
@@ -618,7 +625,7 @@ export default function App() {
     const { id, field } = reviewFocus;
     const tableRow = document.getElementById(`review-row-${row.tx.id}`);
     const inRefundDetail = id !== row.tx.id || Boolean(row.refund?.postings && (field === "category" || field === "funding"));
-    const inDetail = inRefundDetail || field === "postings" || field === "tags";
+    const inDetail = inRefundDetail || field === "postings" || field === "tags" || field === "settlement";
     if (inDetail && detailTxId !== row.tx.id) {
       tableRow?.scrollIntoView({ block: "nearest" });
       setDetailTxId(row.tx.id);
@@ -631,7 +638,7 @@ export default function App() {
     let input: HTMLElement | null = null;
     if (field === "category") input = document.getElementById(categoryInputId(id, inRefundDetail));
     if (field === "funding") input = document.getElementById(fundingInputId(id, inRefundDetail));
-    if (field === "tags" || field === "postings") input = document.getElementById(`review-${field}-${id}`);
+    if (field === "tags" || field === "postings" || field === "settlement") input = document.getElementById(`review-${field}-${id}`);
     const leg = inRefundDetail || row.refund ? document.getElementById(`refund-leg-${id}`) : null;
     if (inDetail && leg) leg.querySelector("details.refund-leg-actions")?.setAttribute("open", "");
     const target = input ?? (inDetail ? leg ?? detailHeading.current : tableRow);
@@ -1043,7 +1050,9 @@ export default function App() {
 
   const excludeSuspected = () => {
     if (blockBatchChanges || !suspectedExclusions.length) return;
-    const patches: ReviewPatches = new Map(suspectedExclusions.map(({ id }) => [id, () => ({ status: "excluded", duplicateOf: undefined })]));
+    const patches: ReviewPatches = new Map(suspectedExclusions.map(({ id }) => [id, (tx) => ({
+      ...reviewStatusPatch(tx, "excluded", "deduplicate"), duplicateOf: undefined,
+    })]));
     enqueueReviewSave(async (id, current) => {
       const result = await api.excludeSuspected(id, current.revision ?? 0, reviewSessionId);
       return { batch: result.batch, notice: `已剔除 ${result.excluded} 笔疑似重复` };
@@ -1225,7 +1234,10 @@ export default function App() {
     const fundingError = fieldProblem(tx.id, "funding");
     const matchReason = fundingMatchReason(tx);
     const fundingRows = refund ? [tx, refund] : [tx];
-    return <AccountSelect value={tx.fundingAccount} accounts={fundingError ? accounts.filter((account) => accountIsActive(account, tx.date, tx.currency)) : accounts}
+    const awaitingCny = needsCnySettlement(tx);
+    const options = awaitingCny || fundingError
+      ? accounts.filter((account) => accountIsActive(account, tx.date, awaitingCny ? "CNY" : tx.currency)) : accounts;
+    return <AccountSelect value={tx.fundingAccount} accounts={options}
       funding label={`${tx.payee || "（无商户）"} · 资金账户`} inputId={fundingInputId(tx.id, detail)} placeholder="选择资金账户" validationMessage={fundingError}
       matchReason={matchReason} confirmCurrent={Boolean(matchReason && tx.fundingAccount)} autoHighlight={Boolean(fundingError)}
       disabled={disabled} onChange={(funding) => saveReviewDecisions(fundingRows.map(({ id }) => ({ id, funding })))} />;
@@ -1238,7 +1250,10 @@ export default function App() {
     const categoryLabel = isTransfer ? "对方账户" : "分类账户";
     const categoryError = fieldProblem(tx.id, "category");
     const category = tx.fundingAccount2 || tx.finalAccount || (categoryError ? "" : tx.suggestedAccount);
-    const categoryOptions = reviewCategoryOptions(tx, accounts);
+    const awaitingCny = needsCnySettlement(tx);
+    const categoryOptions = awaitingCny
+      ? reviewCategoryOptions({ ...tx, currency: "CNY" }, accounts.filter((account) => accountIsActive(account, tx.date, "CNY")))
+      : reviewCategoryOptions(tx, accounts);
     const allocations = savedCategoryAllocations(tx);
     return <>
       <div className={detail ? "account-fields" : "account-fields account-fields-compact"}>
@@ -1256,7 +1271,7 @@ export default function App() {
               onChange={(account) => {
                 const decision = { id: tx.id, account, status: isEditablePostingStatus(tx) ? undefined : tx.status };
                 const reviewed = { ...tx, finalAccount: account, fundingAccount2: tx.fundingAccount2 ? account : undefined };
-                if (decision.status || missingPostingAccount(reviewed)) { saveReviewDecisions([decision]); return; }
+                if (awaitingCny || decision.status || missingPostingAccount(reviewed)) { saveReviewDecisions([decision]); return; }
                 savePostingDecisions([decision], {
                   followedRefundIds: refundFollowsCategory(refund, account) ? [refund.id] : [], advanceAfter: tx.status === "pending" ? tx.id : undefined,
                 });
@@ -1279,9 +1294,11 @@ export default function App() {
     const payee = tx.payee || "（无商户）";
     const entries = refund ? [tx, refund] : [tx];
     const exclude = entries.filter(isEditablePostingStatus);
+    const unsettled = entries.find((entry) => !entry.excludedReason && entry.status !== "excluded"
+      && entry.status !== "duplicate" && needsCnySettlement(entry));
     const excludeLabel = tx.merge && tx.excludedReason ? "确认不入账" : refund || tx.merge ? "排除此组" : "排除此笔";
     const emphasizeExclude = !compact || Boolean(tx.excludedReason) || entries.some(isSuspectedDuplicate);
-    const canInclude = tx.status !== "ready" && !tx.excludedReason && !tx.duplicateOf?.refundCopy && (!refund || (tx.status === "pending"
+    const canInclude = !unsettled && tx.status !== "ready" && !tx.excludedReason && !tx.duplicateOf?.refundCopy && (!refund || (tx.status === "pending"
       && !tx.postings && refund.status === "pending" && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund)));
     const category = tx.finalAccount || tx.suggestedAccount || "";
     const missing = missingPostingAccount({ ...tx, finalAccount: category });
@@ -1349,7 +1366,7 @@ export default function App() {
 
   const renderPostingEditor = (tx: ParsedTx, showValidation: boolean, leg?: string) => {
     const error = fieldProblem(tx.id, "postings");
-    if (tx.reviewConflictId || tx.duplicateOf?.refundCopy || (tx.merge && !error)) return null;
+    if (tx.reviewConflictId || tx.duplicateOf?.refundCopy || (tx.merge && !error) || (needsCnySettlement(tx) && !tx.postings && !error)) return null;
     return <div className="detail-posting-editor" key={tx.id}>
       {leg && <h4>{leg}</h4>}
       <ReviewPostingFields tx={tx} accounts={accounts} draft={drafts[tx.id]?.value ?? makeDraft(tx)}
@@ -1378,7 +1395,7 @@ export default function App() {
     return <section key={tx.id} className="detail-review-warning" aria-label={`${leg ? `${leg} · ` : ""}资金账户待核对`}>
       <h4>{leg && `${leg} · `}资金账户待核对</h4>
       <p>{reason}</p>
-      {!readOnly && !leg && !tx.postings && renderFundingAccount(tx, disabled, true)}
+      {!readOnly && !leg && !tx.postings && !(tx.status === "pending" && needsCnySettlement(tx)) && renderFundingAccount(tx, disabled, true)}
       {!readOnly && reusablePaymentMethod(tx) && hasFundingPosting(tx) && <div>
         <button type="button" className="btn small" aria-haspopup="dialog" disabled={disabled}
           onClick={() => { setError(""); setMappingTarget(tx); }}>添加映射</button>
@@ -1422,6 +1439,7 @@ export default function App() {
       <dl className="tx-meta">
         <div><dt>来源</dt><dd>{tx.sourceFile} · 第 {tx.row} 行</dd></div>
         {tx.sourceTxId && <div><dt>交易号</dt><dd><code>{tx.sourceTxId}</code></dd></div>}
+        {tx.originalAmount && <div><dt>原币金额</dt><dd>{amountText(tx.originalAmount.amount)} {tx.originalAmount.currency}</dd></div>}
         {tx.fundingAccount && <div><dt>资金账户</dt><dd><code>{tx.fundingAccount}</code></dd></div>}
         {tx.postings ? <div><dt>分录</dt><dd><code>{tx.postings.map(({ account, amount, currency }) => `${account} ${amountText(amount)} ${currency}`).join("\n")}</code></dd></div>
           : tx.finalAccount && <div><dt>分类账户</dt><dd><code>{tx.finalAccount}</code></dd></div>}
@@ -1485,12 +1503,28 @@ export default function App() {
         </div>}
       </header>
       <div className="transaction-detail-body">
+        {tx.merge && needsCnySettlement(tx) && <p className="reason">先撤销合并，再确认原交易的人民币金额。</p>}
+        {entries.filter(originalForeignAmount).map((entry) => <CnySettlement
+          key={`${entry.id}:${entry.currency}:${entry.amount}:${entry.cnySettlement?.repayment?.key ?? ""}`}
+          tx={entry} batchId={batchId}
+          editable={!readOnly && !entry.reviewConflictId && !entry.excludedReason && entry.status !== "excluded" && entry.status !== "duplicate"
+            && (needsCnySettlement(entry) || Boolean(entry.cnySettlement))}
+          disabled={fieldsDisabled || blockBatchChanges}
+          onSave={(amount, repaymentKey) => enqueueReviewSave(async (id, current) => {
+            const result = await api.settleInCny(id, current.revision ?? 0, entry.id, amount, repaymentKey);
+            if (statusFilter === "pending:settlement") setStatusFilter("pending");
+            return { batch: result.batch, notice: "已保存人民币金额" };
+          }, { blocking: true })} />)}
+        {!refund && !tx.merge && tx.status === "pending" && needsCnySettlement(tx) &&
+          <section className="detail-section" aria-label="入账账户">{renderAccountFields(tx, fieldsDisabled || Boolean(conflict), undefined, true)}</section>}
         {entries.map((entry) => renderPostingEditor(entry, detailSaveAttempt?.id === tx.id, refund ? entry === refund ? "退款" : "原消费" : undefined))}
         {entries.map((entry) => renderFundingReview(entry, fieldsDisabled || Boolean(entry.reviewConflictId), refund ? entry === refund ? "退款" : "原消费" : undefined))}
         {entries.map((entry) => {
           const match = duplicateEvidence(entry);
-          const label = refund ? `${entry === refund ? "退款" : "原消费"} · 疑似重复` : "疑似重复核对";
-          return match ? renderHistoryMatch(entry, match, rowDisabled, label) : null;
+          const removed = exclusionKind(entry) === "deduplicate";
+          const reason = removed ? "剔除时的匹配记录" : "疑似重复核对";
+          const label = refund ? `${entry === refund ? "退款" : "原消费"} · ${reason}` : reason;
+          return match ? renderHistoryMatch(entry, match, rowDisabled || removed, label) : null;
         })}
         {originals ? <details className="detail-section" open>
           <summary>原交易（{originals.length}）</summary>
@@ -1572,10 +1606,14 @@ export default function App() {
     const hasDraft = entries.some((entry) => Boolean(drafts[entry.id]));
     const rowDisabled = editingDisabled || conflicted || hasDraft;
     const detailsOpen = detailTxId === tx.id;
-    const issues = entries.flatMap(reviewIssues).filter((issue) => issue !== PDF_REVIEW_ISSUE);
-    const needsDetails = issues.includes(DIRECTION_REVIEW_ISSUE) || entries.some((entry) =>
+    const awaitingCny = tx.status === "pending" && needsCnySettlement(tx);
+    const settlementTarget = !readOnly && !tx.merge && entries.find((entry) => entry.status === "pending"
+      && !entry.reviewConflictId && !entry.excludedReason && needsCnySettlement(entry));
+    const issues = entries.flatMap((entry) => reviewIssues(entry).filter((issue) =>
+      issue !== PDF_REVIEW_ISSUE && (entry.status !== "excluded" || !duplicateReviewIssue(issue))));
+    const needsDetails = Boolean(settlementTarget) || issues.includes(DIRECTION_REVIEW_ISSUE) || entries.some((entry) =>
       combinedPaymentIssue(entry) || fundingMatchReason(entry) || isSuspectedDuplicate(entry) || entry.status === "duplicate" || entry.duplicateOf);
-    const detailsLabel = detailsOpen ? "收起详情" : needsDetails ? "核对交易详情" : readOnly ? "查看详情" : "详情与备注";
+    const detailsLabel = detailsOpen ? "收起详情" : settlementTarget ? "确认人民币金额" : needsDetails ? "核对交易详情" : readOnly ? "查看详情" : "详情与备注";
     const tags = [...new Set(entries.flatMap((entry) => entry.tags ?? []))];
     const shownTags = detailRow && !detailAsDrawer ? 1 : 2;
     const remainingTags = tags.slice(shownTags);
@@ -1594,13 +1632,20 @@ export default function App() {
       return message ? [message] : [];
     }))].join(" · ");
     const warnings = new Set([...issues.filter((issue) => issue === LEDGER_DUPLICATE_ISSUE || issue === CROSS_SOURCE_ISSUE), ...issues]);
+    if (entries.some((entry) => entry.status === "pending" && needsCnySettlement(entry))) warnings.add(CNY_SETTLEMENT_REQUIRED);
     const refundCounterpart = tx.refundCounterpartId ? txs.find((row) => row.id === tx.refundCounterpartId) : undefined;
     if (refundCounterpart) warnings.delete("已退款，核对退款流水");
     if (refund) warnings.delete("冲回原费用");
+    const exclusions = new Set<string>();
     for (const entry of entries) {
-      if (entry.excludedReason) warnings.add(entry.excludedReason);
+      if (entry.status === "excluded") {
+        const kind = exclusionKind(entry);
+        const label = kind ? EXCLUSION_LABELS[kind] : "排除原因未记录";
+        exclusions.add(entry.excludedReason ? `${label} · ${entry.excludedReason}` : label);
+      } else if (entry.excludedReason) warnings.add(entry.excludedReason);
       if (entry.duplicateOf && entry.status !== "ready") warnings.add(entry.duplicateOf.label);
     }
+    const hasExcludedMatch = entries.some((entry) => exclusionKind(entry) === "deduplicate" && duplicateEvidence(entry));
 
     return <tr key={tx.id} id={`review-row-${tx.id}`} role="row" tabIndex={-1} data-review-id={tx.id}
       aria-describedby={rowProblem ? `review-row-error-${tx.id}` : undefined}
@@ -1629,6 +1674,14 @@ export default function App() {
                 }</ReviewMenu>}
               </div>}
             </div>
+            {exclusions.size > 0 && <div className="tx-exclusions">
+              {[...exclusions].map((reason) => <span key={reason} className="tx-exclusion-label">{reason}</span>)}
+              {hasExcludedMatch && <button type="button" className="btn small quiet" onClick={() => {
+                if (detailsOpen) { detailHeading.current?.focus(); return; }
+                focusDetailHeading.current = true;
+                setDetailTxId(tx.id);
+              }}>查看匹配记录</button>}
+            </div>}
             {warnings.size > 0 && <ul role="list" aria-label="审批提示" className="tx-warnings">
               {[...warnings].map((warning) => <li key={warning}>{warning}</li>)}
             </ul>}
@@ -1643,6 +1696,7 @@ export default function App() {
             aria-label={`${detailsLabel} · ${payee}`} title={detailsLabel} aria-expanded={detailsOpen}
             aria-controls={detailsOpen ? "transaction-detail" : undefined} onClick={() => {
               if (detailsOpen) { closeDetails(); return; }
+              if (settlementTarget) { revealReviewTarget([{ id: settlementTarget.id, field: "settlement" }]); return; }
               focusDetailHeading.current = true;
               setDetailTxId(tx.id);
             }}><ReviewIcon name={needsDetails ? "question" : "info"} /></button>
@@ -1663,7 +1717,10 @@ export default function App() {
       </td>
       <td role="cell" className="tx-account-cell">
         {tx.merge ? <><div className="account-caption">{tx.postings?.length ?? 0} 条分录</div>
-          {tx.fundingAccount && <code className="merged-funding-account">{tx.fundingAccount}</code>}</> : renderAccountFields(tx, fieldsDisabled, refund)}
+          {tx.fundingAccount && <code className="merged-funding-account">{tx.fundingAccount}</code>}</> : awaitingCny ?
+          <><div className="account-caption">资金账户</div>{tx.fundingAccount
+            ? <code className="merged-funding-account">{tx.fundingAccount}</code> : <span className="muted">待选择</span>}</>
+          : renderAccountFields(tx, fieldsDisabled, refund)}
       </td>
       <td role="cell" className="tx-decision-cell">
         {showDecisionStatus && <span className={`decision-status ${mixedStatus ? "pending" : tx.status}`}>{statusLabel}</span>}
@@ -1793,6 +1850,10 @@ export default function App() {
             onClick={() => setPreviewCheck(null)}>×</button>
         </div>}
         {batch.committedAt && <p className="muted review-diagnostic">提交于 {batchTime(Date.parse(batch.committedAt))}</p>}
+        {batch.settlementBatchId && batches.some(({ batchId: id, committed }) => id === batch.settlementBatchId && !committed)
+          && <div className="review-diagnostic">
+            <a className="btn small" href={batchUrl(batch.settlementBatchId, "")}>继续审批剩余外币交易</a>
+          </div>}
         {(fileErrors.length > 0 || emptyImportFailed) && <div className="review-import-alert review-diagnostic" role="alert">
           <strong>{emptyImportFailed ? "未读取到账单交易" : "部分账单未导入"}</strong>
           {fileErrors.length > 0 && <ul>{fileErrors.map(({ message }, index) => <li key={index}>{message}</li>)}</ul>}
@@ -1807,11 +1868,24 @@ export default function App() {
           </div>
           <DateRangeFilter value={dateRange} onChange={setDateRange} />
           <nav className="tabs" aria-label="筛选交易">
-            {STATUS_TABS.map(({ key, label }) => <button className={`tab${statusFilter === key ? " active" : ""}`} aria-pressed={statusFilter === key}
-              key={key} onClick={() => setStatusFilter(key)}>{posted && key === "ready" ? "已入账" : label}<span className="count">{count(key)}</span></button>)}
+            {STATUS_TABS.map(({ key, label }) => {
+              const activeTab = key === "excluded" ? isExclusionFilter(statusFilter)
+                : statusFilter === key || (key === "pending" && statusFilter === "pending:settlement");
+              return <button type="button" className={`tab${activeTab ? " active" : ""}`} aria-pressed={activeTab}
+                key={key} onClick={() => setStatusFilter(key)}>{posted && key === "ready" ? "已入账" : label}<span className="count">{count(key)}</span></button>;
+            })}
           </nav>
           <select aria-label="排序" value={sort} onChange={(event) => setSort(event.target.value as typeof sort)}><option value="date">按日期</option><option value="amount">按金额</option><option value="payee">按商户</option></select>
         </div>
+        {isExclusionFilter(statusFilter) && <ExclusionFilters value={statusFilter} count={count} onChange={setStatusFilter} />}
+        {(statusFilter === "pending" || statusFilter === "pending:settlement")
+          && (statusFilter === "pending:settlement" || count("pending:settlement") > 0)
+          && <nav className="tabs settlement-filter" aria-label="筛选待确认交易">
+            <button type="button" className={`tab${statusFilter === "pending" ? " active" : ""}`} aria-pressed={statusFilter === "pending"}
+              onClick={() => setStatusFilter("pending")}>全部<span className="count">{count("pending")}</span></button>
+            <button type="button" className={`tab${statusFilter === "pending:settlement" ? " active" : ""}`} aria-pressed={statusFilter === "pending:settlement"}
+              onClick={() => setStatusFilter("pending:settlement")}>待确认人民币金额<span className="count">{count("pending:settlement")}</span></button>
+          </nav>}
         <div className={`review-workspace${detailRow && !detailAsDrawer ? " has-detail" : ""}`}>
           {!rows.length ? <div className="empty">无匹配交易</div> : <div className="table-scroll" ref={tableScroll}>
           <table className={`tx${readOnly ? " read-only" : ""}`} role="table" aria-labelledby="review-heading">

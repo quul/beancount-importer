@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import type { GenerateResult, ImportPreview, ReviewStatusUndo, TxStatus } from "../../shared/types.js";
+import type { GenerateResult, ImportPreview, ReviewExclusionKind, ReviewStatusUndo, TxStatus } from "../../shared/types.js";
 
 export type StoredPdfUpload = string | { archiveName: string };
 
@@ -19,7 +19,7 @@ export interface StoredBatch extends ImportPreview {
     sessionId: string;
     operations: Array<{
       action: ReviewStatusUndo["action"];
-      entries: Array<{ id: string; before: TxStatus; after: TxStatus }>;
+      entries: Array<{ id: string; before: TxStatus; after: TxStatus; beforeExclusion?: ReviewExclusionKind; afterExclusion?: ReviewExclusionKind }>;
     }>;
   };
   mergedFrom?: string[];

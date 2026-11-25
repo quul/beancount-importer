@@ -1,11 +1,13 @@
 import { useState } from "react";
 import { formatTransactionEntry, transactionPostings, validateTransaction } from "../../src/shared/postings.js";
+import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement } from "../../src/shared/settlement.js";
 import type { ParsedTx } from "../../src/shared/types.js";
 import BeancountCode from "./BeancountCode";
 
 function PreviewEntry({ tx, batchId }: { tx: ParsedTx; batchId: string }) {
   if (tx.excludedReason || tx.status === "excluded") return <p className="muted">{tx.excludedReason || "这笔交易已排除"}</p>;
   if (tx.status === "duplicate") return <p className="muted">这笔交易已标为重复</p>;
+  if (needsCnySettlement(tx)) return <p className="muted">{CNY_SETTLEMENT_REQUIRED}</p>;
 
   const reviewed = tx.status === "pending" && !tx.finalAccount && tx.suggestedAccount ? { ...tx, finalAccount: tx.suggestedAccount } : tx;
   const postings = transactionPostings(reviewed);

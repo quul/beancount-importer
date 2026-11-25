@@ -123,6 +123,7 @@ export function loadConfig(dataDir: string, activeLedgerFile?: string): AppConfi
   if (ledgerRoot && fs.existsSync(path.resolve(ledgerRoot, config.mainFile))) {
     config.pythonPath ||= discoverPython(ledgerRoot);
     const ledger = parseLedger(ledgerRoot, config.mainFile, config.pythonPath);
+    config.requireCnySettlement ??= ledger.operatingCurrencies?.length === 1 && ledger.operatingCurrencies[0] === "CNY";
     const today = new Date().toISOString().slice(0, 10);
     const active = ledger.accounts.filter((a) => accountIsActive(a, today));
     const defined = new Set(ledger.accounts.map((a) => a.account));

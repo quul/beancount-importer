@@ -18,6 +18,7 @@ import { discoverPython, parseLedger, parseLedgerText } from "../src/server/lib/
 import { BatchStore, profileId } from "../src/server/lib/batches.js";
 import { classificationMemoryKey, classificationMemoryLocation, saveMemory } from "../src/server/lib/classify.js";
 import { markDuplicates } from "../src/server/lib/dedup.js";
+import { exclusionKind } from "../src/shared/exclusions.js";
 import type { AppConfig, ImportPreview, ParsedTx } from "../src/shared/types.js";
 
 const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bean-api-regression-")));
@@ -341,6 +342,7 @@ try {
     ]);
     assert.ok(creditSample.txs.every((tx) => tx.rawAccount === "中信银行信用卡(6363)" && tx.fundingAccount === citic));
     assert.match(creditSample.txs[0].note, /原交易 USD 7\.50/);
+    assert.deepEqual(creditSample.txs[0].originalAmount, { amount: 7.50, currency: "USD" });
     const alternate = path.join(temporary, "different-pdf-rules.json"), input = path.join(temporary, "renamed.pdf");
     const layouts = JSON.parse(fs.readFileSync(new URL("../config/pdf-rules.json", import.meta.url), "utf8"));
     const copied = layouts.tables.find((layout: { source: string }) => layout.source === "bank-citic");
@@ -478,7 +480,7 @@ try {
     const undone = await request(reopened, undoRoute, { revision: current.revision, reviewSessionId });
     assert.deepEqual(undone.restoredIds, [id]);
     assert.equal(undone.batch.revision, current.revision + 1);
-    assert.deepEqual(undone.batch.txs, [{ ...current.txs[0], status: "excluded" }, current.txs[1]]);
+    assert.deepEqual(undone.batch.txs, [{ ...current.txs[0], status: "excluded", reviewExclusion: "manual" }, current.txs[1]]);
     assert.deepEqual(undone.batch.reviewUndo, excluded.reviewUndo);
     const initialStatus = await request(reopened, undoRoute, { revision: undone.batch.revision, reviewSessionId });
     assert.deepEqual(initialStatus.restoredIds, [id]);
@@ -728,6 +730,115 @@ try {
     passed("category allocation totals are checked before saving and can return to a single account");
   }
   {
+    const cnyRoot = path.join(temporary, "cny-settlement-ledger");
+    const cnyData = path.join(temporary, "cny-settlement-data");
+    const card = "Liabilities:CreditCard:Test";
+    const expense = "Expenses:Food:Meals:Dine";
+    const cnyDefinitions = definitions + `2025-01-01 open ${card} CNY\n`;
+    fs.mkdirSync(cnyRoot);
+    fs.writeFileSync(path.join(cnyRoot, "main.bean"), cnyDefinitions);
+    const cnyBase = await boot({ ...config, ledgerRoot: cnyRoot, requireCnySettlement: true }, cnyData);
+    const cnyStore = new BatchStore(path.join(cnyData, "batches"));
+    const seed = (txs: ParsedTx[]) => cnyStore.create({ file: "card.pdf", source: "bank-cmb", txs,
+      txCount: txs.length, errors: [], accountsDetected: [], ledgerProfile: profileId(cnyRoot, "main.bean") });
+    const expenseRow: ParsedTx = { ...batch.txs[0], source: "bank-cmb", sourceFile: "card.pdf", date: "2026-01-02", direction: "out",
+      eventType: "expense", currency: "USD", amount: 20, fundingAccount: card, finalAccount: expense, status: "ready" };
+    const foreign = (id: string, row: number, currency = "USD"): ParsedTx =>
+      ({ ...expenseRow, id, row, sourceTxId: id, currency });
+    const statement = (id: string, row: number, currency: string, fundingAccount = "", rawAccount = "/uploads/cmb.pdf"): ParsedTx =>
+      ({ ...foreign(id, row, currency), rawAccount, fundingAccount, fundingConfidence: fundingAccount ? 1 : 0,
+        issues: fundingAccount ? [] : ["账户未映射"], status: "pending" });
+    const nativeRow = statement("native-cny", 1, "CNY");
+    const yenRow = statement("foreign-jpy", 2, "JPY");
+    const newStatement = seed([nativeRow, yenRow, statement("other-statement", 3, "JPY", "", "/uploads/other.pdf")]);
+    const newFundingRoute = `/api/batch/${newStatement.batchId}/funding`;
+    const [statementGroup] = (await request(cnyBase, newFundingRoute, { revision: newStatement.revision })).groups;
+    assert.equal(statementGroup.statementOnly, true);
+    assert.ok(statementGroup.accounts.includes(card));
+    const mappedStatement = await request(cnyBase, newFundingRoute, { revision: newStatement.revision,
+      mappings: [{ id: statementGroup.id, account: card }] });
+    assert.deepEqual(mappedStatement.batch.txs.map((tx: ParsedTx) => tx.fundingAccount), [card, card, ""]);
+    assert.equal(mappedStatement.batch.txs[1].status, "pending");
+    assert.ok(!mappedStatement.batch.txs[1].issues.includes("账户未映射"));
+
+    const confirmedNative = { ...nativeRow, fundingAccount: card, fundingConfidence: 1 };
+    const savedStatement = seed([confirmedNative, yenRow]);
+    const fundingRoute = `/api/batch/${savedStatement.batchId}/funding`;
+    const resumedStatement = await request(cnyBase, fundingRoute, { revision: savedStatement.revision });
+    assert.deepEqual(resumedStatement.groups, []);
+    assert.equal(resumedStatement.batch.txs[1].fundingAccount, card);
+    assert.deepEqual(await request(cnyBase, fundingRoute, { revision: resumedStatement.batch.revision }), { groups: [] });
+
+    const ambiguous = seed([confirmedNative, statement("other-cny", 3, "CNY", "Assets:CN:BOC:2222"), yenRow]);
+    const ambiguousFunding = await request(cnyBase, `/api/batch/${ambiguous.batchId}/funding`, { revision: ambiguous.revision });
+    assert.deepEqual(ambiguousFunding, { groups: [] });
+    const settledStatement = seed([confirmedNative, yenRow]);
+    const settled = await request(cnyBase, `/api/batch/${settledStatement.batchId}/cny-settlement`,
+      { revision: settledStatement.revision, id: yenRow.id, amount: "40.00" });
+    assert.equal(settled.batch.txs[1].fundingAccount, card);
+
+    const visible = seed([
+      foreign("manual-usd", 1),
+      foreign("linked-usdt", 2, "USDT"),
+      foreign("second-jpy", 3, "JPY"),
+      { ...foreign("statement-cny", 4, "CNY"), amount: 54, originalAmount: { amount: 7.5, currency: "USD" } },
+    ]);
+    const repayment = { ...foreign("card-payment", 9, "CNY"), date: "2026-01-10", amount: 150, payee: "信用卡还款",
+      direction: "in", eventType: "transfer", status: "pending" } satisfies ParsedTx;
+    seed([repayment, { ...repayment, id: "other-card-payment", sourceTxId: "other-card-payment", fundingAccount: "Liabilities:OtherCard" }]);
+    const route = `/api/batch/${visible.batchId}`;
+    const read = await request(cnyBase, route);
+    assert.deepEqual(read.txs.map((tx: ParsedTx) => [tx.status, tx.originalAmount?.currency]), [
+      ["pending", "USD"], ["pending", "USDT"], ["pending", "JPY"], ["ready", "USD"],
+    ]);
+    await request(cnyBase, route + "/decide", { revision: read.revision, decisions: [{ id: "manual-usd", status: "ready" }] }, 422);
+    await request(cnyBase, route + "/decide", { revision: read.revision, decisions: [{ id: "manual-usd",
+      status: "ready", postings: [{ account: card, amount: -20, currency: "CNY" }, { account: expense, amount: 20, currency: "CNY" }] }] }, 422);
+    const before = await request(cnyBase, route + "/generate", { revision: read.revision });
+    assert.equal(before.generated, 1);
+    assert.match(before.entries, /original-amount: 7\.50 USD/);
+    assert.match(before.entries, /settlement-source: "statement"/);
+    const options = await request(cnyBase, route + "/cny-repayments/linked-usdt");
+    assert.deepEqual(options.map(({ payee, remaining }: { payee: string; remaining: number }) => [payee, remaining]), [["信用卡还款", 150]]);
+    const [choice] = options;
+    const settle = (revision: number, id: string, amount: string, repaymentKey?: string, expected = 200) =>
+      request(cnyBase, route + "/cny-settlement", { revision, id, amount, repaymentKey }, expected);
+    await settle(read.revision, "manual-usd", "1.001", undefined, 400);
+    await settle(read.revision, "statement-cny", "1.00", undefined, 422);
+    const manual = await settle(read.revision, "manual-usd", "145.80");
+    assert.deepEqual([manual.batch.txs[0].currency, manual.batch.txs[0].amount, manual.batch.txs[0].status], ["CNY", 145.8, "pending"]);
+    assert.deepEqual(manual.batch.txs[0].originalAmount, { amount: 20, currency: "USD" });
+    await request(cnyBase, route + "/commit", { revision: manual.batch.revision }, 409);
+    const linked = await settle(manual.batch.revision, "linked-usdt", "120.00", choice.key);
+    assert.equal(linked.batch.txs[1].cnySettlement.repayment.key, choice.key);
+    await settle(linked.batch.revision, "second-jpy", "30.01", choice.key, 422);
+    const approved = await request(cnyBase, route + "/decide", { revision: linked.batch.revision,
+      decisions: [{ id: "manual-usd", status: "ready" }, { id: "linked-usdt", status: "ready" }] });
+    const preview = await request(cnyBase, route + "/generate", { revision: approved.revision });
+    assert.equal(preview.generated, 3);
+    assert.match(preview.entries, /original-amount: 20\.00 USDT/);
+    assert.match(preview.entries, /settlement-source: "repayment"/);
+    assert.match(preview.entries, /settlement-repayment: /);
+    assert.match(preview.entries, /settlement-source: "manual"/);
+    const validated = parseLedgerText(cnyDefinitions + preview.entries, python);
+    assert.deepEqual(validated.errors, []);
+    assert.ok(validated.transactions.every((entry) => entry.postings.every(({ currency }) => currency === "CNY")));
+    await request(cnyBase, route + "/commit", { revision: preview.revision });
+    assert.equal(parseLedger(cnyRoot, "main.bean", python).transactions.length, 3);
+    const posted = await request(cnyBase, route);
+    const continuation = await request(cnyBase, `/api/batch/${posted.settlementBatchId}`);
+    assert.deepEqual(continuation.txs.map((tx: ParsedTx) => [tx.id, tx.status, tx.currency]), [["second-jpy", "pending", "JPY"]]);
+    assert.equal(continuation.committed, false);
+    await request(cnyBase, route + "/commit", { revision: preview.revision });
+    assert.equal((await request(cnyBase, route)).settlementBatchId, posted.settlementBatchId);
+    await settle(continuation.revision, "second-jpy", "25.00", choice.key, 409);
+    const finished = await request(cnyBase, `/api/batch/${posted.settlementBatchId}/cny-settlement`, {
+      revision: continuation.revision, id: "second-jpy", amount: "25.00", repaymentKey: choice.key,
+    });
+    assert.equal(finished.batch.txs[0].currency, "CNY");
+    passed("CNY review blocks unknown foreign amounts, keeps original units, and supports audited repayment allocations");
+  }
+  {
     const mergeRoot = path.join(temporary, "merge-ledger");
     const mergeData = path.join(temporary, "merge-data");
     const cnyFund = "Assets:CN:BOC:1111", otherFund = "Assets:CN:BOC:2222", usdFund = "Assets:Wallet:USD";
@@ -912,10 +1023,11 @@ try {
     assert.equal(excluded.excluded, suspects.length + 2);
     assert.deepEqual(excluded.batch.reviewUndo, { sessionId: reviewSessionId, depth: 1, action: "deduplicate", count: suspects.length + 2 });
     assert.equal(excluded.batch.revision, saved.revision + 1);
-    assert.ok(excluded.batch.txs.slice(0, suspects.length).every((tx: ParsedTx) => tx.status === "excluded" && tx.reviewNote === "已核对备注"));
+    assert.ok(excluded.batch.txs.slice(0, suspects.length).every((tx: ParsedTx) =>
+      exclusionKind(tx) === "deduplicate" && tx.reviewNote === "已核对备注"));
     assert.deepEqual(excluded.batch.txs.slice(suspects.length, suspects.length + other.length), other);
     const removedCopies = new Set(["bank-refund", "unreviewed-wechat"]);
-    const expectedCopies = copies.map((tx) => removedCopies.has(tx.id) ? { ...tx, status: "excluded" } : tx);
+    const expectedCopies = copies.map((tx) => removedCopies.has(tx.id) ? { ...tx, status: "excluded", reviewExclusion: "deduplicate" } : tx);
     assert.deepEqual(excluded.batch.txs.slice(suspects.length + other.length), JSON.parse(JSON.stringify(expectedCopies)));
     const updated = store.get(saved.batchId)!;
     assert.equal(updated.preview, undefined);
@@ -935,6 +1047,27 @@ try {
     await request(exclusionBase, action, { revision: excludedAgain.batch.revision }, 409);
     await request(exclusionBase, undo, { revision: excludedAgain.batch.revision, reviewSessionId }, 409);
     passed("batch exclusion keeps one reviewable cross-source copy, skips ambiguous matches, and saves all changes atomically");
+  }
+  {
+    const rules = await request(base, "/api/exclusion-rules") as Array<{ title: string; description?: string }>;
+    assert.match(rules.find(({ title }) => title === "支付宝余额转入余额宝")?.description ?? "", /30 秒/);
+    assert.ok(rules.some(({ title }) => title === "零钱与零钱通互转"));
+    const data = path.join(temporary, "exclusion-provenance");
+    const app = await boot(config, data);
+    const store = new BatchStore(path.join(data, "batches"));
+    const tx = batch.txs[0];
+    const rows: ParsedTx[] = [
+      { ...tx, id: "selected-suspect", status: "pending", issues: ["疑似重复入账"] },
+      { ...tx, id: "automatic", status: "excluded", excludedReason: "支付宝余额转入余额宝" },
+      { ...tx, id: "legacy", status: "excluded", issues: ["疑似重复入账"] },
+    ];
+    const saved = store.create({ file: "fixture.csv", source: "alipay", txs: rows, txCount: rows.length, errors: [],
+      accountsDetected: [], ledgerProfile: profileId(root, "main.bean") });
+    const route = `/api/batch/${saved.batchId}`;
+    await request(app, route + "/decide", { revision: saved.revision,
+      decisions: [{ id: rows[0].id, status: "excluded" }, { id: rows[1].id, status: "excluded" }], reviewSessionId });
+    assert.deepEqual(store.get(saved.batchId)!.txs.map(exclusionKind), ["manual", "automatic", undefined]);
+    passed("exclusion provenance follows the action and reports current statement rules without reclassifying old exclusions");
   }
   {
     const mappingRoot = path.join(temporary, "mapping-ledger");
