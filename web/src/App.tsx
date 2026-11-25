@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import type { AppConfig, EventType, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerMatch, ParsedTx, ReviewProblem, StatementName, TxDecision, TxStatus } from "../../src/shared/types.js";
 import {
   canFollowPurchaseRefund, CROSS_SOURCE_ISSUE, defaultNarration, duplicateReviewIssue, hasPdfSource, isSuspectedDuplicate,
-  LEDGER_DUPLICATE_ISSUE, MAX_NARRATION_LENGTH, PDF_REVIEW_ISSUE,
+  LEDGER_DUPLICATE_ISSUE, MAX_NARRATION_LENGTH, MAX_REVIEW_PAYEE_LENGTH, PDF_REVIEW_ISSUE, reviewPayeeText,
 } from "../../src/shared/types.js";
 import { planSuspectedDuplicateExclusions } from "../../src/shared/duplicateExclusions.js";
 import { exclusionKind, reviewStatusPatch } from "../../src/shared/exclusions.js";
@@ -84,6 +84,11 @@ type CategoryAdvance = { rowIds: ReadonlySet<string>; origin: Element | null };
 type TransactionDraft = { value: ReviewDraft; original: ReviewDraft };
 type DeleteTarget = Pick<BatchSummary, "batchId" | "file" | "revision"> & { createdAt?: number };
 type ReviewOpening = "import" | "resume" | "reload";
+type InlineReviewField = "narration" | "reviewPayee";
+const EMPTY_INLINE_DRAFTS: Record<InlineReviewField, Record<string, string>> = { narration: {}, reviewPayee: {} };
+const BULK_REVIEW_FIELDS: Record<NonNullable<ReviewTarget["field"]>, string> = {
+  funding: "资金账户", category: "分类账户", postings: "分录", tags: "标签", settlement: "人民币金额", exchange: "货币兑换",
+};
 type FundingTarget = { id: string; batch: ImportPreview; opening: ReviewOpening; groups: FundingMappingGroup[] };
 type PreviewCheck = { message: string; problems: ReviewProblem[] };
 
@@ -299,8 +304,9 @@ export default function App() {
   const [categoryAdvance, setCategoryAdvance] = useState<CategoryAdvance | null>(null);
   const [drafts, setDrafts] = useState<Record<string, TransactionDraft>>({});
   const [detailSaveAttempt, setDetailSaveAttempt] = useState<{ id: string }>();
-  const [narrationDrafts, setNarrationDrafts] = useState<Record<string, string>>({});
+  const [inlineDrafts, setInlineDrafts] = useState(EMPTY_INLINE_DRAFTS);
   const [bulkTags, setBulkTags] = useState("");
+  const [bulkPayee, setBulkPayee] = useState("");
   const [bulkCategoryAccount, setBulkCategoryAccount] = useState("");
   const [bulkScope, setBulkScope] = useState<"selected" | "filtered">("selected");
   const [mergeIds, setMergeIds] = useState<string[] | null>(null);
@@ -516,7 +522,7 @@ export default function App() {
   const emptyImportFailed = !!batch?.errors.length && batch.txs.length === 0;
   const editingDisabled = busy || readOnly;
   const detailDraftIds = Object.keys(drafts);
-  const hasReviewDrafts = detailDraftIds.length > 0 || Object.keys(narrationDrafts).length > 0;
+  const hasReviewDrafts = detailDraftIds.length > 0 || Object.values(inlineDrafts).some((fields) => Object.keys(fields).length > 0);
   const reviewIsSaving = pendingSaves.length > 0;
   const blockBatchChanges = hasReviewDrafts || reviewIsSaving;
   const undoDisabled = !reviewUndo || editingDisabled || blockBatchChanges;
@@ -525,7 +531,7 @@ export default function App() {
   const visible = useMemo(() => {
     const query = filter.trim().toLowerCase();
     return dateScopedRows.filter((row) => matchesReviewFilter(row, statusFilter) && matchesReviewSearch(row, query))
-      .sort((a, b) => sort === "amount" ? a.amount - b.amount : sort === "payee" ? a.tx.payee.localeCompare(b.tx.payee, "zh-CN")
+      .sort((a, b) => sort === "amount" ? a.amount - b.amount : sort === "payee" ? reviewPayeeText(a.tx).localeCompare(reviewPayeeText(b.tx), "zh-CN")
         : `${a.tx.date} ${a.tx.time ?? ""}`.localeCompare(`${b.tx.date} ${b.tx.time ?? ""}`));
   }, [dateScopedRows, filter, statusFilter, sort]);
   const totalPages = Math.max(1, Math.ceil(visible.length / PAGE_SIZE));
@@ -536,9 +542,10 @@ export default function App() {
   const selectableRows = visible.filter((row) => row.entries.some((tx) => !tx.reviewConflictId)).length;
   const selectedVisible = visibleEntries.filter((tx) => selected.has(tx.id)).length;
   const selectedRows = reviewRows.filter((row) => row.entries.some((tx) => selected.has(tx.id))).length;
-  const hiddenSelection = selectedRows - visible.filter((row) => row.entries.some((tx) => selected.has(tx.id))).length;
+  const selectedEntries = active.filter((tx) => selected.has(tx.id) && !tx.reviewConflictId);
+  const hiddenSelection = selectedEntries.length - selectedVisible;
   const count = (filter: ReviewFilter) => dateScopedRows.filter((row) => matchesReviewFilter(row, filter)).length;
-  const targets = bulkScope === "filtered" ? visibleEntries : active.filter((tx) => selected.has(tx.id));
+  const targets = bulkScope === "filtered" ? visibleEntries : selectedEntries;
   const bulkPosting = useMemo(() => {
     if (readOnly || !selectedRows) return null;
     const accountNames = new Set(accounts.map(({ account }) => account));
@@ -551,6 +558,10 @@ export default function App() {
   const bulkTagErrors = invalidTags(bulkTags);
   const bulkEditDisabled = editingDisabled || detailDraftIds.length > 0 || !targets.length;
   const bulkTagDisabled = bulkEditDisabled || !parseTags(bulkTags).length || Boolean(bulkTagErrors.length);
+  const bulkPayeeDisabled = bulkEditDisabled || !bulkPayee.trim() || targets.some(({ id }) => inlineDrafts.reviewPayee[id] !== undefined);
+  const bulkReviewFields = [...new Set(bulkPosting?.reviewTargets.map(({ field }) => field ? BULK_REVIEW_FIELDS[field] : "交易详情"))];
+  const bulkReadyCount = bulkPosting ? targets.filter(({ status }) => status === "ready").length : 0;
+  const bulkUnavailableCount = bulkPosting ? targets.filter(({ status, excludedReason }) => status === "duplicate" || (status !== "ready" && excludedReason)).length : 0;
   const canApplyBulkCategory = !bulkEditDisabled && !reviewIsSaving && bulkCategory?.options.some(({ account }) => account === bulkCategoryAccount);
   const pendingHigh = active.filter((tx) => tx.status === "pending" && !tx.currencyExchange && !tx.reviewConflictId && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 1) >= 0.9
     && !tx.issues?.length && tx.suggestedAccount && !missingPostingAccount({ ...tx, finalAccount: tx.suggestedAccount }));
@@ -774,8 +785,8 @@ export default function App() {
     setPreviewCheck(null);
     setReviewFocus(null);
     setUndoFlashIds(null);
-    setDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null);
-    setBulkScope("selected"); setBulkTags("");
+    setDrafts({}); setInlineDrafts(EMPTY_INLINE_DRAFTS); setSelected(new Set()); setDetailTxId(null);
+    setBulkScope("selected"); setBulkTags(""); setBulkPayee("");
     invalidate(); setNotice(value.mergedInto ? "已合并" : value.committed ? "已提交" : resumed && value.txs.length > 0 ? "已恢复审批进度" : "");
   };
 
@@ -894,11 +905,11 @@ export default function App() {
     startReview(summary.batchId, savedBatch, false);
   });
 
-  const discardNarrationDraft = (id: string, savedValue?: string) => setNarrationDrafts((previous) => {
-    if (savedValue !== undefined && previous[id] !== savedValue) return previous;
-    const next = { ...previous };
+  const discardInlineDraft = (field: InlineReviewField, id: string, savedValue?: string) => setInlineDrafts((previous) => {
+    if (savedValue !== undefined && previous[field][id] !== savedValue) return previous;
+    const next = { ...previous[field] };
     delete next[id];
-    return next;
+    return { ...previous, [field]: next };
   });
 
   const enqueueReviewSave = (
@@ -942,16 +953,16 @@ export default function App() {
 
   const saveDecisions = (
     decisions: TxDecision[] | ((current: ImportPreview) => TxDecision[]),
-    { patches, savedNarration, blocking = !patches && !savedNarration, onSaved }: {
-      patches?: ReviewPatches; savedNarration?: { id: string; value: string }; blocking?: boolean; onSaved?: () => void;
+    { patches, savedInline, blocking = !patches && !savedInline, onSaved }: {
+      patches?: ReviewPatches; savedInline?: { field: InlineReviewField; id: string; value: string }; blocking?: boolean; onSaved?: () => void;
     } = {},
   ) => {
     if (Array.isArray(decisions) && !decisions.length) return false;
     return enqueueReviewSave(async (id, current) => {
       const changes = typeof decisions === "function" ? decisions(current) : decisions;
       if (!changes.length) return;
-      if (savedNarration && (current.txs.find((tx) => tx.id === savedNarration.id)?.narration ?? null) === changes[0].narration) {
-        discardNarrationDraft(savedNarration.id, savedNarration.value);
+      if (savedInline && (current.txs.find((tx) => tx.id === savedInline.id)?.[savedInline.field] ?? null) === changes[0][savedInline.field]) {
+        discardInlineDraft(savedInline.field, savedInline.id, savedInline.value);
         return;
       }
       const saved = await api.decide(id, current.revision ?? 0, changes, true, reviewSessionId);
@@ -965,9 +976,9 @@ export default function App() {
       }
       return { batch: next ?? await api.batch(id), notice: `已保存 ${changes.length} 笔` };
     }, {
-      patches, blocking, saveOnBlur: Boolean(savedNarration),
+      patches, blocking, saveOnBlur: Boolean(savedInline),
       onSaved: () => {
-        if (savedNarration) discardNarrationDraft(savedNarration.id, savedNarration.value);
+        if (savedInline) discardInlineDraft(savedInline.field, savedInline.id, savedInline.value);
         onSaved?.();
       },
     });
@@ -1090,6 +1101,16 @@ export default function App() {
   };
 
   const bulkFlag = (flag: "*" | "!") => saveFlags(targets, flag);
+  const applyBulkPayee = (close: () => void) => {
+    if (bulkPayeeDisabled) return;
+    const value = bulkPayee.trim();
+    const decisions = targets.filter((tx) => reviewPayeeText(tx) !== value)
+      .map((tx) => ({ id: tx.id, reviewPayee: value === tx.payee ? null : value }));
+    const clear = () => setBulkPayee((current) => current === bulkPayee ? "" : current);
+    close();
+    if (decisions.length) saveDecisions(decisions, { onSaved: clear });
+    else clear();
+  };
   const applyTags = (mode: "add" | "remove") => {
     const tags = parseTags(bulkTags);
     if (!tags.length || invalidTags(bulkTags).length) return;
@@ -1154,7 +1175,7 @@ export default function App() {
   });
 
   const clearReview = () => {
-    replaceBatch(null, ""); setDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null); setMergeIds(null); invalidate();
+    replaceBatch(null, ""); setDrafts({}); setInlineDrafts(EMPTY_INLINE_DRAFTS); setSelected(new Set()); setDetailTxId(null); setMergeIds(null); invalidate();
     setFundingTarget(null);
     setPdfPreviewTx(null);
     setMappingTarget(null);
@@ -1306,13 +1327,13 @@ export default function App() {
     const options = awaitingCny || fundingError
       ? accounts.filter((account) => accountIsActive(account, tx.date, awaitingCny ? "CNY" : tx.currency)) : accounts;
     return <AccountSelect value={tx.fundingAccount} accounts={options}
-      funding label={`${tx.payee || "（无商户）"} · 资金账户`} inputId={fundingInputId(tx.id, detail)} placeholder="选择资金账户" validationMessage={fundingError}
+      funding label={`${reviewPayeeText(tx) || "（无商户）"} · 资金账户`} inputId={fundingInputId(tx.id, detail)} placeholder="选择资金账户" validationMessage={fundingError}
       matchReason={matchReason} confirmCurrent={Boolean(matchReason && tx.fundingAccount)} autoHighlight={Boolean(fundingError)}
       disabled={disabled} onChange={(funding) => saveReviewDecisions(fundingRows.map(({ id }) => ({ id, funding })))} />;
   };
 
   const renderAccountFields = (tx: ParsedTx, disabled: boolean, refund?: ParsedTx, detail = false) => {
-    const payee = tx.payee || "（无商户）";
+    const payee = reviewPayeeText(tx) || "（无商户）";
     const accountDisabled = disabled || Boolean(tx.postings || refund?.postings || tx.duplicateOf?.refundCopy);
     const isTransfer = tx.eventType === "transfer";
     const categoryLabel = isTransfer ? "对方账户" : "分类账户";
@@ -1359,7 +1380,7 @@ export default function App() {
 
   const renderPostingActions = (tx: ParsedTx, disabled: boolean, refund?: ParsedTx, compact = false) => {
     if (readOnly || tx.reviewConflictId) return null;
-    const payee = tx.payee || "（无商户）";
+    const payee = reviewPayeeText(tx) || "（无商户）";
     const entries = refund ? [tx, refund] : [tx];
     const exclude = entries.filter(isEditablePostingStatus);
     const unsettled = entries.find((entry) => !entry.excludedReason && entry.status !== "excluded"
@@ -1394,33 +1415,36 @@ export default function App() {
       {exclude.length > 0 && <button type="button" className={`btn small quiet decision-exclude${iconButton}${emphasizeExclude ? " is-urgent" : ""}`} disabled={disabled}
         aria-label={`${excludeLabel} · ${payee}`} title={excludeLabel} onClick={excludeEntries}>{compact ? <ReviewIcon name="cross" /> : excludeLabel}</button>}
       {compact && tx.merge && <ReviewMenu label={`更多操作 · ${payee}`} title="⋯">{(close) =>
-        <button type="button" className="menu-action" disabled={disabled || narrationDrafts[tx.id] !== undefined}
+        <button type="button" className="menu-action" disabled={disabled || Object.values(inlineDrafts).some((fields) => fields[tx.id] !== undefined)}
           aria-label={`撤销合并 · ${payee}`} onClick={() => { close(); undoMerge(tx); }}>撤销合并</button>
       }</ReviewMenu>}
     </div>;
   };
 
-  const renderNarration = (tx: ParsedTx, payee: string) => {
-    const automatic = defaultNarration(tx);
-    const draft = narrationDrafts[tx.id];
-    const value = draft ?? tx.narration ?? "";
-    const lockedNarration = readOnly || Boolean(tx.reviewConflictId);
+  const renderInlineField = (tx: ParsedTx, field: InlineReviewField, label: string) => {
+    const isPayee = field === "reviewPayee";
+    const automatic = isPayee ? "" : defaultNarration(tx);
+    const draft = inlineDrafts[field][tx.id];
+    const value = draft ?? (isPayee ? reviewPayeeText(tx) : tx.narration ?? "");
+    const lockedField = readOnly || Boolean(tx.reviewConflictId);
     const canComplete = !value && automatic.length > 0 && automatic.length <= MAX_NARRATION_LENGTH;
     const edit = (next: string) => {
       invalidate();
-      setNarrationDrafts((previous) => ({ ...previous, [tx.id]: next }));
+      setInlineDrafts((previous) => ({ ...previous, [field]: { ...previous[field], [tx.id]: next } }));
     };
-    return <div className="tx-narration"><input type="text" aria-label={`账本摘要 · ${payee}`} value={value}
-      maxLength={MAX_NARRATION_LENGTH} placeholder={automatic || "输入账本摘要"}
-      title={!lockedNarration && canComplete ? "Tab 填入账单摘要" : value || "账本摘要"}
-      readOnly={lockedNarration} disabled={busy} onChange={(event) => edit(event.target.value)}
+    return <span className={`tx-inline-text ${isPayee ? "tx-payee" : "tx-narration"}`}><input type="text" aria-label={label} value={value}
+      maxLength={isPayee ? MAX_REVIEW_PAYEE_LENGTH : MAX_NARRATION_LENGTH} placeholder={isPayee ? "（无商户）" : automatic || "输入账本摘要"}
+      title={!lockedField && canComplete ? "Tab 填入账单摘要" : value || (isPayee ? "输入商户" : "账本摘要")}
+      readOnly={lockedField} disabled={busy} onChange={(event) => edit(event.target.value)}
       onBlur={() => {
-        if (lockedNarration || draft === undefined) return;
-        void saveDecisions([{ id: tx.id, narration: draft.trim() ? draft : null }], {
-          savedNarration: { id: tx.id, value: draft },
+        if (lockedField || draft === undefined) return;
+        const trimmed = draft.trim();
+        const next = isPayee ? (trimmed === tx.payee ? null : trimmed) : (trimmed ? draft : null);
+        void saveDecisions([{ id: tx.id, [field]: next }], {
+          savedInline: { field, id: tx.id, value: draft },
         });
       }} onKeyDown={(event) => {
-        if (busy || lockedNarration || event.nativeEvent.isComposing) return;
+        if (busy || lockedField || event.nativeEvent.isComposing) return;
         if (event.key === "Tab" && canComplete && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey) {
           event.preventDefault();
           edit(automatic);
@@ -1429,9 +1453,9 @@ export default function App() {
           event.currentTarget.blur();
         } else if (event.key === "Escape" && draft !== undefined) {
           event.preventDefault();
-          discardNarrationDraft(tx.id);
+          discardInlineDraft(field, tx.id);
         }
-      }} /></div>;
+      }} /></span>;
   };
 
   const renderPostingEditor = (tx: ParsedTx, showValidation: boolean, leg?: string) => {
@@ -1481,7 +1505,7 @@ export default function App() {
     return <div className="detail-pdf-source">
       {needsCheck && <span>{PDF_REVIEW_ISSUE}</span>}
       {available && <button type="button" className="pdf-preview-button" aria-haspopup="dialog"
-        aria-label={`查看 PDF 原文 · ${tx.payee || "无商户"}`} onClick={() => setPdfPreviewTx(tx)}>查看 PDF 原文</button>}
+        aria-label={`查看 PDF 原文 · ${reviewPayeeText(tx) || "无商户"}`} onClick={() => setPdfPreviewTx(tx)}>查看 PDF 原文</button>}
     </div>;
   };
 
@@ -1502,7 +1526,7 @@ export default function App() {
 
   const renderMergedOriginals = (originals: ParsedTx[]) => <div className="merge-originals">
     {originals.map((tx) => <article className="refund-leg" key={tx.id}>
-      <div className="refund-leg-heading"><h4>{tx.payee || "（无商户）"}</h4>
+      <div className="refund-leg-heading"><h4>{reviewPayeeText(tx) || "（无商户）"}</h4>
         <strong className={`amt ${tx.direction}`}>{tx.direction === "in" ? "+" : "−"}{amountText(tx.amount)} {tx.currency}</strong>
         {showDecisionStatus && <span className={`decision-status ${tx.status}`}>{DECISION_LABELS[tx.status]}</span>}
       </div>
@@ -1560,7 +1584,9 @@ export default function App() {
         <div className="detail-heading">
           <div className="detail-payee-line">
             {renderDetailFlag(editableEntries.length ? editableEntries : entries, refund ? "整组账本标记" : "账本标记", editingDisabled || !editableEntries.length)}
-            <h3 id="transaction-detail-heading" ref={detailHeading} tabIndex={-1}>{tx.payee || "（无商户）"}</h3>
+            <h3 id="transaction-detail-heading" ref={detailHeading} tabIndex={-1} aria-label={reviewPayeeText(tx) || "（无商户）"}>
+              {renderInlineField(tx, "reviewPayee", "交易详情商户")}
+            </h3>
           </div>
           <div className="detail-meta">
             <time dateTime={tx.time ? `${tx.date}T${tx.time}` : tx.date}>{timestamp}</time>
@@ -1637,6 +1663,7 @@ export default function App() {
               <strong className={`amt ${entry.direction}`}>{fmt(entry.amount)} {entry.currency}</strong>
               {showDecisionStatus && <span className={`decision-status ${entry.status}`}>{postingStatusLabel(entry, posted)}</span>}</div>
             <time className="tx-date" dateTime={entry.time ? `${entry.date}T${entry.time}` : entry.date}>{entry.date}{entry.time && ` ${entry.time}`}</time>
+            {renderInlineField(entry, "reviewPayee", `${label}商户`)}
             {entry.reviewNote && <dl className="tx-meta"><div><dt>审批备注</dt><dd>{entry.reviewNote}</dd></div></dl>}
             <details className="refund-leg-actions">
               <summary>{readOnly ? "单笔详情" : "单笔审批与备注"}</summary>
@@ -1712,7 +1739,7 @@ export default function App() {
   </div>;
 
   const renderReviewRow = ({ tx, refund, entries, amount, originals }: ReviewRow) => {
-    const payee = tx.payee || "（无商户）";
+    const payee = reviewPayeeText(tx) || "（无商户）";
     const ready = tx.status === "ready";
     const isSelected = entries.every((entry) => selected.has(entry.id));
     const partlySelected = !isSelected && entries.some((entry) => selected.has(entry.id));
@@ -1778,7 +1805,7 @@ export default function App() {
       </td>}
       <td role="cell" className="tx-summary-cell">
         <div className="tx-summary-content">
-            <div className="payee" title={payee}>{payee}</div>
+            {renderInlineField(tx, "reviewPayee", `商户 · ${payee}`)}
             <div className="tx-secondary">
               <time className="tx-date" dateTime={tx.time ? `${tx.date}T${tx.time}` : tx.date}
                 title={tx.time ? `${tx.date} ${tx.time}` : tx.date}>
@@ -1806,7 +1833,7 @@ export default function App() {
             {splitChargeEntry && <button type="button" className="btn small quiet split-charge-row-hint"
               onClick={() => revealSplitChargeReview(splitChargeEntry.id)}>查看拆单金额匹配</button>}
             {rowProblem && <p id={`review-row-error-${tx.id}`} className="review-field-error">{rowProblem}</p>}
-            {renderNarration(tx, payee)}
+            {renderInlineField(tx, "narration", `账本摘要 · ${payee}`)}
             {statementSources.size > 0 && <StatementSources sources={sourcesFor(originals ?? entries)} />}
         </div>
       </td>
@@ -2063,8 +2090,8 @@ export default function App() {
         <footer className="review-footer">
           {bulkPosting ? <div className="bulk-bar" role="group" aria-label="批量编辑">
             <select className="bulk-scope" aria-label="批量编辑范围" value={bulkScope} onChange={(event) => setBulkScope(event.target.value as typeof bulkScope)}>
-              <option value="selected">已选 {selectedRows} 笔{hiddenSelection > 0 ? `（筛选外 ${hiddenSelection}）` : ""}</option>
-              <option value="filtered">全部可选结果 · {selectableRows} 笔</option>
+              <option value="selected">已选 {selectedEntries.length} 笔{hiddenSelection > 0 ? `（筛选外 ${hiddenSelection}）` : ""}</option>
+              <option value="filtered">全部可选结果 · {visibleEntries.length} 笔</option>
             </select>
             {bulkCategory && <div className="bulk-category" role="group" aria-label="批量设置分类">
               <AccountSelect value={bulkCategoryAccount} accounts={bulkCategory.options} label="批量分类账户" placeholder="设置分类" autoHighlight
@@ -2076,12 +2103,20 @@ export default function App() {
               {bulkCategory.eligible.length > 0 && !bulkCategory.options.length && <span className="bulk-category-hint">无共同可用分类</span>}
             </div>}
             <button type="button" className="btn primary small" disabled={bulkEditDisabled || !bulkPosting.approvals.length}
-              aria-describedby={bulkPosting.reviewTargets.length ? "bulk-review-hint" : undefined}
+              aria-describedby={bulkReviewFields.length || bulkReadyCount || bulkUnavailableCount ? "bulk-review-hint" : undefined}
               onClick={() => savePostingDecisions(bulkPosting.approvals, { followedRefundIds: bulkPosting.followedRefundIds })}>标记 {bulkPosting.approvalCount} 笔入账</button>
             <button type="button" className="btn small" disabled={bulkEditDisabled || !bulkPosting.exclusionIds.length}
               onClick={() => void savePostingStatus(bulkPosting.exclusionIds, "excluded")}>{bulkScope === "filtered" ? "排除筛选结果" : "排除所选"}</button>
             {(bulkScope === "filtered" ? selectableRows : selectedRows) >= 2 && <button type="button" className="btn small" disabled={bulkEditDisabled || targets.length < 2}
               onClick={() => { setError(""); setMergeIds(targets.map(({ id }) => id)); }}>合并记账</button>}
+            <ReviewMenu label="批量设置商户" title="设置商户">{(close) => <form className="bulk-edit-menu" onSubmit={(event) => {
+              event.preventDefault();
+              applyBulkPayee(close);
+            }}>
+              <label>商户<input value={bulkPayee} onChange={(event) => setBulkPayee(event.target.value)} aria-label="批量商户"
+                maxLength={MAX_REVIEW_PAYEE_LENGTH} disabled={bulkEditDisabled} /></label>
+              <button type="submit" className="btn small" disabled={bulkPayeeDisabled}>应用到 {targets.length} 笔</button>
+            </form>}</ReviewMenu>
             <ReviewMenu label="批量标签与标记" title="标签与标记">{(close) => <div className="bulk-edit-menu">
               <input value={bulkTags} onChange={(event) => setBulkTags(event.target.value)} placeholder="英文标签，空格分隔" aria-label="批量标签"
                 aria-describedby={bulkTagErrors.length ? "bulk-tag-errors" : undefined} aria-invalid={bulkTagErrors.length > 0 || undefined} />
@@ -2096,8 +2131,12 @@ export default function App() {
               </div>
             </div>}</ReviewMenu>
             <button type="button" className="btn small quiet" onClick={() => setSelected(new Set())}>清空选择</button>
-            {bulkPosting.reviewTargets.length > 0 && <button id="bulk-review-hint" type="button" className="btn small quiet bulk-review-hint"
-              onClick={() => revealReviewTarget(bulkPosting.reviewTargets)}>{bulkPosting.reviewTargets.length} 笔需核对</button>}
+            {Boolean(bulkReviewFields.length || bulkReadyCount || bulkUnavailableCount) && <div id="bulk-review-hint" className="bulk-posting-hints">
+              {bulkReviewFields.length > 0 && <button type="button" className="btn small quiet bulk-review-hint"
+                onClick={() => revealReviewTarget(bulkPosting.reviewTargets)}>需核对{bulkReviewFields.join("、")}</button>}
+              {bulkReadyCount > 0 && <span>{bulkReadyCount} 笔已标记</span>}
+              {bulkUnavailableCount > 0 && <span>{bulkUnavailableCount} 笔不可入账</span>}
+            </div>}
           </div> : <span className="review-count">{visible.length} 笔</span>}
           <nav className="toolbar pagination" aria-label="分页">
             <button type="button" className="btn small quiet" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>上一页</button>
@@ -2119,6 +2158,14 @@ export default function App() {
             {preview.fileCounts?.[file] !== undefined && <small className="muted">{preview.fileCounts[file]} 笔</small>}
           </li>)}</ul>
         </div> : preview.targetFiles === undefined && <p className="muted preview-targets">涉及月份 {Object.keys(preview.monthFiles).join(" · ")}</p>}
+        {preview.assetBalances && <section className="preview-asset-balances" aria-labelledby="preview-asset-balances-heading">
+          <h3 id="preview-asset-balances-heading">资产账户预计余额</h3><small className="muted">按账本全部日期计算</small>
+          <dl>{Object.entries(preview.assetBalances).map(([account, amounts]) => <div key={account}>
+            <dt><code>{account}</code></dt>
+            <dd>{Object.entries(amounts).map(([currency, amount]) => <span key={currency}><strong>{amount}</strong> <span className="muted">{currency}</span></span>)}</dd>
+          </div>)}</dl>
+        </section>}
+        {preview.assetBalancesWarning && <p className="muted" role="status">{preview.assetBalancesWarning}</p>}
         {preview.opens.length > 0 && <p className="error-line">账户指令建议：{preview.opens.join("；")}</p>}
         {preview.errors?.map((message, index) => <p role="alert" className="error-line" key={index}>{message}</p>)}
         <BeancountCode className="code" text={preview.entries} />

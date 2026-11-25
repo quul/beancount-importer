@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFile, spawnSync } from "node:child_process";
-import type { LedgerBalanceSnapshot, LedgerError, LedgerInfo } from "../../shared/types.js";
+import type { LedgerBalances, LedgerBalanceSnapshot, LedgerError, LedgerInfo } from "../../shared/types.js";
 
 const BRIDGE = path.resolve(import.meta.dirname, "../../../scripts/ledger_bridge.py");
 const READ_LEDGER_HINT = "无法读取账本。请在「账本设置」中检查主文件和 Python 路径。";
@@ -18,9 +18,10 @@ export interface LedgerValidation {
   errors: LedgerError[];
 }
 
-type BridgeResult = LedgerInfo & LedgerValidation & { balanceSnapshot?: LedgerBalanceSnapshot; fatal?: string };
+type BridgeResult = LedgerInfo & LedgerValidation & { balanceSnapshot?: LedgerBalanceSnapshot; assetBalances?: LedgerBalances; fatal?: string };
 type BridgeRequest = { operation: "inspect" | "validate"; file?: string; text?: string; trackAccountSources?: boolean }
-  | { operation: "balances"; file: string; balanceDate: string };
+  | { operation: "balances"; file: string; balanceDate: string }
+  | { operation: "projected_asset_balances"; file: string; accounts: string[]; batchId: string; generated: string[] };
 const bridgeOptions = () => ({
   encoding: "utf-8" as const,
   env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1", PYTHONIOENCODING: "utf-8" },
@@ -105,6 +106,12 @@ export async function readLedgerBalanceSnapshot(rootDir: string, mainFile: strin
   const result = await bridgeAsync({ operation: "balances", file: ledgerFile(rootDir, mainFile), balanceDate }, pythonPath || discoverPython(rootDir));
   if (!result.balanceSnapshot) throw new LedgerAccessError("Beancount 桥接未返回账户余额", READ_LEDGER_HINT);
   return result.balanceSnapshot;
+}
+
+export function readProjectedAssetBalances(rootDir: string, mainFile: string, pythonPath: string, accounts: string[], batchId: string, generated: string[]): LedgerBalances {
+  const { assetBalances } = bridge({ operation: "projected_asset_balances", file: ledgerFile(rootDir, mainFile), accounts, batchId, generated }, pythonPath);
+  if (!assetBalances) throw new LedgerAccessError("Beancount 桥接未返回预计资产余额", READ_LEDGER_HINT);
+  return assetBalances;
 }
 
 /** Text parsing is native as well; no regex fallback silently drops directives. */

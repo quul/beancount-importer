@@ -125,7 +125,7 @@ export function buildBulkPostingPlan(rows: readonly ReviewRow[], accounts: Reado
       // The server applies the purchase's category to the refund when it saves the purchase.
       approvals.push(purchase.decision);
       followedRefundIds.push(refund.id);
-      approvalCount++;
+      approvalCount += tx.status === "ready" ? 1 : 2;
       continue;
     }
 
@@ -134,7 +134,7 @@ export function buildBulkPostingPlan(rows: readonly ReviewRow[], accounts: Reado
     if (blocked) reviewTargets.push(blocked.target);
     else {
       approvals.push(...plans.flatMap((plan) => "decision" in plan ? [plan.decision] : []));
-      approvalCount++;
+      approvalCount += candidates.length;
     }
   }
   return { approvals, approvalCount, exclusionIds, followedRefundIds, reviewTargets };
@@ -175,7 +175,7 @@ export function matchesReviewSearch(row: ReviewRow, query: string): boolean {
     || row.tx.merge?.totals.some(({ amount, currency }) => `${amount.toFixed(2)} ${currency}`.toLowerCase().includes(query))) return true;
   return [...row.entries, ...(row.originals ?? [])].some((tx) => {
     const original = originalForeignAmount(tx);
-    return [tx.payee, tx.note, tx.narration, tx.rawAccount, tx.recognition?.label, tx.recognition?.fundingMethod,
+    return [tx.payee, tx.reviewPayee, tx.note, tx.narration, tx.rawAccount, tx.recognition?.label, tx.recognition?.fundingMethod,
     tx.finalAccount, tx.fundingAccount, tx.reviewNote, tx.sourceStatus, tx.excludedReason, tx.sourceTxId, tx.amount.toFixed(2), ...(tx.tags ?? []),
     original && `${original.amount} ${original.currency}`,
     tx.currencyExchange?.account, tx.currencyExchange && `${tx.currencyExchange.amount} ${tx.currencyExchange.currency}`,

@@ -270,15 +270,20 @@ try {
   const bulkRows = buildReviewRows([pendingPurchase, pendingRefund, missing, duplicate]);
   assert.deepEqual(buildBulkPostingPlan(bulkRows, accounts, new Set([pendingPurchase.id, pendingRefund.id])), {
     approvals: [{ id: pendingPurchase.id, account: "Expenses:Food", status: "ready" }],
-    approvalCount: 1, exclusionIds: [pendingPurchase.id, pendingRefund.id], followedRefundIds: [pendingRefund.id], reviewTargets: [],
+    approvalCount: 2, exclusionIds: [pendingPurchase.id, pendingRefund.id], followedRefundIds: [pendingRefund.id], reviewTargets: [],
   });
   assert.deepEqual(buildBulkPostingPlan(bulkRows, accounts), {
     approvals: [{ id: pendingPurchase.id, account: "Expenses:Food", status: "ready" }],
-    approvalCount: 1, exclusionIds: [pendingPurchase.id, pendingRefund.id, missing.id], followedRefundIds: [pendingRefund.id],
+    approvalCount: 2, exclusionIds: [pendingPurchase.id, pendingRefund.id, missing.id], followedRefundIds: [pendingRefund.id],
     reviewTargets: [{ id: missing.id, field: "category" }],
   });
   const needsRefundReview = buildReviewRows([pendingPurchase, { ...pendingRefund, issues: [LEDGER_DUPLICATE_ISSUE] }]);
   assert.deepEqual(buildBulkPostingPlan(needsRefundReview, accounts).reviewTargets, [{ id: pendingRefund.id }]);
+  const readyPurchase = { ...pendingPurchase, finalAccount: "Expenses:Food", status: "ready" } satisfies ParsedTx;
+  assert.equal(buildBulkPostingPlan(buildReviewRows([readyPurchase, pendingRefund]), accounts).approvalCount, 1);
+  const [renamedRow] = buildReviewRows([{ ...pendingPurchase, payee: "账单原商户", reviewPayee: "审批新商户" }]);
+  assert.ok(matchesReviewSearch(renamedRow, "账单原商户"));
+  assert.ok(matchesReviewSearch(renamedRow, "审批新商户"));
   console.log("✓ bulk decisions honor the scope, keep paired refunds automatic, and leave unresolved rows for review");
 
   const fundAccount = { account: "Income:Investment:Fund-基金收益", type: "income", openedAt: "2026-01-01", currencies: ["CNY"] } satisfies ParsedAccount;

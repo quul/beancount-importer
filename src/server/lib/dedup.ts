@@ -9,6 +9,10 @@ export { sourceKey };
 
 export interface Fingerprint { key: string; source: string }
 const normPayee = (value: string) => value.replace(/[\s（）()]/g, "").toLowerCase();
+const matchesLedgerPayee = (ledger: LedgerTx, payee: string) => {
+  const sourcePayee = ledger.metadata?.["source-payee"];
+  return normPayee(ledger.payee) === payee || (sourcePayee !== undefined && normPayee(sourcePayee) === payee);
+};
 export function fingerprint(tx: { date: string; amount: number; direction: string; payee: string }): string {
   return [looseFingerprint(tx), normPayee(tx.payee)].join("|");
 }
@@ -47,13 +51,14 @@ function ledgerDuplicateCandidates(tx: ParsedTx, ledgerTxs: LedgerTx[], assigned
   if (!usableAccount(tx.fundingAccount)) return [];
   const payment = (posting: DraftPosting) => posting.account === tx.fundingAccount && posting.currency === tx.currency;
   const amount = fundingPostingSign(tx) * tx.amount;
+  const payee = normPayee(tx.payee);
   const candidates: LedgerMatch[] = [];
   for (const ledger of ledgerTxs) {
     if (assignedLedger.has(ledger.id) || ledger.date !== tx.date) continue;
     const unrounded = ledger.unroundedFunding;
     let reason: string;
     if (ledger.postings.some((posting) => payment(posting) && sameAmount(posting.amount, amount))) {
-      reason = normPayee(ledger.payee) === normPayee(tx.payee) ? SAME_PAYEE_REASON : OTHER_PAYEE_REASON;
+      reason = matchesLedgerPayee(ledger, payee) ? SAME_PAYEE_REASON : OTHER_PAYEE_REASON;
     } else if (unrounded && payment(unrounded) && unrounded.amount === amount) {
       reason = `${ROUNDING_REASON}，明细合计 ${Math.abs(unrounded.amount)} ${unrounded.currency}`;
     } else continue;
@@ -144,10 +149,11 @@ export function markDuplicates(allTxs: ParsedTx[], ledgerTxs: LedgerTx[]): Dedup
   // Merchant history is useful even while wallet identity or transaction amount
   // is unresolved. References are presentation context and never duplicate proof.
   for (const tx of allTxs) {
-    if (tx.status === "duplicate" || !normPayee(tx.payee)) continue;
+    const payee = normPayee(tx.payee);
+    if (tx.status === "duplicate" || !payee) continue;
     const existing = new Set((tx.matches ?? []).map((match) => match.id));
     const history = ledgerTxs.filter((ledger) => {
-      if (normPayee(ledger.payee) !== normPayee(tx.payee) || existing.has(ledger.id)) return false;
+      if (existing.has(ledger.id) || !matchesLedgerPayee(ledger, payee)) return false;
       existing.add(ledger.id); return true;
     })
       .sort((a, b) => b.date.localeCompare(a.date)).slice(0, 5);

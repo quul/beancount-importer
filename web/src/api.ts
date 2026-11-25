@@ -1,4 +1,4 @@
-import type { AppConfig, AutomaticExclusionRule, BatchRevision, CnyRepaymentChoice, CurrencyExchangeInput, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerBalanceSnapshot, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, SplitChargeReview, StatementName, StatementSource, TxDecision } from "../../src/shared/types.js";
+import type { AppConfig, AutomaticExclusionRule, BatchRevision, CnyRepaymentChoice, CurrencyExchangeInput, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerBalances, LedgerBalanceSnapshot, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, SplitChargeReview, StatementName, StatementSource, TxDecision } from "../../src/shared/types.js";
 import type { ManualBatchInput } from "../../src/shared/manual-batch.js";
 
 export type ConfigResponse = AppConfig & { nativePathPicker?: boolean };
@@ -40,6 +40,8 @@ export interface GeneratedPreview {
   monthFiles: Record<string, string>;
   targetFiles?: string[];
   fileCounts?: Record<string, number>;
+  assetBalances?: LedgerBalances;
+  assetBalancesWarning?: string;
   generated: number;
   opens: string[];
   revision: number;

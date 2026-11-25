@@ -203,6 +203,7 @@ export function ReviewPostingFields({ tx, draft, accounts, disabled, postingErro
 export function TransactionSourceDetails({ tx, counterpart, sources }: { tx: ParsedTx; counterpart?: ParsedTx; sources?: StatementSource[] }) {
   return <dl className="tx-meta source-details">
     <div><dt>原始来源</dt><dd>{tx.sourceFile} · 第 {tx.row} {tx.source === "manual" ? "笔" : "行 · " + tx.source}</dd></div>
+    {tx.reviewPayee !== undefined && <div><dt>原始商户</dt><dd>{tx.payee || "（无商户）"}</dd></div>}
     {sources && sources.length > 1 && <div><dt>来源账单</dt><dd>{sources.map(({ file, id }) => <div key={id}>{file}</div>)}</dd></div>}
     {tx.sourceStatus && <div><dt>账单状态</dt><dd>{tx.sourceStatus}</dd></div>}
     {tx.note && <div><dt>账单备注</dt><dd>{tx.note}</dd></div>}

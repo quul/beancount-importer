@@ -2,10 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import type { AppConfig, LedgerError } from "../../shared/types.js";
+import type { AppConfig, GenerateResult, LedgerError } from "../../shared/types.js";
 import { activeTransactions } from "../../shared/transactionMerge.js";
 import { atomicJson, profileId, type StoredBatch } from "./batches.js";
-import { discoverPython, parseLedger } from "./ledger.js";
+import { discoverPython, parseLedger, readProjectedAssetBalances } from "./ledger.js";
 import { generateEntries } from "./generate.js";
 import { importLayoutError } from "../../shared/import-paths.js";
 import { markDuplicates } from "./dedup.js";
@@ -92,6 +92,111 @@ function withInclude(text: string, relative: string, root: string, parent: strin
 function errorKey(error: LedgerError, staged: string, root: string): string {
   const normalize = (s: string) => s.split(staged).join(root).replace(/\\/g, "/");
   return JSON.stringify([normalize(error.file ?? ""), error.line, normalize(error.message), error.type]);
+}
+
+type ImportFiles = NonNullable<GenerateResult["files"]>;
+
+function prepareLedgerStage(root: string, stage: string, mainFile: string) {
+  const snapshot = new Map<string, string>();
+  const originalText = new Map<string, string>();
+  const mainRelative = path.relative(root, inside(root, mainFile));
+  const excluded = (name: string) => [".git", "venv", ".venv", "node_modules", "__pycache__"].includes(name) || name.endsWith(".picklecache");
+  const copy = (from: string, to: string) => {
+    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+      if (excluded(entry.name)) continue;
+      const source = path.join(from, entry.name), target = path.join(to, entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) { fs.mkdirSync(target, { recursive: true }); copy(source, target); }
+      else if (entry.isFile()) {
+        const bytes = fs.readFileSync(source);
+        fs.writeFileSync(target, bytes);
+        snapshot.set(path.relative(root, source), crypto.createHash("sha256").update(bytes).digest("hex"));
+      }
+    }
+  };
+  copy(root, stage);
+  // Walk the actual include graph (including files with nonstandard suffixes).
+  // Run both before loading the baseline and after applying the draft, because
+  // a planned main/annual file can contain original absolute include paths.
+  const rewriteIncludes = () => {
+    const seen = new Set<string>();
+    const visit = (relative: string) => {
+      if (seen.has(relative)) return;
+      seen.add(relative);
+      const stagedFile = inside(stage, relative);
+      if (!fs.existsSync(stagedFile)) {
+        if (fs.existsSync(inside(root, relative))) throw new ImportError(422, "账本 include 引用了快照排除目录中的文件，无法隔离校验");
+        return; // Truly missing includes are reported by the native loader.
+      }
+      const text = fs.readFileSync(stagedFile, "utf8");
+      if (snapshot.has(relative) && !originalText.has(relative)) originalText.set(relative, text);
+      const targets: string[] = [];
+      const rewritten = text.replace(/(^[ \t]*include[ \t]+")([^"]+)(")/gm, (_match, prefix: string, include: string, suffix: string) => {
+        const target = includeRelative(root, relative, include);
+        targets.push(target);
+        return `${prefix}${path.relative(path.dirname(stagedFile), inside(stage, target)).replace(/\\/g, "/")}${suffix}`;
+      });
+      if (rewritten !== text) fs.writeFileSync(stagedFile, rewritten);
+      targets.forEach(visit);
+    };
+    visit(mainRelative);
+  };
+  rewriteIncludes();
+  return { snapshot, originalText, mainRelative, excluded, rewriteIncludes };
+}
+
+function stageImport(
+  config: AppConfig, root: string, stage: string, prepared: ReturnType<typeof prepareLedgerStage>,
+  batchId: string, files: ImportFiles, opens: string[],
+) {
+  const { snapshot, originalText, mainRelative, rewriteIncludes } = prepared;
+  const planned = new Map<string, string>();
+  const content = (relative: string) => {
+    if (planned.has(relative)) return planned.get(relative)!;
+    if (snapshot.has(relative) && !originalText.has(relative)) originalText.set(relative, fs.readFileSync(inside(stage, relative), "utf8"));
+    return originalText.get(relative) ?? "";
+  };
+  const written: string[] = [];
+  const annualFiles = new Map<string, string>();
+  for (const [target, { year, body }] of Object.entries(files)) {
+    const relative = path.normalize(target);
+    inside(root, relative);
+    planned.set(relative, `${content(relative).trimEnd()}\n\n; import-batch: ${batchId}\n${body.trimEnd()}\n`);
+    written.push(target);
+    if (config.annualLayout) {
+      const annual = path.join("years", year, `${year}.bean`);
+      annualFiles.set(year, annual);
+      planned.set(annual, withInclude(content(annual), path.relative(path.dirname(annual), relative), root, annual));
+    } else {
+      planned.set(mainRelative, withInclude(content(mainRelative), path.relative(path.dirname(mainRelative), relative), root, mainRelative));
+    }
+  }
+  for (const [year, annual] of annualFiles) {
+    const opensText = opens.filter((line) => line.startsWith(`${year}-`)).map((line) => `${line}\n`).join("");
+    planned.set(annual, opensText + content(annual));
+    planned.set(mainRelative, withInclude(content(mainRelative), path.relative(path.dirname(mainRelative), annual), root, mainRelative));
+  }
+  if (!config.annualLayout && opens.length) {
+    planned.set(mainRelative, `${opens.join("\n")}\n${content(mainRelative)}`);
+  }
+  for (const [relative, after] of planned) replaceFile(inside(stage, relative), after);
+  rewriteIncludes();
+  return { planned, written };
+}
+
+export function projectAssetBalances(
+  config: AppConfig, root: string, batchId: string, files: ImportFiles, opens: string[], accounts: string[], generated: string[],
+) {
+  root = fs.realpathSync(path.resolve(root));
+  const python = config.pythonPath || discoverPython(root);
+  const stage = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bean-import-preview-")));
+  try {
+    const prepared = prepareLedgerStage(root, stage, config.mainFile);
+    stageImport(config, root, stage, prepared, batchId, files, opens);
+    return readProjectedAssetBalances(stage, prepared.mainRelative, python, accounts, batchId, generated);
+  } finally {
+    fs.rmSync(stage, { recursive: true, force: true });
+  }
 }
 
 export function acquireWriteLock(file: string, busyMessage: string): () => void {
@@ -191,51 +296,8 @@ export function commitBatch(batch: StoredBatch, config: AppConfig, root: string,
     }
 
     stage = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bean-import-")));
-    const snapshot = new Map<string, string>();
-    const originalText = new Map<string, string>();
-    const mainRelative = path.relative(root, inside(root, config.mainFile));
-    const excluded = (name: string) => [".git", "venv", ".venv", "node_modules", "__pycache__"].includes(name) || name.endsWith(".picklecache");
-    const copy = (from: string, to: string) => {
-      for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
-        if (excluded(entry.name)) continue;
-        const source = path.join(from, entry.name), target = path.join(to, entry.name);
-        if (entry.isSymbolicLink()) continue;
-        if (entry.isDirectory()) { fs.mkdirSync(target, { recursive: true }); copy(source, target); }
-        else if (entry.isFile()) {
-          const bytes = fs.readFileSync(source);
-          fs.writeFileSync(target, bytes);
-          snapshot.set(path.relative(root, source), crypto.createHash("sha256").update(bytes).digest("hex"));
-        }
-      }
-    };
-    copy(root, stage);
-    // Walk the actual include graph (including files with nonstandard suffixes).
-    // Run both before loading the baseline and after applying the draft, because
-    // a planned main/annual file can contain original absolute include paths.
-    const rewriteIncludes = () => {
-      const seen = new Set<string>();
-      const visit = (relative: string) => {
-        if (seen.has(relative)) return;
-        seen.add(relative);
-        const stagedFile = inside(stage!, relative);
-        if (!fs.existsSync(stagedFile)) {
-          if (fs.existsSync(inside(root, relative))) throw new ImportError(422, "账本 include 引用了快照排除目录中的文件，无法隔离校验");
-          return; // Truly missing includes are reported by the native loader.
-        }
-        const text = fs.readFileSync(stagedFile, "utf8");
-        if (snapshot.has(relative) && !originalText.has(relative)) originalText.set(relative, text);
-        const targets: string[] = [];
-        const rewritten = text.replace(/(^[ \t]*include[ \t]+")([^"]+)(")/gm, (_match, prefix: string, include: string, suffix: string) => {
-          const target = includeRelative(root, relative, include);
-          targets.push(target);
-          return `${prefix}${path.relative(path.dirname(stagedFile), inside(stage!, target)).replace(/\\/g, "/")}${suffix}`;
-        });
-        if (rewritten !== text) fs.writeFileSync(stagedFile, rewritten);
-        targets.forEach(visit);
-      };
-      visit(mainRelative);
-    };
-    rewriteIncludes();
+    const prepared = prepareLedgerStage(root, stage, config.mainFile);
+    const { snapshot, originalText, mainRelative, excluded } = prepared;
     // Both baseline and duplicate identity come from the same byte snapshot that
     // is later checked against the original tree. No pre-snapshot race window.
     const ledger = parseLedger(stage, mainRelative, python);
@@ -258,38 +320,7 @@ export function commitBatch(batch: StoredBatch, config: AppConfig, root: string,
     const toOriginal = (error: LedgerError): LedgerError => ({ ...error,
       file: error.file?.split(stage!).join(root), message: error.message.split(stage!).join(root) });
     const baselineErrors = (ledger.errors ?? []).map(toOriginal);
-    const planned = new Map<string, string>();
-    const content = (relative: string) => {
-      if (planned.has(relative)) return planned.get(relative)!;
-      if (snapshot.has(relative) && !originalText.has(relative)) originalText.set(relative, fs.readFileSync(inside(stage!, relative), "utf8"));
-      return originalText.get(relative) ?? "";
-    };
-    const written: string[] = [];
-    const annualFiles = new Map<string, string>();
-    for (const [target, { year, body }] of Object.entries(generated.files)) {
-      const relative = path.normalize(target);
-      inside(root, relative);
-      planned.set(relative, `${content(relative).trimEnd()}\n\n; import-batch: ${batch.batchId}\n${body.trimEnd()}\n`);
-      written.push(target);
-      if (config.annualLayout) {
-        const annual = path.join("years", year, `${year}.bean`);
-        annualFiles.set(year, annual);
-        planned.set(annual, withInclude(content(annual), path.relative(path.dirname(annual), relative), root, annual));
-      } else {
-        planned.set(mainRelative, withInclude(content(mainRelative), path.relative(path.dirname(mainRelative), relative), root, mainRelative));
-      }
-    }
-    const opens = batch.preview.opens;
-    for (const [year, annual] of annualFiles) {
-      const opensText = opens.filter((line) => line.startsWith(`${year}-`)).map((line) => `${line}\n`).join("");
-      planned.set(annual, opensText + content(annual));
-      planned.set(mainRelative, withInclude(content(mainRelative), path.relative(path.dirname(mainRelative), annual), root, mainRelative));
-    }
-    if (!config.annualLayout && opens.length) {
-      planned.set(mainRelative, `${opens.join("\n")}\n${content(mainRelative)}`);
-    }
-    for (const [relative, after] of planned) replaceFile(inside(stage, relative), after);
-    rewriteIncludes();
+    const { planned, written } = stageImport(config, root, stage, prepared, batch.batchId, generated.files, batch.preview.opens);
     const stagedLedger = parseLedger(stage, mainRelative, python);
     const validation = { errors: stagedLedger.errors ?? [] };
     const existing = new Map<string, number>();

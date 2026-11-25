@@ -1,7 +1,7 @@
 import { useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { amountText, validDate } from "../../src/shared/postings.js";
 import { planTransactionMerge } from "../../src/shared/transactionMerge.js";
-import { MAX_NARRATION_LENGTH, type ParsedTx } from "../../src/shared/types.js";
+import { MAX_NARRATION_LENGTH, reviewPayeeText, type ParsedTx } from "../../src/shared/types.js";
 import type { MergeDraft } from "./api";
 import useAnchoredOptions from "./useAnchoredOptions";
 
@@ -25,7 +25,7 @@ export default function MergeDialog({ members, accounts, busy, error, onClose, o
   const [narration, setNarration] = useState("");
   const plan = useMemo(() => planTransactionMerge(members, accounts), [members, accounts]);
   const { commonPayee, payeeOptions } = useMemo(() => {
-    const names = members.map(({ payee }) => payee?.trim() ?? "");
+    const names = members.map((tx) => reviewPayeeText(tx).trim());
     const options = [...new Set(names.filter((name) => name && name.length <= MAX_NARRATION_LENGTH))];
     const common = options.length === 1 && names.every((name) => name === options[0]) ? options[0] : "";
     return { commonPayee: common, payeeOptions: options };
@@ -68,7 +68,7 @@ export default function MergeDialog({ members, accounts, busy, error, onClose, o
       <div className="toolbar merge-heading"><h2 id="merge-heading">合并记账</h2><span className="muted">{members.length} 笔原交易</span></div>
       <ul className="merge-members" aria-label="所选原交易">
         {members.map((tx) => <li key={tx.id}>
-          <div><strong>{tx.payee || "（无商户）"}</strong><time dateTime={tx.date}>{tx.date}</time></div>
+          <div><strong>{reviewPayeeText(tx) || "（无商户）"}</strong><time dateTime={tx.date}>{tx.date}</time></div>
           <span className={`amt ${tx.direction}`}>{tx.direction === "in" ? "+" : "−"}{amountText(tx.amount)} {tx.currency}</span>
         </li>)}
       </ul>

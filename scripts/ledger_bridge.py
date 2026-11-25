@@ -110,6 +110,36 @@ def ledger_currencies(entries, options, data):
     return sorted(currencies)
 
 
+def posting_units(posting):
+    units = posting.units
+    if units is not None and isinstance(units.currency, str) and isinstance(units.number, Decimal) and units.number.is_finite():
+        return units
+    return None
+
+
+def format_balances(balances):
+    return {
+        account: {currency: format(amount, "f") for currency, amount in sorted(amounts.items())}
+        for account, amounts in sorted(balances.items())
+    }
+
+
+def projected_asset_balances(entries, data, request):
+    balances = {account: defaultdict(Decimal) for account in request["accounts"]}
+    imported_ids = set()
+    for entry in entries:
+        if not isinstance(entry, data.Transaction):
+            continue
+        if entry.meta.get("import-batch") == request["batchId"]:
+            imported_ids.add(entry.meta.get("import-row-id"))
+        for posting in entry.postings:
+            if posting.account in balances and (units := posting_units(posting)) is not None:
+                balances[posting.account][units.currency] += units.number
+    if not set(request["generated"]).issubset(imported_ids):
+        raise ValueError("部分生成分录未进入暂存账本")
+    return format_balances(balances)
+
+
 def account_balance_snapshot(entries, data, as_of, expense_prefix):
     balances = defaultdict(lambda: defaultdict(Decimal))
     recent_expenses = defaultdict(lambda: deque(maxlen=2))
@@ -118,8 +148,8 @@ def account_balance_snapshot(entries, data, as_of, expense_prefix):
             continue
         movements = defaultdict(lambda: defaultdict(Decimal))
         for posting in entry.postings:
-            units = posting.units
-            if units is not None and isinstance(units.currency, str) and isinstance(units.number, Decimal) and units.number.is_finite():
+            units = posting_units(posting)
+            if units is not None:
                 balances[posting.account][units.currency] += units.number
                 movements[posting.account][units.currency] += units.number
         entry_meta = entry.meta or {}
@@ -138,10 +168,7 @@ def account_balance_snapshot(entries, data, as_of, expense_prefix):
             if spent:
                 recent_expenses[account].append({"date": str(entry.date), "amounts": spent})
     return {
-        "balances": {
-            account: {currency: format(amount, "f") for currency, amount in sorted(amounts.items())}
-            for account, amounts in balances.items()
-        },
+        "balances": format_balances(balances),
         "recentExpenses": {account: list(expenses) for account, expenses in recent_expenses.items()},
     }
 
@@ -153,8 +180,8 @@ def run(request):
     except ImportError as exc:
         raise RuntimeError("所选 Python 未安装 Beancount，请选择账本的 venv/bin/python") from exc
 
-    if request.get("operation") not in ("inspect", "validate", "balances"):
-        raise ValueError("operation must be inspect, validate or balances")
+    if request.get("operation") not in ("inspect", "validate", "balances", "projected_asset_balances"):
+        raise ValueError("unknown ledger operation")
     if ("file" in request) == ("text" in request):
         raise ValueError("provide exactly one of file or text")
     if "file" in request:
@@ -177,6 +204,8 @@ def run(request):
         return {**result, "balanceSnapshot": account_balance_snapshot(
             entries, data, date.fromisoformat(request["balanceDate"]), options.get("name_expenses", "Expenses") + ":"
         )}
+    if request["operation"] == "projected_asset_balances":
+        return {**result, "assetBalances": projected_asset_balances(entries, data, request)}
     result["operatingCurrencies"] = options.get("operating_currency", [])
     result["currencies"] = ledger_currencies(entries, options, data)
     if "file" in request and request.get("trackAccountSources") and not errors:
@@ -226,9 +255,10 @@ def run(request):
             categories = {p["account"] for p in tx["postings"] if p["account"].startswith(("Expenses:", "Income:"))}
             # A split salary or mixed purchase is not evidence for one category.
             if len(categories) == 1:
-                payee = tx["payee"] or tx["narration"]
-                if payee:
-                    payees[payee][next(iter(categories))] += 1
+                category = next(iter(categories))
+                payee_names = dict.fromkeys((tx["payee"] or tx["narration"], meta.get("source-payee")))
+                for payee in filter(None, payee_names):
+                    payees[payee][category] += 1
 
     result.update({"accounts": list(accounts.values()), "transactions": transactions, "payeeIndex": {payee: [{"account": account, "count": count} for account, count in counts.most_common()] for payee, counts in payees.items()}})
     return result

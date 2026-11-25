@@ -212,6 +212,8 @@ export interface ParsedTx extends RawTx {
   tags?: string[];
   flag?: "*" | "!";
   reviewNote?: string;
+  /** Custom Beancount payee set during review. The source payee remains in payee. */
+  reviewPayee?: string;
   /** Custom Beancount narration set during review. */
   narration?: string;
   /** Optional manually reviewed multi-leg transaction, signed amounts. */
@@ -227,6 +229,11 @@ export interface ParsedTx extends RawTx {
 }
 
 export const MAX_NARRATION_LENGTH = 2000;
+export const MAX_REVIEW_PAYEE_LENGTH = 2000;
+
+export function reviewPayeeText(tx: Pick<ParsedTx, "payee" | "reviewPayee">): string {
+  return tx.reviewPayee ?? tx.payee;
+}
 
 export function defaultNarration(tx: Pick<RawTx, "note" | "rawCategory">): string {
   return [...new Set([tx.note, tx.rawCategory].filter(Boolean))].join(" · ");
@@ -472,6 +479,7 @@ export interface TxDecision {
   tags?: string[];
   flag?: "*" | "!";
   reviewNote?: string;
+  reviewPayee?: string | null;
   narration?: string | null;
   postings?: DraftPosting[] | null;
   categoryAllocations?: CategoryAllocation[];

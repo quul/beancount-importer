@@ -1,4 +1,4 @@
-import { defaultNarration, type DraftPosting, type ParsedTx, type ReviewProblem } from "./types.js";
+import { defaultNarration, reviewPayeeText, type DraftPosting, type ParsedTx, type ReviewProblem } from "./types.js";
 import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement, originalForeignAmount } from "./settlement.js";
 import { isCurrencyExchangePayment, readExchangeQuantity } from "./currency-exchange.js";
 
@@ -106,7 +106,7 @@ export function validateTransaction(tx: ParsedTx, postings: DraftPosting[]): str
 export function formatTransactionHeader(tx: ParsedTx): string {
   const tags = [...new Set(tx.tags ?? [])].map((tag) => ` #${tag}`).join("");
   const narration = tx.narration ?? defaultNarration(tx);
-  return `${tx.date} ${tx.flag ?? "*"} ${quote(tx.payee || "未知交易方")} ${quote(narration)}${tags}`;
+  return `${tx.date} ${tx.flag ?? "*"} ${quote(reviewPayeeText(tx) || "未知交易方")} ${quote(narration)}${tags}`;
 }
 
 export function formatPosting(posting: DraftPosting): string {
@@ -119,6 +119,7 @@ export function formatTransactionEntry(tx: ParsedTx, postings: readonly DraftPos
     "import-source": tx.source, "import-row-id": tx.id,
     ...(tx.sourceTxId ? { "import-id": tx.sourceTxId } : {}), ...(tx.sourceFileHash ? { "source-file-hash": tx.sourceFileHash } : {}),
     ...(tx.orderId ? { "source-order-id": tx.orderId } : {}),
+    ...(tx.reviewPayee !== undefined ? { "source-payee": tx.payee } : {}),
     "source-file": tx.sourceFile, "import-event": tx.eventType ?? (tx.direction === "in" ? "income" : "expense"),
     ...(batchId ? { "import-batch": batchId } : {}), ...(tx.time ? { time: tx.time } : {}),
     ...(tx.sourceStatus ? { "source-status": tx.sourceStatus } : {}), ...(tx.originalDirection ? { "source-direction": tx.originalDirection } : {}),

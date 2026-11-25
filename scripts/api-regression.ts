@@ -201,10 +201,20 @@ try {
     const route = "/api/batch/" + summary.batchId;
     const reopened = await request(manualBase, route);
     assert.deepEqual(reopened.txs, manual.txs);
-    const reviewed = await request(manualBase, route + "/decide", { revision: reopened.revision,
+    const bulkPayee = "京东到家";
+    const renamed = await request(manualBase, route + "/decide", { revision: reopened.revision, changesOnly: true,
+      decisions: reopened.txs.slice(0, 2).map(({ id }: ParsedTx) => ({ id, reviewPayee: bulkPayee })) });
+    assert.deepEqual(renamed.changes.txs.map(({ payee, reviewPayee, status }: ParsedTx) => [payee, reviewPayee, status]),
+      reopened.txs.slice(0, 2).map(({ payee, status }: ParsedTx) => [payee, bulkPayee, status]));
+    const manualMain = path.join(manualRoot, "main.bean"), beforePreview = fs.readFileSync(manualMain, "utf8");
+    const reviewed = await request(manualBase, route + "/decide", { revision: renamed.revision,
       decisions: reopened.txs.map(({ id, currency }: ParsedTx) => ({ id, account: currency === "USD" ? foreignCategory : category, status: "ready" })) });
     const preview = await request(manualBase, route + "/generate", { revision: reviewed.revision });
     assert.equal(preview.generated, 6);
+    assert.deepEqual(preview.assetBalances, { [debit]: { CNY: "880.00" }, [foreignAccount]: { USD: "2.998456789" } });
+    assert.equal(fs.readFileSync(manualMain, "utf8"), beforePreview);
+    assert.equal(fs.existsSync(path.join(manualRoot, "years")), false);
+    assert.equal(preview.entries.split(`"${bulkPayee}"`).length, 3);
     assert.match(preview.entries, /Liabilities:CN:JD:Baitiao\s+-12\.34 CNY/);
     assert.match(preview.entries, /Assets:CN:BOC:2222\s+-5\.00 CNY/);
     assert.match(preview.entries, /Assets:USD:Cash\s+-7\.125 USD/);
@@ -216,6 +226,8 @@ try {
     assert.deepEqual(afterCommit.balances, {
       [debit]: { CNY: "930.00" }, [credit]: { CNY: "-212.34" }, [foreignAccount]: { USD: "2.998456789" }, [income]: { CNY: "-3.50" },
     });
+    const fullLedger = await request(manualBase, balancesRoute + "2027-01-01");
+    assert.deepEqual(preview.assetBalances, { [debit]: fullLedger.balances[debit], [foreignAccount]: fullLedger.balances[foreignAccount] });
     assert.deepEqual(afterCommit.recentExpenses, {
       [debit]: [postedExpense("2025-01-07", "30"), postedExpense("2026-02-04", "5.00")],
       [credit]: [postedExpense("2026-02-03", "12.34"), postedExpense("2026-02-03", "12.34")],
@@ -1097,6 +1109,7 @@ try {
     assert.equal(preview.generated, 2);
     assert.match(preview.entries, /150\.00 USDC \{\{1080\.00 CNY\}\}/);
     assert.match(preview.entries, /original-amount: 7\.50 USD/);
+    assert.deepEqual(preview.assetBalances, { [payer]: { CNY: "-1134.00" }, [receipt]: { USDC: "150.00" } });
     await request(exchangeBase, route + "/commit", { revision: preview.revision });
     const imported = parseLedger(exchangeRoot, "main.bean", python);
     assert.deepEqual(imported.errors, []);
@@ -2148,14 +2161,22 @@ try {
   assert.equal(withNarration.batch.txs[0].status, original.status);
   const resetNarration = await request(base, route + "/decide", { revision: withNarration.revision, decisions: [{ id: original.id, narration: null }] });
   assert.equal(resetNarration.batch.txs[0].narration, undefined);
-  const saved = await request(base, route + "/decide", { revision: resetNarration.revision, decisions: [{ id: original.id, account: "Expenses:Food:Meals:Dine", funding: "Assets:CN:BOC:2222", status: "ready", tags: ["trip2026"], flag: "!", narration, reviewNote: '核实 "引号" \\\n下一行' }] });
+  const reviewPayee = '昆明民宿 "前台"';
+  await request(base, route + "/decide", { revision: resetNarration.revision, decisions: [{ id: original.id, reviewPayee: "两行\n商户" }] }, 400);
+  const clearedPayee = await request(base, route + "/decide", { revision: resetNarration.revision, decisions: [{ id: original.id, reviewPayee: "" }] });
+  assert.deepEqual([clearedPayee.batch.txs[0].payee, clearedPayee.batch.txs[0].reviewPayee, clearedPayee.batch.txs[0].status], [original.payee, "", original.status]);
+  const resetPayee = await request(base, route + "/decide", { revision: clearedPayee.revision, decisions: [{ id: original.id, reviewPayee: null }] });
+  assert.equal(resetPayee.batch.txs[0].reviewPayee, undefined);
+  const saved = await request(base, route + "/decide", { revision: resetPayee.revision, decisions: [{ id: original.id, account: "Expenses:Food:Meals:Dine", funding: "Assets:CN:BOC:2222", status: "ready", tags: ["trip2026"], flag: "!", narration, reviewPayee, reviewNote: '核实 "引号" \\\n下一行' }] });
   batch = await request(base, route); assert.equal(batch.revision, saved.revision); assert.equal(batch.txs[0].fundingAccount, "Assets:CN:BOC:2222"); assert.deepEqual(batch.txs[0].tags, ["trip2026"]);
   const preview = await request(base, route + "/generate", { revision: batch.revision });
   assert.match(preview.entries, /Assets:CN:BOC:2222\s+-12\.34 CNY/); assert.match(preview.entries, / ! .*#trip2026/);
   assert.ok(preview.entries.includes(JSON.stringify(narration)));
+  assert.ok(preview.entries.includes(JSON.stringify(reviewPayee)));
+  assert.ok(preview.entries.includes("source-payee: " + JSON.stringify(original.payee)));
   assert.match(preview.entries, /review-note: /);
   assert.deepEqual(preview.targetFiles, ["years/2026/imported/2026-01.bean"]);
-  passed("reviewed funding, tags, flag, narration and note reach server-generated entries");
+  passed("reviewed funding, tags, flag, merchant, narration and note reach server-generated entries");
   const edited = await request(base, route + "/decide", { revision: batch.revision, decisions: [{ id: batch.txs[0].id, tags: ["trip2026", "checked"] }] });
   await request(base, route + "/commit", { revision: batch.revision }, 409);
   await request(base, route + "/commit", { revision: edited.revision }, 409);
@@ -2165,9 +2186,14 @@ try {
   assert.equal(committed.ok, true); assert.equal(committed.validation.newErrors.length, 0);
   await deleteBatch(base, batch.batchId, edited.revision, 409);
   const monthly = path.join(root, "years/2026/imported/2026-01.bean"), beforeRetry = fs.readFileSync(monthly, "utf8");
-  const written = parseLedger(root, "main.bean", python).transactions;
+  const { transactions: written, payeeIndex } = parseLedger(root, "main.bean", python);
   assert.equal(written.length, 1);
   assert.equal(written[0].narration, narration);
+  assert.equal(written[0].payee, reviewPayee);
+  assert.equal(written[0].metadata?.["source-payee"], original.payee);
+  const merchantCategory = [{ account: "Expenses:Food:Meals:Dine", count: 1 }];
+  assert.deepEqual(payeeIndex[original.payee], merchantCategory);
+  assert.deepEqual(payeeIndex[reviewPayee], merchantCategory);
   const repeated = await request(base, route + "/commit", { revision: 0 }); assert.equal(repeated.alreadyCommitted, true); assert.equal(fs.readFileSync(monthly, "utf8"), beforeRetry);
   passed("stale previews cannot write; annual include, native validation and retry idempotency work");
   const importedAgain = await upload(base, csv()); assert.equal(importedAgain.txs[0].status, "duplicate"); assert.match(importedAgain.txs[0].duplicateOf?.label ?? "", /交易号/);

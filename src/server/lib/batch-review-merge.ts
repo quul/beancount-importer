@@ -57,7 +57,7 @@ function reviewSignature(tx: ParsedTx, memberIds: string[]): string {
   const postings = tx.postings?.map(({ account, currency, amount }) => JSON.stringify([account, currency, amount])).sort();
   return JSON.stringify([
     [...memberIds].sort(), tx.status, tx.finalAccount, tx.fundingAccount, tx.fundingAccount2 ?? null, postings, tx.currencyExchange ?? null,
-    tx.flag ?? "*", [...(tx.tags ?? [])].sort(), tx.reviewNote ?? "", tx.narration ?? null,
+    tx.flag ?? "*", [...(tx.tags ?? [])].sort(), tx.reviewNote ?? "", tx.reviewPayee ?? null, tx.narration ?? null,
     tx.refundReviewMode ?? null, tx.merge ? [tx.date, tx.payee] : null,
   ]);
 }

@@ -109,7 +109,7 @@ export function findPostedRefundCopies(txs: readonly ParsedTx[], ledger: readonl
     const funding = tx.postings.filter((posting) => posting.amount > 0 && isFundingAccount(posting.account));
     if (funding.length !== 1) return [];
     const [{ account: fundingAccount, amount, currency }] = funding;
-    return [{ tx, source, date: tx.date, time: tx.time, payee: tx.payee, sourceTxId: tx.sourceTxId ?? tx.metadata?.["import-id"],
+    return [{ tx, source, date: tx.date, time: tx.time, payee: tx.metadata?.["source-payee"] ?? tx.payee, sourceTxId: tx.sourceTxId ?? tx.metadata?.["import-id"],
       sourceFile: tx.metadata?.["source-file"], sourceFileHash: tx.metadata?.["source-file-hash"], rawAccount: tx.metadata?.["source-account"] ?? "",
       fundingAccount, amount, currency }];
   });

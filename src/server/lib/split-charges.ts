@@ -87,7 +87,8 @@ export function findSplitChargeReview(txs: readonly ParsedTx[], ledger: readonly
       add(postedIndex, key, { id: "posted:" + tx.id, date: tx.date, time: tx.time, account, currency, amount: -amount, units,
         payee: tx.payee || tx.narration, source: tx.source ?? tx.metadata?.["import-source"],
         sourceTxId: tx.sourceTxId ?? tx.metadata?.["import-id"], orderId: normalized(tx.metadata?.["source-order-id"]),
-        card: cardSuffix(tx.metadata?.["source-account"] ?? ""), merchant: merchant(tx.payee), file: tx.file, line: tx.line, posted: true });
+        card: cardSuffix(tx.metadata?.["source-account"] ?? ""), merchant: merchant(tx.metadata?.["source-payee"] ?? tx.payee),
+        file: tx.file, line: tx.line, posted: true });
     }
   }
 

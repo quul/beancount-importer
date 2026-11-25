@@ -6,8 +6,8 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
-import type { AppConfig, AutomaticExclusionRule, BatchRevision, FundingMappingChoice, FundingMappingGroup, ImportPreview, ParsedTx, ReviewProblem, TxDecision, LedgerInfo } from "../shared/types.js";
-import { duplicateReviewIssue, isFamilyCard, MAX_NARRATION_LENGTH } from "../shared/types.js";
+import type { AppConfig, AutomaticExclusionRule, BatchRevision, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerBalances, ParsedTx, ReviewProblem, TxDecision, LedgerInfo } from "../shared/types.js";
+import { duplicateReviewIssue, isFamilyCard, MAX_NARRATION_LENGTH, MAX_REVIEW_PAYEE_LENGTH } from "../shared/types.js";
 import { planSuspectedDuplicateExclusions } from "../shared/duplicateExclusions.js";
 import { reviewStatusPatch } from "../shared/exclusions.js";
 import { mayHaveSplitCharges } from "../shared/split-charges.js";
@@ -39,7 +39,7 @@ import { clearTransferPairMatches, pairTransfers, transferPairIssue } from "./li
 import { isParsedStatementRow, parseFundingParts, readSheet, UNREADABLE_TRANSACTION } from "./parsers/common.js";
 import { BatchStore, isBatchId, profileId, type StoredBatch, type StoredPdfUpload } from "./lib/batches.js";
 import { applyStatementNames, combineBatchReviews, resolveBatchReviewConflict, statementsForBatches } from "./lib/batch-review-merge.js";
-import { acquireWriteLock, assertBatchDeletable, commitBatch, ImportError } from "./lib/commit.js";
+import { acquireWriteLock, assertBatchDeletable, commitBatch, ImportError, projectAssetBalances } from "./lib/commit.js";
 import { importLayoutError } from "../shared/import-paths.js";
 import { isLocalRequest } from "./lib/local-request.js";
 import { createPdfPreviewLoader } from "./lib/pdf-preview.js";
@@ -542,6 +542,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
           delete tx.currencyExchange;
         }
         delete tx.reviewNote;
+        delete tx.reviewPayee;
         delete tx.narration;
         delete tx.refundReviewMode;
         delete tx.reviewExclusion;
@@ -1240,6 +1241,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       if (decision.tags !== undefined && (!Array.isArray(decision.tags) || decision.tags.length > 40 || decision.tags.some((tag) => typeof tag !== "string" || tag.length > 64 || !TAG_RE.test(tag)))) throw new ImportError(400, "标签格式无效");
       if (decision.flag !== undefined && decision.flag !== "*" && decision.flag !== "!") throw new ImportError(400, "标记应为 * 或 !");
       if (decision.reviewNote !== undefined && (typeof decision.reviewNote !== "string" || decision.reviewNote.length > 2000)) throw new ImportError(400, "备注最多 2000 字符");
+      if (decision.reviewPayee != null && (typeof decision.reviewPayee !== "string" || decision.reviewPayee.length > MAX_REVIEW_PAYEE_LENGTH
+        || /[\x00-\x1f\x7f]/.test(decision.reviewPayee))) throw new ImportError(400, `请填写有效的商户名称，最多 ${MAX_REVIEW_PAYEE_LENGTH} 字符`);
       if (decision.narration != null && (typeof decision.narration !== "string" || decision.narration.length > MAX_NARRATION_LENGTH)) {
         throw new ImportError(400, `账本摘要最多 ${MAX_NARRATION_LENGTH} 字符`);
       }
@@ -1271,6 +1274,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       if (decision.tags !== undefined) tx.tags = [...new Set(decision.tags)];
       if (decision.flag !== undefined) tx.flag = decision.flag;
       if (decision.reviewNote !== undefined) tx.reviewNote = decision.reviewNote;
+      if (decision.reviewPayee === null) delete tx.reviewPayee;
+      else if (decision.reviewPayee !== undefined) tx.reviewPayee = decision.reviewPayee.trim();
       if (decision.narration === null) delete tx.narration;
       else if (decision.narration !== undefined) tx.narration = decision.narration;
       if (decision.postings === null) { delete tx.postings; delete tx.fundingAccount2; }
@@ -1332,9 +1337,23 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       });
       return;
     }
+    const generatedIds = new Set(result.generated);
+    const assetAccounts = [...new Set(active.filter(({ id }) => generatedIds.has(id)).flatMap((tx) =>
+      transactionPostings(tx).map(({ account }) => account).filter((account) => account.startsWith("Assets:"))))];
+    let assetBalances: LedgerBalances | undefined;
+    let assetBalancesWarning: string | undefined;
+    if (assetAccounts.length) {
+      try {
+        assetBalances = projectAssetBalances(config, ledgerRoot(), batch.batchId, result.files, opens, assetAccounts, result.generated);
+      } catch (error) {
+        console.warn("Unable to project asset balances:", error instanceof Error ? error.message : error);
+        assetBalancesWarning = "暂时无法试算资产账户余额。";
+      }
+    }
     batch.preview = { revision: batch.revision, result, opens }; batches.save(batch);
     const { files, ...preview } = result;
-    res.json({ ...preview, targetFiles: Object.keys(files), generated: result.generated.length, opens, revision: batch.revision, baselineErrors: currentLedger.errors ?? [] });
+    res.json({ ...preview, targetFiles: Object.keys(files), generated: result.generated.length, opens, revision: batch.revision,
+      baselineErrors: currentLedger.errors ?? [], assetBalances, assetBalancesWarning });
   }));
   app.post("/api/batch/:id/commit", withBatchWrite((req, res, batch) => {
     if (!batch.committed) requireRevision(batch, req.body.revision);
