@@ -169,6 +169,8 @@ export interface ParsedTx extends RawTx {
   reviewExclusion?: ReviewExclusionKind;
   /** inferred beancount asset/liability account for the funding leg */
   fundingAccount: string;
+  /** Batch-local account selections for fundingParts, in statement order. */
+  fundingPartAccounts?: Array<string | null>;
   /** second leg when the engine can infer a transfer (e.g. credit card repayment) */
   fundingAccount2?: string;
   /** suggested categorization account (LLM + memory + history) */
@@ -221,7 +223,8 @@ export function isSuspectedDuplicate(tx: ParsedTx): boolean {
 export function canFollowPurchaseRefund(refund: ParsedTx): boolean {
   if (refund.eventType !== "refund" || refund.direction !== "in" || refund.excludedReason || needsCnySettlement(refund)
     || refund.status === "excluded" || refund.status === "duplicate"
-    || refund.reviewConflictId || refund.postings || refund.fundingAccount2 || refund.refundReviewMode === "manual") return false;
+    || refund.reviewConflictId || refund.postings || refund.fundingAccount2 || (refund.fundingParts?.length ?? 0) > 1
+    || refund.refundReviewMode === "manual") return false;
   return refund.refundReviewMode === "follow-purchase"
     || (refund.status === "pending" && (!refund.finalAccount || refund.finalAccount === refund.suggestedAccount));
 }
@@ -392,11 +395,12 @@ export interface FundingMappingGroup {
   count: number;
   accounts: string[];
   statementOnly?: boolean;
+  combination?: string;
 }
 
 export interface FundingMappingChoice {
   id: string;
-  account: string;
+  account: string | null;
 }
 
 export interface TxDecision {

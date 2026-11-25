@@ -8,7 +8,7 @@ import { planSuspectedDuplicateExclusions } from "../../src/shared/duplicateExcl
 import { exclusionKind, reviewStatusPatch } from "../../src/shared/exclusions.js";
 import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement, originalForeignAmount } from "../../src/shared/settlement.js";
 import { savedCategoryAllocations } from "../../src/shared/categoryAllocations.js";
-import { amountText, missingPostingAccount, missingPostingAccountMessage } from "../../src/shared/postings.js";
+import { FUNDING_SPLIT_REQUIRED, amountText, missingPostingAccount, missingPostingAccountMessage, requiresFundingSplit } from "../../src/shared/postings.js";
 import { accountIsActive, hasFundingPosting, isCombinedPayment, isFundingAccount, reusablePaymentMethod } from "../../src/shared/funding.js";
 import { activeTransactions } from "../../src/shared/transactionMerge.js";
 import { api, ApiError, IncompleteReviewError, type BatchMergeOptions, type BatchSummary, type ConfigResponse, type GeneratedPreview, type LedgerSummary, type MergeDraft } from "./api";
@@ -758,7 +758,8 @@ export default function App() {
       value = result.batch;
     }
     if (editable && !value.statementSources?.length && activeTransactions(value.txs).some((tx) => !tx.merge
-      && (tx.source === "wechat" || (!tx.fundingAccount && tx.status !== "excluded" && tx.status !== "duplicate")))) {
+      && (tx.source === "wechat" || (!tx.fundingAccount && tx.status !== "excluded" && tx.status !== "duplicate")
+        || (opening === "import" && tx.source === "alipay" && tx.status === "pending" && !tx.fundingPartAccounts && isCombinedPayment(tx))))) {
       const result = await api.funding(id, value.revision ?? 0, mappings);
       if (batchIdFromUrl() !== id) return;
       if (result.groups.length) {
@@ -1302,7 +1303,8 @@ export default function App() {
       && !tx.postings && refund.status === "pending" && canFollowPurchaseRefund(refund) && !isSuspectedDuplicate(refund)));
     const category = tx.finalAccount || tx.suggestedAccount || "";
     const missing = missingPostingAccount({ ...tx, finalAccount: category });
-    const includeHint = missing === "category" && tx.eventType === "transfer" ? "请选择转账对方账户" : missing ? missingPostingAccountMessage[missing] : undefined;
+    const includeHint = requiresFundingSplit(tx) ? FUNDING_SPLIT_REQUIRED
+      : missing === "category" && tx.eventType === "transfer" ? "请选择转账对方账户" : missing ? missingPostingAccountMessage[missing] : undefined;
     const include = () => {
       if (missing === "postings") { revealReviewTarget([{ id: tx.id, field: missing }]); return; }
       if (missing) {
@@ -1764,7 +1766,7 @@ export default function App() {
       }} onConfirm={(mappings) => confirmFunding(fundingTarget, mappings)} />}
     {mappingTarget && mappingGroup && <FundingDialog key={mappingTarget.id} mapping groups={[mappingGroup]} busy={busy} error={error}
       initialChoices={mappingGroup.accounts.includes(mappingTarget.fundingAccount) ? { [mappingTarget.id]: mappingTarget.fundingAccount } : {}}
-      onCancel={() => { setMappingTarget(null); setError(""); }} onConfirm={([{ account }]) => confirmMapping(mappingTarget, account)} />}
+      onCancel={() => { setMappingTarget(null); setError(""); }} onConfirm={([{ account }]) => { if (account) confirmMapping(mappingTarget, account); }} />}
     {mergeIds && <MergeDialog members={active.filter((tx) => mergeIds.includes(tx.id))} accounts={new Set(accounts.map(({ account }) => account))}
       busy={busy} error={error} onClose={() => { setMergeIds(null); setError(""); }} onConfirm={createMerge} />}
     {!settings && !routedBatchId && batchMergeOptions && <BatchReviewDialog batches={batchMergeOptions.batches} sources={batchMergeOptions.sources}

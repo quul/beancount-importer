@@ -152,6 +152,13 @@ try {
   assert.deepEqual([...differentCurrency.imbalances].map(([currency, total]) => [currency, Number(total.toFixed(2))]),
     [["USD", -0.30], ["CNY", 0.30]]);
   assert.equal(differentCurrency.postings, undefined);
+  const combined = { ...expense, fundingParts: [{ rawAccount: "信用卡", amount: 0.2 }, { rawAccount: "红包" }],
+    fundingPartAccounts: ["Liabilities:Card", null] };
+  const fundingDraft = draftPostings(combined, makeDraft(combined));
+  assert.deepEqual(fundingDraft.map(({ account, amount, paymentMethod }) => [account, amount, paymentMethod]), [
+    [expense.finalAccount, "0.3", undefined], ["Liabilities:Card", "-0.2", "信用卡"], ["", "", "红包"],
+  ]);
+  assert.equal(validatePostingDraft(fundingDraft, [{ account: "Liabilities:Card" }, { account: expense.finalAccount }]).postings, undefined);
   console.log("✓ saved splits reopen as manual postings and only balanced complete edits can be saved");
 
   assert.deepEqual(calculatePostingAmount("100/4"), { value: "25" });

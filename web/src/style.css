@@ -243,6 +243,11 @@ select {
 .funding-field { display: grid; gap: 5px; min-width: 0; }
 .funding-field > span { font-weight: 600; }
 .funding-field small { font-weight: 400; }
+.funding-fields > .funding-scope { margin: 0; }
+.funding-combination { display: grid; gap: 10px; min-width: 0; padding: 8px 12px 12px; border: 1px solid var(--line); border-radius: 8px; }
+.funding-combination legend { padding-inline: 4px; font-weight: 600; overflow-wrap: anywhere; }
+.funding-combination legend small { color: var(--muted); font-weight: 400; }
+.funding-reset { justify-self: start; }
 .merge-dialog { width: min(620px, calc(100% - 28px)); }
 .merge-dialog form { display: grid; gap: 12px; }
 .batch-review-dialog { overflow-x: hidden; }
@@ -573,6 +578,7 @@ input[aria-invalid="true"]:not(:focus) { border-color: var(--danger); }
 .split-postings-toggle:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: 2px; }
 .split-postings-toggle:has(input:disabled) { background: var(--subtle); color: var(--muted); cursor: default; }
 .detail-posting-editor .posting-editor { margin-top: 6px; }
+.posting-payment-method { grid-column: 1 / -1; color: var(--muted); }
 .detail-review-warning { display: grid; gap: 5px; min-width: 0; padding: 10px 12px; border-radius: 8px; background: var(--warning-soft); font-size: 13px; overflow-wrap: anywhere; }
 .detail-review-warning h4 { margin: 0; color: var(--warning); font-size: 13px; }
 .detail-review-warning :is(p, dl, dd) { margin: 0; }

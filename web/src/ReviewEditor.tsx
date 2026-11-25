@@ -4,7 +4,7 @@ import { accountPattern, amountText, currencyPattern, fundingPostingSign, transa
 import AccountSelect from "./AccountSelect";
 import { calculatePostingAmount } from "./postingCalculator";
 
-type PostingInput = Omit<DraftPosting, "amount"> & { amount: string };
+type PostingInput = Omit<DraftPosting, "amount"> & { amount: string; paymentMethod?: string };
 
 export interface ReviewDraft {
   tags: string;
@@ -24,7 +24,20 @@ export function invalidTags(value: string): string[] {
 
 export function draftPostings(tx: ParsedTx, draft: ReviewDraft): PostingInput[] {
   if (draft.postings) return draft.postings;
-  const amount = -fundingPostingSign(tx) * tx.amount;
+  const sign = fundingPostingSign(tx);
+  const amount = -sign * tx.amount;
+  if (!tx.postings && !tx.fundingAccount2 && tx.fundingParts && tx.fundingPartAccounts) {
+    const selected = tx.fundingPartAccounts;
+    return [
+      { account: tx.finalAccount || tx.suggestedAccount, amount: String(amount), currency: tx.currency },
+      ...tx.fundingParts.map(({ rawAccount, amount: partAmount }, index) => ({
+        account: selected[index] ?? "",
+        amount: partAmount === undefined ? "" : String(sign * partAmount),
+        currency: tx.currency,
+        paymentMethod: rawAccount || "未标明支付方式",
+      })),
+    ];
+  }
   const postings: DraftPosting[] = tx.postings || tx.fundingAccount2 ? transactionPostings(tx) : [
     { account: tx.finalAccount || tx.suggestedAccount, amount, currency: tx.currency },
     { account: tx.fundingAccount, amount: -amount, currency: tx.currency },
@@ -145,6 +158,7 @@ export function ReviewPostingFields({ tx, draft, accounts, disabled, postingErro
         const amountErrorId = `${postingsId}-${index}-amount-error`;
         const currencyErrorId = `${postingsId}-${index}-currency-error`;
         return <div className="posting-row" key={index}>
+          {posting.paymentMethod && <small className="posting-payment-method">{posting.paymentMethod}</small>}
           <AccountSelect value={posting.account} accounts={accounts} label={`第 ${index + 1} 条分录的账户`}
             validationMessage={errors?.account} onChange={(account) => setPosting(index, { account })} />
           <div className="posting-input-group">

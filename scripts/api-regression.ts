@@ -19,7 +19,7 @@ import { BatchStore, profileId } from "../src/server/lib/batches.js";
 import { classificationMemoryKey, classificationMemoryLocation, saveMemory } from "../src/server/lib/classify.js";
 import { markDuplicates } from "../src/server/lib/dedup.js";
 import { exclusionKind } from "../src/shared/exclusions.js";
-import type { AppConfig, ImportPreview, ParsedTx } from "../src/shared/types.js";
+import type { AppConfig, FundingMappingGroup, ImportPreview, ParsedTx } from "../src/shared/types.js";
 
 const temporary = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bean-api-regression-")));
 const python = process.env.ACCOUNT_IMPORT_PYTHON || discoverPython(discoverLedgerRoot());
@@ -1093,20 +1093,21 @@ try {
     const fundingLock = path.join(mappingData, "locks", "batches", `${unmapped.batchId}.json`);
     fs.mkdirSync(path.dirname(fundingLock), { recursive: true });
     fs.writeFileSync(fundingLock, JSON.stringify({ pid: process.pid }));
-    const { groups } = await request(mappingBase, `${route}/funding`, { revision });
-    assert.deepEqual(groups.map(({ label, count }: { label: string; count: number }) => [label, count]), [["测试卡（9999）", 2], ["自定义钱包", 1], ["零钱", 1]]);
+    const { groups }: { groups: FundingMappingGroup[] } = await request(mappingBase, `${route}/funding`, { revision });
+    assert.deepEqual(groups.map(({ label, count }) => [label, count]), [["测试卡（9999）", 2], ["自定义钱包", 1], ["零钱", 1], ["红包", 1]]);
     assert.deepEqual(groups[0].accounts, ["Assets:CN:BOC:1111", "Assets:CN:BOC:2222"]);
     const mappings = [
       { id: groups[0].id, account: "Assets:CN:BOC:1111" },
       { id: groups[1].id, account: "Assets:CN:BOC:2222" },
       { id: groups[2].id, account: "Assets:CN:BOC:2222" },
+      { id: groups[3].id, account: null },
     ];
     await request(mappingBase, `${route}/funding`, { revision, mappings }, 409);
     fs.unlinkSync(fundingLock);
     await request(mappingBase, `${route}/funding`, { revision: revision - 1, mappings }, 409);
     await request(mappingBase, `${route}/funding`, { revision, mappings: [{ ...mappings[0], account: "Assets:Future" }] }, 400);
     const incomplete = await request(mappingBase, `${route}/funding`, { revision, mappings: mappings.slice(0, 1) });
-    assert.equal(incomplete.groups.length, 3);
+    assert.equal(incomplete.groups.length, 4);
     assert.equal((await request(mappingBase, route)).revision, revision);
     assert.equal(fs.existsSync(path.join(mappingRoot, ".beancount-importer.json")), false);
     const mapped = await request(mappingBase, `${route}/funding`, { revision, mappings });
@@ -1119,12 +1120,16 @@ try {
     assert.deepEqual(mapped.batch.txs.slice(4).map((tx: { fundingAccount: string }) => tx.fundingAccount), ["", mappings[2].account, "", ""]);
 
     const restarted = await boot(undefined, mappingData, mappingActive);
-    const resumed = await request(restarted, `/api/batch/${earlier.batchId}/funding`, { revision: earlier.revision });
+    const earlierRoute = `/api/batch/${earlier.batchId}/funding`;
+    const earlierFunding = await request(restarted, earlierRoute, { revision: earlier.revision });
+    assert.deepEqual(earlierFunding.groups, groups.filter(({ combination }) => combination));
+    const resumed = await request(restarted, earlierRoute, { revision: earlier.revision, mappings: mappings.slice(2) });
     assert.deepEqual(resumed.groups, []);
     assert.equal(resumed.batch.txs[0].fundingAccount, mappings[0].account);
     const next = await upload(restarted, input.replaceAll("map-", "next-").replaceAll("测试卡（9999）", "测试卡(9999)"));
     assert.equal(next.txs[0].fundingAccount, mappings[0].account);
-    assert.deepEqual((await request(restarted, `/api/batch/${next.batchId}/funding`, { revision: next.revision })).groups, []);
+    assert.deepEqual((await request(restarted, `/api/batch/${next.batchId}/funding`, { revision: next.revision })).groups,
+      groups.filter(({ combination }) => combination));
     const similar = await upload(restarted, [header, "2026-01-03 10:10:00,餐饮美食,测试餐厅,午餐,支出,10,副测试卡(9999),交易成功,map-similar"].join("\n"));
     assert.equal(similar.txs[0].fundingAccount, "");
     assert.equal((await request(restarted, `/api/batch/${similar.batchId}/funding`, { revision: similar.revision })).groups[0].label, "副测试卡(9999)");
@@ -1186,24 +1191,60 @@ try {
       "2026-01-05 10:20:00,餐饮美食,测试餐厅,午餐,支出,12,集分宝＋" + newMethod + ",交易成功,new-split-2",
       "2026-01-05 10:30:00,餐饮美食,测试餐厅,午餐,支出,8," + newMethod + ",交易成功,new-split-3",
       "2026-01-05 10:40:00,餐饮美食,测试餐厅,午餐,支出,5,红包＋积分,交易成功,new-split-4",
+      "2026-01-05 10:50:00,餐饮美食,测试餐厅,午餐,支出,15,银行立减＋" + newMethod + ",交易成功,new-split-5",
     ].join("\n");
     const needsMapping = await upload(splitBase, splitInput);
     const splitRoute = "/api/batch/" + needsMapping.batchId + "/funding";
-    const { groups } = await request(splitBase, splitRoute, { revision: needsMapping.revision });
-    assert.deepEqual(groups.map(({ label, count }: { label: string; count: number }) => [label, count]), [[newMethod, 3]]);
-    const mapped = await request(splitBase, splitRoute, { revision: needsMapping.revision, mappings: [{ id: groups[0].id, account: card }] });
+    const { groups }: { groups: FundingMappingGroup[] } = await request(splitBase, splitRoute, { revision: needsMapping.revision });
+    const ordinary = groups.filter(({ combination }) => !combination);
+    assert.deepEqual(ordinary.map(({ label, count }) => [label, count]), [[newMethod, 1]]);
+    const creditAndDiscount = `${newMethod} & 银行立减`;
+    const components = groups.filter(({ combination }) => combination);
+    assert.deepEqual(components.map(({ combination, label, count }) => [combination, label, count]), [
+      [creditAndDiscount, newMethod, 2], [creditAndDiscount, "银行立减", 2],
+      [`集分宝 & ${newMethod}`, "集分宝", 1], [`集分宝 & ${newMethod}`, newMethod, 1],
+      ["红包 & 积分", "红包", 1], ["红包 & 积分", "积分", 1],
+    ]);
+    const wallet = "Assets:CN:BOC:1111", coupon = "Equity:Coupons:Payment", category = "Expenses:Food:Meals:Dine";
+    assert.ok(components[1].accounts.includes(coupon));
+    await request(splitBase, splitRoute, { revision: needsMapping.revision, mappings: [{ id: ordinary[0].id, account: null }] }, 400);
+    await request(splitBase, splitRoute, { revision: needsMapping.revision, mappings: [{ id: components[0].id, account: "Assets:Missing" }] }, 400);
+    const mapped = await request(splitBase, splitRoute, { revision: needsMapping.revision, mappings: groups.map(({ id, combination, label }) => ({
+      id, account: !combination ? wallet : combination === creditAndDiscount ? (label === newMethod ? card : coupon) : null,
+    })) });
     assert.deepEqual(mapped.groups, []);
     assert.equal(mapped.batch.txs.length, needsMapping.txs.length);
-    assert.ok(mapped.batch.txs.slice(0, 2).every((tx: ParsedTx, index: number) => tx.fundingAccount === card && tx.status === "pending"
+    assert.ok(mapped.batch.txs.slice(0, 2).every((tx: ParsedTx, index: number) => tx.status === "pending"
       && tx.sourceTxId === needsMapping.txs[index].sourceTxId && tx.amount === needsMapping.txs[index].amount && !tx.postings));
     assert.deepEqual(mapped.batch.txs[0].fundingParts, needsMapping.txs[0].fundingParts);
-    assert.equal(mapped.batch.txs[2].fundingAccount, card);
-    assert.equal(mapped.batch.txs[3].fundingAccount, "");
-    assert.deepEqual(mapped.config.assetMapping.at(-1), { keyword: newMethod, source: "alipay", exact: true, account: card, kind: "credit" });
+    assert.deepEqual(mapped.batch.txs.map((tx: ParsedTx) => tx.fundingPartAccounts), [
+      [card, coupon], [null, null], undefined, [null, null], [coupon, card],
+    ]);
+    assert.equal(mapped.batch.txs[0].fundingAccount, card);
+    assert.equal(mapped.batch.txs[2].fundingAccount, wallet);
+    assert.deepEqual(mapped.config.assetMapping, [...splitConfig.assetMapping, { keyword: newMethod, source: "alipay", exact: true, account: wallet, kind: "debit" }]);
+    assert.deepEqual(await request(splitBase, splitRoute, { revision: mapped.batch.revision }), { groups: [] });
+    const reviewRoute = `/api/batch/${needsMapping.batchId}`;
+    const id = mapped.batch.txs[0].id;
+    const categorized = await request(splitBase, reviewRoute + "/decide",
+      { revision: mapped.batch.revision, decisions: [{ id, account: category }] });
+    assert.equal(categorized.batch.txs[0].status, "pending");
+    const blocked = await request(splitBase, reviewRoute + "/decide",
+      { revision: categorized.batch.revision, decisions: [{ id, status: "ready" }] }, 422);
+    assert.equal(blocked.error, "请拆分组合支付");
+    const complete = await request(splitBase, reviewRoute + "/decide", { revision: categorized.batch.revision, decisions: [{ id, status: "ready", postings: [
+      { account: category, amount: 10, currency: "CNY" }, { account: card, amount: -9, currency: "CNY" },
+      { account: coupon, amount: -1, currency: "CNY" },
+    ] }] });
+    const splitPreview = await request(splitBase, reviewRoute + "/generate", { revision: complete.batch.revision });
+    assert.equal(splitPreview.generated, 1);
+    assert.match(splitPreview.entries, /Equity:Coupons:Payment\s+-1\.00 CNY/);
     const again = await upload(splitBase, splitInput.replaceAll("new-split-", "repeat-split-"));
-    assert.equal(again.txs[0].fundingAccount, card);
-    assert.deepEqual(await request(splitBase, "/api/batch/" + again.batchId + "/funding", { revision: again.revision }), { groups: [] });
-    passed("import mapping asks once per unknown payment method across ordinary and combined orders and ignores discounts");
+    assert.equal(again.txs[0].fundingAccount, wallet);
+    assert.ok(again.txs.every((tx) => tx.fundingPartAccounts === undefined));
+    const nextFunding = await request(splitBase, "/api/batch/" + again.batchId + "/funding", { revision: again.revision });
+    assert.deepEqual(nextFunding.groups, components);
+    passed("Alipay combination accounts are independently optional, scoped to the batch, and applied to split review");
   }
   {
     const quickRoot = path.join(temporary, "quick-funding-mapping");

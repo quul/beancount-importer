@@ -1,6 +1,9 @@
 import { defaultNarration, type DraftPosting, type ParsedTx, type ReviewProblem } from "./types.js";
 import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement, originalForeignAmount } from "./settlement.js";
 
+export const FUNDING_SPLIT_REQUIRED = "请拆分组合支付";
+export const requiresFundingSplit = (tx: ParsedTx) => !tx.postings && (tx.fundingParts?.length ?? 0) > 1;
+
 export const accountPattern = /^(Assets|Liabilities|Equity|Income|Expenses)(?::[\p{Lu}\p{Nd}][\p{L}\p{Nd}-]*)+$/u;
 const isPostingAccount = (account: string) => accountPattern.test(account) && !/(?:^|:)(FixMe|Unknown)(?::|$)/i.test(account);
 export const currencyPattern = /^[A-Z][A-Z0-9._'-]*$/;
@@ -30,6 +33,7 @@ export const missingPostingAccountMessage = {
 
 export function missingPostingAccount(tx: ParsedTx): keyof typeof missingPostingAccountMessage | undefined {
   if (tx.postings) return tx.postings.length < 2 || tx.postings.some(({ account }) => !isPostingAccount(account)) ? "postings" : undefined;
+  if (requiresFundingSplit(tx)) return "postings";
   if (!isPostingAccount(tx.fundingAccount)) return "funding";
   if (!isPostingAccount(tx.fundingAccount2 || tx.finalAccount)) return "category";
 }
@@ -48,7 +52,7 @@ export function transactionReviewProblems(tx: ParsedTx, postings: DraftPosting[]
   if (needsCnySettlement(tx)) add(CNY_SETTLEMENT_REQUIRED, "settlement");
   if (tx.excludedReason) add(`原始流水不可入账：${tx.excludedReason}`);
   if (!Number.isFinite(tx.amount) || tx.amount < 0 || (!tx.merge && tx.amount === 0)) add("交易金额须大于零");
-  if (!tx.postings && (tx.fundingParts?.length ?? 0) > 1) add("请拆分组合支付", "postings");
+  if (requiresFundingSplit(tx)) add(FUNDING_SPLIT_REQUIRED, "postings");
   if (postings.length < 2) add("至少需要两条分录", "postings");
   const sameAccount = new Set(postings.map((posting) => posting.account)).size < 2;
   if (sameAccount && postings.every(({ account }) => isPostingAccount(account))) {

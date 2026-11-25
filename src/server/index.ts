@@ -7,13 +7,13 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import multer from "multer";
 import type { AppConfig, AutomaticExclusionRule, BatchRevision, FundingMappingChoice, FundingMappingGroup, ImportPreview, ParsedTx, ReviewProblem, TxDecision, LedgerInfo } from "../shared/types.js";
-import { duplicateReviewIssue, MAX_NARRATION_LENGTH } from "../shared/types.js";
+import { duplicateReviewIssue, isFamilyCard, MAX_NARRATION_LENGTH } from "../shared/types.js";
 import { planSuspectedDuplicateExclusions } from "../shared/duplicateExclusions.js";
 import { reviewStatusPatch } from "../shared/exclusions.js";
 import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement, originalForeignAmount, readCnySettlementAmount } from "../shared/settlement.js";
 import { MAX_CATEGORY_ALLOCATIONS, planCategoryAllocations, savedCategoryAllocations } from "../shared/categoryAllocations.js";
 import { activeTransactions, mergeSource, planTransactionMerge } from "../shared/transactionMerge.js";
-import { missingPostingAccount, missingPostingAccountMessage, statusAfterCategorization, validDate } from "../shared/postings.js";
+import { FUNDING_SPLIT_REQUIRED, missingPostingAccount, missingPostingAccountMessage, requiresFundingSplit, statusAfterCategorization, validDate } from "../shared/postings.js";
 import { hasFundingPosting, isFundingAccount, isStatementOnlyPayment, reusablePaymentMethod } from "../shared/funding.js";
 import { configWithDefaults, defaultActiveLedgerFile, loadConfig, readLedgerSettings, saveConfig } from "./config.js";
 import { discoverPython, LedgerAccessError, parseLedger, parseLedgerAsync, validateLedgerFile } from "./lib/ledger.js";
@@ -33,7 +33,7 @@ import { parseYunshanfu, isYunshanfu } from "./parsers/yunshanfu.js";
 import { detectBank, parseBank } from "./parsers/banks.js";
 import { parsePdfBank, PDF_RETRY_HINT } from "./parsers/pdf.js";
 import { pairTransfers, transferPairIssue } from "./lib/transfers.js";
-import { isParsedStatementRow, readSheet, UNREADABLE_TRANSACTION } from "./parsers/common.js";
+import { isParsedStatementRow, parseFundingParts, readSheet, UNREADABLE_TRANSACTION } from "./parsers/common.js";
 import { BatchStore, isBatchId, profileId, type StoredBatch, type StoredPdfUpload } from "./lib/batches.js";
 import { applyStatementNames, combineBatchReviews, resolveBatchReviewConflict, statementsForBatches } from "./lib/batch-review-merge.js";
 import { acquireWriteLock, assertBatchDeletable, commitBatch, ImportError } from "./lib/commit.js";
@@ -217,6 +217,30 @@ function unmappedPayments(txs: ParsedTx[], wechatRules: ReturnType<typeof loadWe
     if (raw) addPaymentGroup(groups, tx, raw, isStatementOnlyPayment(tx, raw));
   }
   return groups;
+}
+
+function combinedFundingPayments(txs: ParsedTx[]) {
+  const groups = new Map<string, { label: string; combination: string; txs: Set<ParsedTx> }>();
+  const rows = new Map<ParsedTx, { parts: NonNullable<ParsedTx["fundingParts"]>; ids: string[] }>();
+  for (const tx of txs) {
+    if (tx.source !== "alipay" || tx.status !== "pending" || tx.excludedReason || tx.postings || tx.fundingAccount2
+      || tx.fundingPartAccounts || (tx.fundingAccount && tx.fundingConfidence === 1) || isFamilyCard(tx)) continue;
+    const parts = tx.fundingParts ?? parseFundingParts(tx.rawAccount).fundingParts;
+    if (!parts || parts.length < 2) continue;
+    const labels = parts.map(({ rawAccount }) => rawAccount || "未标明支付方式");
+    const keys = labels.map(normalizePaymentMethod);
+    const key = [...keys].sort();
+    const combination = labels.join(" & ");
+    const ids = keys.map((label) => crypto.createHash("sha256")
+      .update(JSON.stringify(["alipay-combined", key, label])).digest("hex"));
+    ids.forEach((id, index) => {
+      const group = groups.get(id) ?? { label: labels[index], combination, txs: new Set<ParsedTx>() };
+      group.txs.add(tx);
+      groups.set(id, group);
+    });
+    rows.set(tx, { parts, ids });
+  }
+  return { groups, rows };
 }
 
 function statementFundingDefaults(txs: ParsedTx[]): Map<ParsedTx, string> {
@@ -822,25 +846,28 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const rules = wechatRulesFor(txs);
     const exclusionsChanged = applyWechatExclusions(txs, rules);
     const payments = unmappedPayments(txs, rules);
+    const combined = combinedFundingPayments(txs);
     const splitPayments = txs.flatMap((tx) => {
       const fundingParts = needsFundingAccount(tx) ? unallocatedFundingParts(tx) : undefined;
       return fundingParts ? [{ tx, fundingParts }] : [];
     });
     const statementDefaults = statementFundingDefaults(txs);
-    const currentLedger = payments.size || splitPayments.length || statementDefaults.size ? ledger() : undefined;
+    const currentLedger = payments.size || combined.groups.size || splitPayments.length || statementDefaults.size ? ledger() : undefined;
     const splits = splitPayments.map(({ tx, fundingParts }) => ({
       tx, fundingParts, guess: inferFundingAccount({ ...tx, fundingParts }, config, currentLedger),
     }));
     const splitRows = new Set(splits.map(({ tx }) => tx));
     for (const { tx, fundingParts, guess } of splits) {
-      if (guess.account) continue;
+      if (guess.account || tx.source === "alipay") continue;
       for (const part of fundingParts) {
         if (isPaymentAccountPart(part)) addPaymentGroup(payments, tx, part.rawAccount.trim());
       }
     }
     const mappings = req.body?.mappings as FundingMappingChoice[] | undefined;
-    if (mappings !== undefined && (!Array.isArray(mappings) || mappings.length > payments.size
-      || mappings.some((item) => !item || !payments.has(item.id) || typeof item.account !== "string")
+    if (mappings !== undefined && (!Array.isArray(mappings) || mappings.length > payments.size + combined.groups.size
+      || mappings.some((item) => !item || (combined.groups.has(item.id)
+        ? item.account !== null && typeof item.account !== "string"
+        : !payments.has(item.id) || typeof item.account !== "string"))
       || new Set(mappings.map((item) => item.id)).size !== mappings.length)) throw new ImportError(400, "资金映射无效");
     const available = currentLedger?.accounts.filter(({ account }) => isFundingAccount(account)) ?? [];
     const choices = new Map(mappings?.map(({ id, account }) => [id, account]));
@@ -859,7 +886,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       const [guess] = guesses;
       const existing = guesses.size === 1 && accounts.includes(guess) ? guess : "";
       const choice = choices.get(id);
-      if (choice !== undefined && !accounts.includes(choice)) throw new ImportError(400, `账户不可用：${fromFile ? sourceFile : raw}`);
+      if (choice !== undefined && (choice === null || !accounts.includes(choice))) throw new ImportError(400, `账户不可用：${fromFile ? sourceFile : raw}`);
       if (choice && existing && choice !== existing) throw new ImportError(409, "账户映射已更新");
       if (!existing) groups.push({ id, label: fromFile ? sourceFile : raw, source, count: rows.length, accounts, statementOnly: fromFile || undefined });
       const account = existing || choice;
@@ -869,6 +896,14 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
         assetMapping = setExactFundingMapping(assetMapping, source, raw, account);
       }
     }
+    for (const [id, { label, combination, txs: members }] of combined.groups) {
+      const rows = [...members];
+      const accounts = currentLedger!.accounts.filter((account) => rows.every((tx) =>
+        accountIsActive(account, tx.date, tx.currency))).map(({ account }) => account);
+      const choice = choices.get(id);
+      if (choice != null && !accounts.includes(choice)) throw new ImportError(400, `账户不可用：${combination} · ${label}`);
+      groups.push({ id, label, combination, source: "alipay", count: members.size, accounts });
+    }
     if (groups.some(({ id }) => !choices.has(id))) { res.json({ groups }); return; }
 
     for (const [tx, account] of resolved) {
@@ -876,6 +911,16 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       tx.issues = tx.issues?.filter((issue) => !fundingMappingIssue(issue));
     }
     let fundingChanged = resolved.size > 0;
+    for (const [tx, { parts, ids }] of combined.rows) {
+      tx.fundingParts = parts;
+      tx.fundingPartAccounts = ids.map((id) => choices.get(id) ?? null);
+      const primary = tx.fundingPartAccounts[parts.findIndex(isPaymentAccountPart)];
+      if (primary && isFundingAccount(primary)) {
+        confirmFundingAccount(tx, primary);
+        tx.issues = tx.issues?.filter((issue) => !fundingMappingIssue(issue));
+      }
+      fundingChanged = true;
+    }
     if (currentLedger) {
       for (const [tx, account] of resolved.size ? statementFundingDefaults(txs) : statementDefaults) {
         if (applyStatementFundingDefault(tx, account, currentLedger)) fundingChanged = true;
@@ -883,6 +928,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     }
     const fundingConfig = { ...config, assetMapping };
     for (const { tx, fundingParts, guess: originalGuess } of splits) {
+      if (tx.fundingAccount) continue;
       const guess = assetMapping === config.assetMapping ? originalGuess : inferFundingAccount({ ...tx, fundingParts }, fundingConfig, currentLedger);
       if (!guess.account) continue;
       tx.fundingParts = fundingParts;
@@ -1045,11 +1091,13 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       else if (decision.postings !== undefined) { tx.postings = decision.postings; delete tx.fundingAccount2; }
       if (decision.status === "ready") {
         if (needsCnySettlement(tx)) throw new ImportError(422, CNY_SETTLEMENT_REQUIRED);
+        if (requiresFundingSplit(tx)) throw new ImportError(422, FUNDING_SPLIT_REQUIRED);
         const missing = missingPostingAccount(tx);
         if (missing) throw new ImportError(422, missingPostingAccountMessage[missing]);
       }
       if (decision.status !== undefined) Object.assign(tx, reviewStatusPatch(tx, decision.status));
       else if (decision.account !== undefined) Object.assign(tx, reviewStatusPatch(tx, statusAfterCategorization(tx)));
+      else if (decision.postings === null && requiresFundingSplit(tx) && tx.status === "ready") tx.status = "pending";
       if (tx.status !== "duplicate") delete tx.duplicateOf;
     }
     syncStatementRefunds(active);
