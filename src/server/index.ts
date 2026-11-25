@@ -37,7 +37,7 @@ import { isParsedStatementRow, parseFundingParts, readSheet, UNREADABLE_TRANSACT
 import { BatchStore, isBatchId, profileId, type StoredBatch, type StoredPdfUpload } from "./lib/batches.js";
 import { applyStatementNames, combineBatchReviews, resolveBatchReviewConflict, statementsForBatches } from "./lib/batch-review-merge.js";
 import { acquireWriteLock, assertBatchDeletable, commitBatch, ImportError } from "./lib/commit.js";
-import { importDirectoryError } from "./lib/import-paths.js";
+import { importDirectoryError } from "../shared/import-paths.js";
 import { isLocalRequest } from "./lib/local-request.js";
 import { createPdfPreviewLoader } from "./lib/pdf-preview.js";
 import { archiveStatement, ledgerUploadsDirectory } from "./lib/statement-uploads.js";

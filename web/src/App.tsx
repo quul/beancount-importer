@@ -2022,7 +2022,20 @@ export default function App() {
         </footer>
       </section>
 
-      {preview && <section className="card"><div className="toolbar"><h2 ref={previewHeading} tabIndex={-1}>分录预览</h2><span>共 {preview.generated} 笔</span><span className="spacer" />{!readOnly && <button className="btn primary" disabled={busy || blockBatchChanges || Boolean(preview.errors?.length) || preview.revision !== batch.revision} onClick={commit}>校验并写入账本</button>}</div><p className="muted preview-targets">{(preview.targetFiles ?? Object.keys(preview.monthFiles)).join(" · ")}</p>{preview.opens.length > 0 && <p className="error-line">账户指令建议：{preview.opens.join("；")}</p>}{preview.errors?.map((message, index) => <p role="alert" className="error-line" key={index}>{message}</p>)}<BeancountCode className="code" text={preview.entries} /></section>}
+      {preview && <section className="card">
+        <div className="toolbar">
+          <h2 ref={previewHeading} tabIndex={-1}>分录预览</h2><span>共 {preview.generated} 笔</span><span className="spacer" />
+          {!readOnly && <button className="btn primary" disabled={busy || blockBatchChanges || Boolean(preview.errors?.length) || preview.revision !== batch.revision}
+            onClick={commit}>校验并写入账本</button>}
+        </div>
+        {preview.targetFiles?.length ? <div className="preview-targets">
+          <h3>本次写入的文件</h3>
+          <ul>{preview.targetFiles.map((file) => <li key={file}><code>{file}</code></li>)}</ul>
+        </div> : preview.targetFiles === undefined && <p className="muted preview-targets">涉及月份 {Object.keys(preview.monthFiles).join(" · ")}</p>}
+        {preview.opens.length > 0 && <p className="error-line">账户指令建议：{preview.opens.join("；")}</p>}
+        {preview.errors?.map((message, index) => <p role="alert" className="error-line" key={index}>{message}</p>)}
+        <BeancountCode className="code" text={preview.entries} />
+      </section>}
       {posted && <section className="card done-banner"><h2>此批次已过账</h2>{Boolean(batch.written?.length) && <p>{batch.written?.join(" · ")}</p>}</section>}
       {batch.mergedInto && <section className="card done-banner"><div className="toolbar"><h2>此批次已合并</h2>
         {batches.some(({ batchId }) => batchId === batch.mergedInto) && <button type="button" className="btn small"

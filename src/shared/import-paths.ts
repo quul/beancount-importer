@@ -1,5 +1,4 @@
-import path from "node:path";
-import type { AppConfig } from "../../shared/types.js";
+import type { AppConfig } from "./types.js";
 
 export type ImportLayout = Pick<AppConfig, "monthlyDir" | "annualLayout">;
 
@@ -16,5 +15,6 @@ export function importTarget(layout: ImportLayout, date: string, source: string,
   const variables = { year, month, source: source.replace(/[^a-z0-9-]/gi, "_"), account: account.replaceAll(":", "_") };
   const directory = layout.monthlyDir.replace(/\{(year|month|source|account)\}/g, (_, key: keyof typeof variables) => variables[key]);
   const filename = layout.annualLayout ? `${year}-${month}.bean` : `${year}${month}.beancount`;
-  return path.posix.join(directory.replaceAll("\\", "/"), filename);
+  const segments = directory.split(/[/\\]/).filter((segment) => segment && segment !== ".");
+  return [...segments, filename].join("/");
 }

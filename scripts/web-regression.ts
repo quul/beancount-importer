@@ -6,6 +6,7 @@ import { calculatePostingAmount } from "../web/src/postingCalculator.js";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
 import { buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch, reviewCategoryOptions } from "../web/src/reviewRows.js";
 import { LEDGER_DUPLICATE_ISSUE } from "../src/shared/types.js";
+import { importDirectoryError, importTarget } from "../src/shared/import-paths.js";
 import { planCategoryAllocations, savedCategoryAllocations } from "../src/shared/categoryAllocations.js";
 import { planTransactionMerge } from "../src/shared/transactionMerge.js";
 import type { ParsedAccount, ParsedTx } from "../src/shared/types.js";
@@ -284,6 +285,13 @@ try {
   assert.deepEqual(list.deleted, ["deleted-merge"]);
   console.log("✓ ordinary and merged completed approvals share an archive; merged sources stay under their immediate approval");
 
+  const layout = { annualLayout: true, monthlyDir: "./{year}//{month}\\{source}/{account}/" };
+  assert.equal(importDirectoryError(layout.monthlyDir), undefined);
+  assert.equal(importTarget(layout, "2026-11-01", "alipay", "Assets:Bank"), "2026/11/alipay/Assets_Bank/2026-11.bean");
+  assert.equal(importTarget({ ...layout, annualLayout: false, monthlyDir: "" }, "2026-11-01", "alipay", "Assets:Bank"), "202611.beancount");
+  assert.ok(importDirectoryError("../{year}"));
+  console.log("✓ settings path examples share the output naming rules and support the directory template variables");
+
   status = 422;
   const reviewReminder = "请将待确认内容处理完毕后，再点击「生成预览」。";
   const reviewProblems = [{ id: "transfer", field: "category", message: "请选择转账对方账户" }];
@@ -311,5 +319,5 @@ try {
   await assert.rejects(() => api.upload([]), (error: unknown) => error instanceof ApiError && error.temporary
     && error.message === "服务连接中断，请重试");
   console.log("✓ empty responses, proxy pages and network exceptions get friendly retry messages");
-  console.log("Web contract regression passed (14 groups).");
+  console.log("Web contract regression passed (15 groups).");
 } finally { globalThis.fetch = originalFetch; }

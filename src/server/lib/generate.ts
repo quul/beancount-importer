@@ -3,7 +3,7 @@ import type { GenerateResult, ParsedTx, ReviewProblem } from "../../shared/types
 import { accountPattern, amountText, currencyPattern, formatTransactionEntry, transactionPostings, transactionReviewProblems, validDate } from "../../shared/postings.js";
 import { activeTransactions } from "../../shared/transactionMerge.js";
 import { loadWechatRules, wechatExclusionReason } from "../parsers/wechat-rules.js";
-import { importTarget, type ImportLayout } from "./import-paths.js";
+import { importTarget, type ImportLayout } from "../../shared/import-paths.js";
 
 export { transactionPostings };
 

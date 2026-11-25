@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { importDirectoryError, importTarget } from "../../src/shared/import-paths.js";
 import type { AppConfig, ParsedAccount } from "../../src/shared/types.js";
 import AccountSelect from "./AccountSelect";
 import { api, ApiError, type ConfigResponse, type PathField } from "./api";
@@ -40,6 +41,11 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
   if (!section) return null;
 
   const funding = section === "funding";
+  const today = new Date();
+  const exampleYear = today.getFullYear(), exampleMonth = today.getMonth() + 1;
+  const exampleDate = `${exampleYear}-${String(exampleMonth).padStart(2, "0")}-01`;
+  const directoryError = importDirectoryError(values.monthlyDir);
+  const examplePath = directoryError ? undefined : importTarget(values, exampleDate, "alipay", "Assets:Bank");
   async function save() {
     if (funding) {
       const saved = await onSave({ assetMapping: values.assetMapping });
@@ -129,16 +135,34 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
           <div className="editor-grid">
             {pathInput("ledgerRoot", "账本目录", "选择文件夹")}
             <label>主入口<input value={values.mainFile} onChange={(event) => setValues({ ...values, mainFile: event.target.value })} /></label>
-            <label>导入子目录<input value={values.monthlyDir} aria-describedby="import-directory-variables" onChange={(event) => setValues({ ...values, monthlyDir: event.target.value })} /></label>
-            <small id="import-directory-variables" className="wide settings-variables">
-              <span><code>{"{year}"}</code> 年份（2026）</span>
-              <span><code>{"{month}"}</code> 月份（01）</span>
-              <span><code>{"{source}"}</code> 来源（alipay）</span>
-              <span><code>{"{account}"}</code> 资金账户（Assets_Bank）</span>
-            </small>
             {pathInput("pythonPath", "Python 路径（可选）", "选择文件")}
           </div>
-          <label className="check-label"><input type="checkbox" checked={values.annualLayout} onChange={(event) => setValues({ ...values, annualLayout: event.target.checked })} />按年度目录和 include 链写入</label>
+          <section className="settings-destination" aria-labelledby="settings-destination-heading">
+            <h3 id="settings-destination-heading">分录保存位置</h3>
+            <small>以 {exampleYear} 年 {exampleMonth} 月为例，路径相对于账本目录。</small>
+            <output id="import-path-example" className={directoryError ? "error-line" : undefined}>
+              {directoryError ?? <code>{examplePath}</code>}
+            </output>
+            <details className="settings-disclosure">
+              <summary>修改保存目录</summary>
+              <label htmlFor="import-directory">保存目录</label>
+              <input id="import-directory" value={values.monthlyDir} aria-invalid={directoryError ? true : undefined}
+                aria-describedby={directoryError ? "import-directory-variables import-path-example" : "import-directory-variables"}
+                onChange={(event) => setValues({ ...values, monthlyDir: event.target.value })} />
+              <small id="import-directory-variables" className="settings-variables">
+                <span><code>{"{year}"}</code> 年份</span>
+                <span><code>{"{month}"}</code> 月份</span>
+                <span><code>{"{source}"}</code> 来源（alipay）</span>
+                <span><code>{"{account}"}</code> 资金账户（Assets_Bank）</span>
+              </small>
+            </details>
+          </section>
+          <details className="settings-disclosure settings-advanced">
+            <summary>高级设置</summary>
+            <label className="check-label"><input type="checkbox" checked={values.annualLayout} aria-describedby="annual-layout-help"
+              onChange={(event) => setValues({ ...values, annualLayout: event.target.checked })} />使用年度索引</label>
+            <small id="annual-layout-help">开启后，每年生成一个索引文件，主账本通过它读取月度分录。</small>
+          </details>
           <label className="settings-switch">
             <span>
               <span id="archive-uploads-label">账单副本随账本保存</span>
@@ -148,7 +172,8 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
               checked={values.archiveUploadsInLedger} onChange={(event) => setValues({ ...values, archiveUploadsInLedger: event.target.checked })} />
           </label>
           <div className="toolbar settings-actions">
-            <button type="button" className="btn primary" onClick={() => void save()} disabled={picking !== null || !values.ledgerRoot.trim() || !values.mainFile.trim()}>保存账本设置</button>
+            <button type="button" className="btn primary" onClick={() => void save()}
+              disabled={picking !== null || !values.ledgerRoot.trim() || !values.mainFile.trim() || Boolean(directoryError)}>保存账本设置</button>
           </div>
         </>}
       </fieldset>

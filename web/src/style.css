@@ -648,7 +648,15 @@ input[aria-invalid="true"]:not(:focus) { border-color: var(--danger); }
 .settings-actions { justify-content: flex-end; padding-top: 12px; border-top: 1px solid var(--line); }
 .settings-path { display: flex; align-items: stretch; gap: 8px; margin-top: 5px; }
 .settings-path input { flex: 1; }
-.settings-variables { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: -5px; }
+.settings-destination { display: grid; gap: 6px; margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.settings-destination h3, .preview-targets h3 { margin: 0; font-size: 14px; }
+.settings-destination output { display: block; overflow-wrap: anywhere; }
+.settings-destination output code { font-weight: 600; }
+.settings-disclosure > summary { width: fit-content; padding-block: 5px; cursor: pointer; }
+.settings-disclosure > label[for] { margin-top: 4px; }
+.settings-disclosure > input { width: 100%; margin-top: 4px; }
+.settings-variables { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
+.settings-advanced { margin-block: 12px; }
 .settings-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 12px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
 .settings-switch small { margin-top: 2px; }
 .settings-switch input { appearance: none; display: flex; align-items: center; flex: none; width: 36px; height: 22px; margin: 0; padding: 3px; border-radius: 11px; background: var(--muted); cursor: inherit; }
@@ -663,7 +671,8 @@ input[aria-invalid="true"]:not(:focus) { border-color: var(--danger); }
 .mapping-field > span { display: none; }
 .mapping-row > small { padding: 8px 0; }
 .mapping-row > .btn { min-height: 36px; }
-.preview-targets { margin-top: 8px; overflow-wrap: anywhere; }
+.preview-targets { margin-block: 12px; overflow-wrap: anywhere; }
+.preview-targets ul { display: grid; gap: 3px; margin: 4px 0 0; padding-inline-start: 20px; }
 pre.code { max-height: 440px; overflow: auto; margin-bottom: 0; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--subtle); font-size: 13px; }
 .done-banner { border-color: var(--success); color: var(--success); }
 .done-banner p { margin-top: 5px; overflow-wrap: anywhere; }

@@ -7,7 +7,7 @@ import { activeTransactions } from "../../shared/transactionMerge.js";
 import { atomicJson, profileId, type StoredBatch } from "./batches.js";
 import { discoverPython, parseLedger } from "./ledger.js";
 import { generateEntries } from "./generate.js";
-import { importDirectoryError } from "./import-paths.js";
+import { importDirectoryError } from "../../shared/import-paths.js";
 import { markDuplicates } from "./dedup.js";
 import { syncStatementRefunds } from "./refunds.js";
 
