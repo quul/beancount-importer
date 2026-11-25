@@ -12,6 +12,8 @@ export type SourceType =
   | "merged"
   | "unknown";
 
+export type ImportStatementKind = "yuebao-interest" | "alipay" | "wechat" | "yunshanfu" | "bank";
+
 export type Direction = "in" | "out";
 export type EventType = "expense" | "income" | "refund" | "transfer" | "unknown" | "familyCard";
 /** Someone else paid on my behalf (亲情卡/亲友代付): the funding leg is theirs, not mine. */
@@ -344,6 +346,8 @@ export interface AppConfig {
   ledgerRoot: string;
   mainFile: string;
   monthlyDir: string;
+  /** Destination overrides for statement kinds, relative to the ledger directory. */
+  statementDirectories?: Partial<Record<ImportStatementKind, string>>;
   /** Python environment containing Beancount; auto-detected when omitted. */
   pythonPath?: string;
   /** Real ledgers use years/YYYY/imported and the annual include chain. */
@@ -381,6 +385,7 @@ export interface GenerateResult {
   monthFiles: Record<string, string>;
   /** Rendered destination files. Older previews only stored monthFiles. */
   files?: Record<string, { year: string; body: string }>;
+  fileCounts?: Record<string, number>;
   /** tx ids that were generated */
   generated: string[];
   errors?: string[];

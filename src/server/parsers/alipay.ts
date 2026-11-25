@@ -1,6 +1,6 @@
 /** Alipay export: retain every source transaction, including excluded rows. */
 import fs from "node:fs";
-import { alipayRefundOrderId } from "../../shared/alipay.js";
+import { alipayRefundOrderId, isYuebaoInterestDescription } from "../../shared/alipay.js";
 import type { EventType, RawTx } from "../../shared/types.js";
 import { col, parseAmount, parseDate, readTextSmart, parseCsv, txId, parseFundingParts, UNREADABLE_TRANSACTION, type ParseResult } from "./common.js";
 import { statementRefundEvidence } from "./refund-evidence.js";
@@ -84,7 +84,7 @@ export function parseAlipay(file: string): ParseResult {
       || (sourceStatus === "退款成功" && Boolean(alipayRefundOrderId(sourceTxId)));
     const yuEBaoInterest = !excludedReason && amount !== null && amount > 0 && category === "投资理财"
       && rawAccount === "余额宝" && sourceStatus === "交易成功" && originalDirection === "不计收支"
-      && /^余额宝-\d{4}\.\d{2}\.\d{2}-收益发放$/.test(description);
+      && isYuebaoInterestDescription(description);
     const income = yuEBaoInterest || originalDirection.includes("收入");
     const transfer = !yuEBaoInterest && (/信用借还|账户存取/.test(category) || /还款|提现|转入余额|余额转出/.test(`${category} ${note}`));
     // 亲情卡/亲友代付: someone else's card paid for this purchase. The funding

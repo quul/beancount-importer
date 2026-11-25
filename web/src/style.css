@@ -193,6 +193,13 @@ select {
 .batch-actions { display: flex; gap: 8px; flex: none; }
 .review-card { padding: 12px 15px 0; }
 .review-header { justify-content: space-between; }
+.review-destinations { margin-top: 10px; padding: 4px 10px 9px; border: 1px solid var(--line); border-radius: 8px; }
+.review-destinations-heading { justify-content: space-between; }
+.review-destinations-heading h3 { margin: 0; font-size: 14px; }
+.review-destinations dl { display: grid; gap: 4px; margin: 1px 0 0; font-size: 13px; }
+.review-destination { display: grid; grid-template-columns: minmax(0, min(40%, 220px)) minmax(0, 1fr); gap: 8px; align-items: baseline; }
+.review-destination small { display: inline; margin-inline-start: 4px; color: var(--muted); white-space: nowrap; }
+.review-destination dd { margin: 0; overflow-wrap: anywhere; }
 .review-actions .btn { min-height: 32px; }
 .review-menu { display: inline-flex; flex: none; }
 .review-menu-trigger { white-space: nowrap; }
@@ -657,6 +664,9 @@ input[aria-invalid="true"]:not(:focus) { border-color: var(--danger); }
 .settings-disclosure > input { width: 100%; margin-top: 4px; }
 .settings-variables { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
 .settings-advanced { margin-block: 12px; }
+.statement-directory-rules { display: grid; gap: 10px; margin-top: 8px; }
+.statement-directory-rule { display: grid; gap: 4px; min-width: 0; }
+.statement-directory-rule > output { font-size: 12px; }
 .settings-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 12px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
 .settings-switch small { margin-top: 2px; }
 .settings-switch input { appearance: none; display: flex; align-items: center; flex: none; width: 36px; height: 22px; margin: 0; padding: 3px; border-radius: 11px; background: var(--muted); cursor: inherit; }
@@ -673,6 +683,7 @@ input[aria-invalid="true"]:not(:focus) { border-color: var(--danger); }
 .mapping-row > .btn { min-height: 36px; }
 .preview-targets { margin-block: 12px; overflow-wrap: anywhere; }
 .preview-targets ul { display: grid; gap: 3px; margin: 4px 0 0; padding-inline-start: 20px; }
+.preview-targets li > small { display: inline-block; margin-inline-start: 8px; }
 pre.code { max-height: 440px; overflow: auto; margin-bottom: 0; padding: 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--subtle); font-size: 13px; }
 .done-banner { border-color: var(--success); color: var(--success); }
 .done-banner p { margin-top: 5px; overflow-wrap: anywhere; }

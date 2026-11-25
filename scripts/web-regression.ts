@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { api, ApiError, IncompleteReviewError } from "../web/src/api.js";
 import { groupBatchList } from "../web/src/batchList.js";
+import { summarizeImportDirectories } from "../web/src/ImportDestinationSummary.js";
 import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, validatePostingDraft } from "../web/src/ReviewEditor.js";
 import { calculatePostingAmount } from "../web/src/postingCalculator.js";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
@@ -8,7 +9,7 @@ import { buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, matchesRe
 import { LEDGER_DUPLICATE_ISSUE } from "../src/shared/types.js";
 import { importDirectoryError, importTarget } from "../src/shared/import-paths.js";
 import { planCategoryAllocations, savedCategoryAllocations } from "../src/shared/categoryAllocations.js";
-import { planTransactionMerge } from "../src/shared/transactionMerge.js";
+import { mergeSource, planTransactionMerge } from "../src/shared/transactionMerge.js";
 import type { ParsedAccount, ParsedTx } from "../src/shared/types.js";
 
 const originalFetch = globalThis.fetch;
@@ -292,6 +293,33 @@ try {
   assert.ok(importDirectoryError("../{year}"));
   console.log("✓ settings path examples share the output naming rules and support the directory template variables");
 
+  const summaryLayout = { annualLayout: true, monthlyDir: "{year}", statementDirectories: {
+    "yuebao-interest": "理财/余额宝收益", alipay: "平台/支付宝", bank: "银行/{account}",
+  } };
+  const yieldRow = { ...income, id: "destination-yuebao", date: "2026-11-01", source: "alipay", status: "pending",
+    rawAccount: "余额宝", note: "余额宝-2026.11.01-收益发放 · 备注" } satisfies ParsedTx;
+  const alipayRow = { ...yieldRow, id: "destination-alipay", note: "其他利息", status: "ready" } satisfies ParsedTx;
+  const wechatRow = { ...alipayRow, id: "destination-wechat", source: "wechat" } satisfies ParsedTx;
+  const bankRow = { ...yieldRow, id: "destination-bank", source: "bank-cmb", fundingAccount: "", finalAccount: "" } satisfies ParsedTx;
+  const candidates = [yieldRow, alipayRow, wechatRow, bankRow,
+    { ...yieldRow, id: "destination-duplicate", status: "duplicate" } satisfies ParsedTx,
+    { ...yieldRow, id: "destination-excluded", excludedReason: "交易关闭" },
+    { ...yieldRow, id: "destination-foreign", requireCnySettlement: true, currency: "JPY" }];
+  assert.deepEqual(Object.fromEntries(summarizeImportDirectories(summaryLayout, candidates)
+    .map(([directory, group]) => [directory, [group.count, [...group.kinds]]])), {
+    "理财/余额宝收益/": [1, ["yuebao-interest"]],
+    "平台/支付宝/": [1, ["alipay"]],
+    "银行/{account}/": [1, ["bank"]],
+    "2026/": [1, []],
+  });
+  const mergedDestination = { ...alipayRow, id: "destination-merged", source: "merged",
+    merge: { originals: [mergeSource(yieldRow), mergeSource(alipayRow)], totals: [] } } satisfies ParsedTx;
+  assert.deepEqual(summarizeImportDirectories(summaryLayout, [yieldRow, alipayRow, mergedDestination]), [
+    ["2026/", { count: 1, kinds: new Set(), hasDefault: true }],
+  ]);
+  assert.equal(summarizeImportDirectories({ monthlyDir: "" }, [wechatRow])[0][0], "");
+  console.log("✓ estimated destinations count reviewable transactions, use configured directories and preserve unresolved accounts");
+
   status = 422;
   const reviewReminder = "请将待确认内容处理完毕后，再点击「生成预览」。";
   const reviewProblems = [{ id: "transfer", field: "category", message: "请选择转账对方账户" }];
@@ -319,5 +347,5 @@ try {
   await assert.rejects(() => api.upload([]), (error: unknown) => error instanceof ApiError && error.temporary
     && error.message === "服务连接中断，请重试");
   console.log("✓ empty responses, proxy pages and network exceptions get friendly retry messages");
-  console.log("Web contract regression passed (15 groups).");
+  console.log("Web contract regression passed (16 groups).");
 } finally { globalThis.fetch = originalFetch; }

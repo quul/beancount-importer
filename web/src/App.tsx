@@ -23,6 +23,7 @@ import DateRangeFilter from "./DateRangeFilter";
 import EntryPreview from "./EntryPreview";
 import ExclusionFilters from "./ExclusionFilters";
 import FundingDialog from "./FundingDialog";
+import ImportDestinationSummary from "./ImportDestinationSummary";
 import MergeDialog from "./MergeDialog";
 import PdfPreviewDialog from "./PdfPreviewDialog";
 import ReviewMenu from "./ReviewMenu";
@@ -43,6 +44,7 @@ const REVIEW_UNDO_LABELS = { approve: "撤销入账标记", exclude: "撤销排�
 
 function settingsRoute(): SettingsSection | null {
   if (window.location.hash === SETTINGS_LINKS.funding) return "funding";
+  if (window.location.hash === SETTINGS_LINKS.directories) return "directories";
   return window.location.hash === SETTINGS_LINKS.ledger ? "ledger" : null;
 }
 
@@ -1922,6 +1924,7 @@ export default function App() {
         </div>}
         {rowErrors.length > 0 && <details className="review-diagnostic"><summary>需要核对的账单行（{rowErrors.length}）</summary>{rowErrors.map(({ row, message }, index) => <p className="error-line" key={index}>第 {row} 行：{message}</p>)}</details>}
         {batch.ledgerErrors?.length ? <details className="review-diagnostic"><summary>载入批次时的账本校验信息（{batch.ledgerErrors.length}）</summary>{batch.ledgerErrors.map((item, index) => <p className="error-line" key={index}>{item.file}{item.line ? `:${item.line}` : ""} {item.message}</p>)}</details> : null}
+        {!readOnly && config && <ImportDestinationSummary layout={config} txs={txs} rulesHref={SETTINGS_LINKS.directories} />}
         <div className="filter-row">
           <div className="review-search">
             <input ref={searchInput} type="search" value={filter} onChange={(event) => setFilter(event.target.value)}
@@ -2030,7 +2033,9 @@ export default function App() {
         </div>
         {preview.targetFiles?.length ? <div className="preview-targets">
           <h3>本次写入的文件</h3>
-          <ul>{preview.targetFiles.map((file) => <li key={file}><code>{file}</code></li>)}</ul>
+          <ul>{preview.targetFiles.map((file) => <li key={file}><code>{file}</code>
+            {preview.fileCounts?.[file] !== undefined && <small className="muted">{preview.fileCounts[file]} 笔</small>}
+          </li>)}</ul>
         </div> : preview.targetFiles === undefined && <p className="muted preview-targets">涉及月份 {Object.keys(preview.monthFiles).join(" · ")}</p>}
         {preview.opens.length > 0 && <p className="error-line">账户指令建议：{preview.opens.join("；")}</p>}
         {preview.errors?.map((message, index) => <p role="alert" className="error-line" key={index}>{message}</p>)}

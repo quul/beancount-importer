@@ -37,7 +37,7 @@ import { isParsedStatementRow, parseFundingParts, readSheet, UNREADABLE_TRANSACT
 import { BatchStore, isBatchId, profileId, type StoredBatch, type StoredPdfUpload } from "./lib/batches.js";
 import { applyStatementNames, combineBatchReviews, resolveBatchReviewConflict, statementsForBatches } from "./lib/batch-review-merge.js";
 import { acquireWriteLock, assertBatchDeletable, commitBatch, ImportError } from "./lib/commit.js";
-import { importDirectoryError } from "../shared/import-paths.js";
+import { importLayoutError } from "../shared/import-paths.js";
 import { isLocalRequest } from "./lib/local-request.js";
 import { createPdfPreviewLoader } from "./lib/pdf-preview.js";
 import { archiveStatement, ledgerUploadsDirectory } from "./lib/statement-uploads.js";
@@ -1151,7 +1151,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   app.post("/api/batch/:id/generate", withBatchWrite((req, res, batch) => {
     requireRevision(batch, req.body.revision);
     if (batch.committed) throw new ImportError(409, "该批次已经写入");
-    const directoryError = importDirectoryError(config.monthlyDir);
+    const directoryError = importLayoutError(config);
     if (directoryError) throw new ImportError(400, directoryError);
     const currentLedger = ledger();
     const active = activeTransactions(batch.txs);
@@ -1270,10 +1270,11 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const base = existing ? configWithDefaults(ledgerDirectory, existing) : config;
     const candidate = {
       ...base, archiveUploadsInLedger: switchingDirectory && !existing ? true : base.archiveUploadsInLedger ?? true,
+      statementDirectories: switchingDirectory && !existing ? undefined : base.statementDirectories,
       ...patch, ledgerRoot: ledgerDirectory, llm: { ...base.llm, ...patch.llm },
     };
     if (typeof candidate.mainFile !== "string" || typeof candidate.monthlyDir !== "string" || (candidate.pythonPath !== undefined && typeof candidate.pythonPath !== "string")) throw new ImportError(400, "账本路径配置无效");
-    const directoryError = importDirectoryError(candidate.monthlyDir);
+    const directoryError = importLayoutError(candidate);
     if (directoryError) throw new ImportError(400, directoryError);
     const main = path.resolve(root, candidate.mainFile);
     const relativeMain = path.relative(root, main);

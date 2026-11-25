@@ -3,7 +3,7 @@ import type { GenerateResult, ParsedTx, ReviewProblem } from "../../shared/types
 import { accountPattern, amountText, currencyPattern, formatTransactionEntry, transactionPostings, transactionReviewProblems, validDate } from "../../shared/postings.js";
 import { activeTransactions } from "../../shared/transactionMerge.js";
 import { loadWechatRules, wechatExclusionReason } from "../parsers/wechat-rules.js";
-import { importTarget, type ImportLayout } from "../../shared/import-paths.js";
+import { importFundingAccount, transactionImportTarget, type ImportLayout } from "../../shared/import-paths.js";
 
 export { transactionPostings };
 
@@ -13,12 +13,13 @@ export function generateEntries(txs: ParsedTx[], batchId?: string, layout?: Impo
   const monthFiles: Record<string, string> = {}, generated: string[] = [], errors: string[] = [];
   const reviewProblems: ReviewProblem[] = [];
   const files: NonNullable<GenerateResult["files"]> = {};
-  const append = (date: string, source: ParsedTx["source"], account: string, body: string) => {
+  const fileCounts: NonNullable<GenerateResult["fileCounts"]> = {};
+  const append = (date: string, body: string, target?: string, count = 1) => {
     const month = date.slice(0, 7).replace("-", "");
     monthFiles[month] = (monthFiles[month] ?? "") + body;
-    if (layout) {
-      const target = importTarget(layout, date, source, account);
+    if (target) {
       (files[target] ??= { year: date.slice(0, 4), body: "" }).body += body;
+      fileCounts[target] = (fileCounts[target] ?? 0) + count;
     }
   };
   const ready = activeTransactions(txs).filter((tx) => tx.status === "ready")
@@ -38,10 +39,8 @@ export function generateEntries(txs: ParsedTx[], batchId?: string, layout?: Impo
       errors.push(...new Set(problems.map(({ message }) => `${tx.sourceFile}:${tx.row} ${message}`)));
       continue;
     }
-    const account = tx.merge ? tx.fundingAccount || "merged" : postings.find((posting) => posting.account === tx.fundingAccount)?.account
-      ?? postings.find((posting) => /^(Assets|Liabilities):/.test(posting.account))?.account
-      ?? postings[0].account;
-    append(tx.date, tx.source, account, formatTransactionEntry(tx, postings, batchId) + "\n\n");
+    const target = layout && transactionImportTarget(layout, tx, { account: importFundingAccount(tx, postings), members }).file;
+    append(tx.date, formatTransactionEntry(tx, postings, batchId) + "\n\n", target);
     generated.push(tx.id);
     for (const member of members) {
       if (!member) continue;
@@ -71,13 +70,14 @@ export function generateEntries(txs: ParsedTx[], batchId?: string, layout?: Impo
     if (txs.some((other) => !other.merge && other.date === tx.date && other.fundingAccount === tx.fundingAccount && other.currency === tx.currency && other.status !== "duplicate" && !postedOnSourceDate.has(other.id))) continue;
     if (!postedOnSourceDate.has(tx.id) || !transactionPostings(tx).some((posting) => posting.account === tx.fundingAccount && posting.currency === tx.currency)) continue;
     const nextDay = new Date(Date.parse(`${tx.date}T00:00:00Z`) + 86400000).toISOString().slice(0, 10);
-    append(nextDay, tx.source, tx.fundingAccount, `${nextDay} balance ${tx.fundingAccount} ${amountText(tx.balanceAfter!)} ${tx.currency}\n\n`);
+    const target = layout && transactionImportTarget(layout, tx, { account: tx.fundingAccount, date: nextDay }).file;
+    append(nextDay, `${nextDay} balance ${tx.fundingAccount} ${amountText(tx.balanceAfter!)} ${tx.currency}\n\n`, target, 0);
   }
   const sortedMonths = Object.fromEntries(Object.entries(monthFiles).sort(([a], [b]) => a.localeCompare(b)));
   const sortedFiles = Object.fromEntries(Object.entries(files).sort(([a], [b]) => a.localeCompare(b)));
   const sections = layout ? Object.entries(sortedFiles).map(([file, { body }]) => [file, body]) : Object.entries(sortedMonths);
   return { entries: sections.map(([file, body]) => `; ===== ${file} =====\n${body}`).join("\n"),
-    monthFiles: sortedMonths, ...(layout ? { files: sortedFiles } : {}), generated, errors,
+    monthFiles: sortedMonths, ...(layout ? { files: sortedFiles, fileCounts } : {}), generated, errors,
     ...(reviewProblems.length > 0 && { reviewProblems }), opens: [] };
 }
 

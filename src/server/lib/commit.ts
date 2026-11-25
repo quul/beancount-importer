@@ -7,7 +7,7 @@ import { activeTransactions } from "../../shared/transactionMerge.js";
 import { atomicJson, profileId, type StoredBatch } from "./batches.js";
 import { discoverPython, parseLedger } from "./ledger.js";
 import { generateEntries } from "./generate.js";
-import { importDirectoryError } from "../../shared/import-paths.js";
+import { importLayoutError } from "../../shared/import-paths.js";
 import { markDuplicates } from "./dedup.js";
 import { syncStatementRefunds } from "./refunds.js";
 
@@ -176,16 +176,17 @@ export function commitBatch(batch: StoredBatch, config: AppConfig, root: string,
     if (!batch.preview || batch.preview.revision !== batch.revision) throw new ImportError(409, "请先生成当前审阅版本的预览");
 
     const python = config.pythonPath || discoverPython(root);
-    const directoryError = importDirectoryError(config.monthlyDir);
+    const directoryError = importLayoutError(config);
     if (directoryError) throw new ImportError(400, directoryError);
     const generated = generateEntries(batch.txs, batch.batchId, config);
     if (generated.errors?.length) throw new ImportError(422, "分录校验未通过", generated.errors);
     if (!generated.generated.length) throw new ImportError(422, "没有已确认的交易可写入");
     const previousFiles = batch.preview.result.files;
-    const hasNewVariables = /\{(?:month|source|account)\}/.test(config.monthlyDir) || (!config.annualLayout && config.monthlyDir.includes("{year}"));
+    const requiresFilePreview = Object.values(config.statementDirectories ?? {}).some(Boolean)
+      || /\{(?:month|source|account)\}/.test(config.monthlyDir) || (!config.annualLayout && config.monthlyDir.includes("{year}"));
     if (previousFiles
       ? JSON.stringify(generated.files) !== JSON.stringify(previousFiles)
-      : hasNewVariables || JSON.stringify(generated.monthFiles) !== JSON.stringify(batch.preview.result.monthFiles)) {
+      : requiresFilePreview || JSON.stringify(generated.monthFiles) !== JSON.stringify(batch.preview.result.monthFiles)) {
       throw new ImportError(409, "预览与当前批次不一致，请重新生成");
     }
 

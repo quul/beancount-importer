@@ -1930,6 +1930,61 @@ try {
   assert.equal(fs.existsSync(path.join(dataDir, "config.json")), false);
   assert.deepEqual(parseLedger(root, "main.bean", python).errors, []);
   passed("balanced coupon splits commit to the templated paths shown in preview; invalid splits do not");
+  {
+    const directoryRoot = path.join(temporary, "statement-directory-ledger"), directoryData = path.join(temporary, "statement-directory-data");
+    const directoryActive = path.join(temporary, "statement-directory-active.json");
+    const income = "Income:Interest", funding = "Assets:CN:BOC:1111", expense = "Expenses:Food:Meals:Dine";
+    fs.mkdirSync(directoryRoot);
+    fs.writeFileSync(path.join(directoryRoot, "main.bean"), definitions + `2025-01-01 open ${income} CNY\n`);
+    const directoryBase = await boot({ ...config, ledgerRoot: directoryRoot, monthlyDir: "{year}" }, directoryData, directoryActive);
+    const source = await upload(directoryBase, [
+      csv().split("\n")[0],
+      "2026-01-02 10:00:00,投资理财,余额宝,余额宝-2026.01.02-收益发放,不计收支,0.12,余额宝,交易成功,route-yuebao",
+      "2026-01-03 10:00:00,投资理财,其他利息,利息发放,收入,0.34,余额宝,交易成功,route-interest",
+    ].join("\n"));
+    const [yieldRow, otherInterest] = source.txs;
+    assert.deepEqual([yieldRow.eventType, yieldRow.direction], ["income", "in"]);
+    const store = new BatchStore(path.join(directoryData, "batches"));
+    const imported = store.get(source.batchId)!;
+    const more = (kind: ParsedTx["source"], id: string): ParsedTx => ({
+      ...otherInterest, id, source: kind, sourceTxId: id, sourceFile: id + ".csv", eventType: "expense", direction: "out",
+    });
+    imported.txs.push(more("bank-cmb", "route-bank"), more("wechat", "route-wechat"));
+    imported.txCount = imported.txs.length;
+    store.save(imported);
+    const route = `/api/batch/${source.batchId}`;
+    const decided = await request(directoryBase, route + "/decide", { revision: source.revision, decisions: imported.txs.map((tx) => ({
+      id: tx.id, account: tx.eventType === "income" ? income : expense, funding, status: "ready",
+    })) });
+    await request(directoryBase, "/api/config", { statementDirectories: { alipay: "../outside" } }, 400);
+    await request(directoryBase, "/api/config", { statementDirectories: { unknown: "目录" } }, 400);
+    const routes = { alipay: "平台/支付宝", bank: "银行/{source}" };
+    assert.deepEqual((await request(directoryBase, "/api/config", { statementDirectories: routes })).statementDirectories, routes);
+    const firstPreview = await request(directoryBase, route + "/generate", { revision: decided.batch.revision });
+    assert.equal(firstPreview.fileCounts["平台/支付宝/2026-01.bean"], 2);
+
+    const specificRoutes = { ...routes, "yuebao-interest": "理财/余额宝收益" };
+    await request(directoryBase, "/api/config", { statementDirectories: specificRoutes });
+    await request(directoryBase, route + "/commit", { revision: decided.batch.revision }, 409);
+    const restarted = await boot(undefined, directoryData, directoryActive);
+    assert.deepEqual((await request(restarted, "/api/config")).statementDirectories, specificRoutes);
+    const preview = await request(restarted, route + "/generate", { revision: decided.batch.revision });
+    const files = {
+      "2026/2026-01.bean": 1, "理财/余额宝收益/2026-01.bean": 1,
+      "平台/支付宝/2026-01.bean": 1, "银行/bank-cmb/2026-01.bean": 1,
+    };
+    assert.deepEqual(preview.fileCounts, files);
+    assert.deepEqual(new Set(preview.targetFiles), new Set(Object.keys(files)));
+    const committed = await request(restarted, route + "/commit", { revision: decided.batch.revision });
+    assert.deepEqual(committed.written, preview.targetFiles);
+    const yuebaoFile = fs.readFileSync(path.join(directoryRoot, "理财/余额宝收益/2026-01.bean"), "utf8");
+    const alipayFile = fs.readFileSync(path.join(directoryRoot, "平台/支付宝/2026-01.bean"), "utf8");
+    assert.match(yuebaoFile, /import-id: "route-yuebao"/);
+    assert.doesNotMatch(yuebaoFile, /import-id: "route-interest"/);
+    assert.match(alipayFile, /import-id: "route-interest"/);
+    assert.deepEqual(parseLedger(directoryRoot, "main.bean", python).errors, []);
+    passed("statement directories route Yuebao before Alipay, fall back to default, and match preview file counts");
+  }
   const otherRoot = path.join(temporary, "other-ledger"); fs.mkdirSync(otherRoot); fs.writeFileSync(path.join(otherRoot, "entry.bean"), definitions);
   const otherSettings = path.join(otherRoot, ".beancount-importer.json");
   fs.writeFileSync(otherSettings, JSON.stringify({

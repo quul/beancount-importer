@@ -36,6 +36,7 @@ export interface GeneratedPreview {
   entries: string;
   monthFiles: Record<string, string>;
   targetFiles?: string[];
+  fileCounts?: Record<string, number>;
   generated: number;
   opens: string[];
   revision: number;

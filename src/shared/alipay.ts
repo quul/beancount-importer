@@ -1,5 +1,7 @@
 import type { RawTx } from "./types.js";
 
+export const isYuebaoInterestDescription = (description: string) => /^余额宝-\d{4}\.\d{2}\.\d{2}-收益发放$/.test(description);
+
 export function alipayRefundOrderId(sourceTxId?: string): string | undefined {
   return sourceTxId?.match(/^(\d+)_\d+$/)?.[1];
 }

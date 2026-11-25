@@ -1,15 +1,16 @@
 import { useEffect, useRef, useState } from "react";
-import { importDirectoryError, importTarget } from "../../src/shared/import-paths.js";
-import type { AppConfig, ParsedAccount } from "../../src/shared/types.js";
+import { importDirectoryError, importLayoutError, importStatementKinds, importTarget } from "../../src/shared/import-paths.js";
+import type { AppConfig, ImportStatementKind, ParsedAccount } from "../../src/shared/types.js";
 import AccountSelect from "./AccountSelect";
 import { api, ApiError, type ConfigResponse, type PathField } from "./api";
 
-export const SETTINGS_LINKS = { ledger: "#/settings", funding: "#/settings/funding" } as const;
+export const SETTINGS_LINKS = { ledger: "#/settings", funding: "#/settings/funding", directories: "#/settings/statement-directories" } as const;
 export type SettingsSection = keyof typeof SETTINGS_LINKS;
 
 function formValues(config: AppConfig) {
   return {
     ledgerRoot: config.ledgerRoot, mainFile: config.mainFile, monthlyDir: config.monthlyDir,
+    statementDirectories: config.statementDirectories ?? {},
     pythonPath: config.pythonPath ?? "", annualLayout: config.annualLayout ?? true,
     archiveUploadsInLedger: config.archiveUploadsInLedger ?? true, assetMapping: config.assetMapping,
   };
@@ -25,6 +26,7 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
 }) {
   const [values, setValues] = useState(() => formValues(config));
   const previousMappings = useRef(config.assetMapping);
+  const directorySummary = useRef<HTMLElement>(null);
   const [picking, setPicking] = useState<PathField | null>(null);
   const [pickerError, setPickerError] = useState<{ field: PathField; message: string } | null>(null);
   useEffect(() => {
@@ -37,6 +39,9 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
     setValues((current) => ({ ...current, assetMapping: current.assetMapping === previous ? config.assetMapping
       : [...current.assetMapping.filter((mapping) => !mapping.exact || !keys.has(exactKey(mapping))), ...changed] }));
   }, [config.assetMapping]);
+  useEffect(() => {
+    if (section === "directories") directorySummary.current?.focus();
+  }, [section]);
 
   if (!section) return null;
 
@@ -45,6 +50,7 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
   const exampleYear = today.getFullYear(), exampleMonth = today.getMonth() + 1;
   const exampleDate = `${exampleYear}-${String(exampleMonth).padStart(2, "0")}-01`;
   const directoryError = importDirectoryError(values.monthlyDir);
+  const layoutError = importLayoutError(values);
   const examplePath = directoryError ? undefined : importTarget(values, exampleDate, "alipay", "Assets:Bank");
   async function save() {
     if (funding) {
@@ -53,13 +59,25 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
       return;
     }
     const original = formValues(config);
-    const changed = Object.entries(values).filter(([key, value]) => key !== "assetMapping" && original[key as keyof typeof original] !== value);
+    const changed = Object.entries(values).filter(([key, value]) => key !== "assetMapping"
+      && (key === "statementDirectories"
+        ? JSON.stringify(original.statementDirectories) !== JSON.stringify(value)
+        : original[key as keyof typeof original] !== value));
     const saved = await onSave(Object.fromEntries(changed));
     if (saved) setValues((current) => ({ ...formValues(saved), assetMapping: current.assetMapping }));
   }
 
   function updateMapping(index: number, patch: Partial<AppConfig["assetMapping"][number]>) {
     setValues((current) => ({ ...current, assetMapping: current.assetMapping.map((mapping, row) => row === index ? { ...mapping, ...patch } : mapping) }));
+  }
+
+  function updateDirectory(kind: ImportStatementKind, value: string) {
+    setValues((current) => {
+      const statementDirectories = { ...current.statementDirectories };
+      if (value) statementDirectories[kind] = value;
+      else delete statementDirectories[kind];
+      return { ...current, statementDirectories };
+    });
   }
 
   async function pick(field: PathField) {
@@ -90,7 +108,7 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
     <aside className="settings-sidebar">
       <h2>设置</h2>
       <nav aria-label="设置分类">
-        <a href={SETTINGS_LINKS.ledger} aria-current={section === "ledger" ? "page" : undefined}>账本设置</a>
+        <a href={SETTINGS_LINKS.ledger} aria-current={!funding ? "page" : undefined}>账本设置</a>
         <a href={SETTINGS_LINKS.funding} aria-current={funding ? "page" : undefined}>资金映射</a>
       </nav>
     </aside>
@@ -156,6 +174,28 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
                 <span><code>{"{account}"}</code> 资金账户（Assets_Bank）</span>
               </small>
             </details>
+            <details className="settings-disclosure" open={section === "directories" || undefined}>
+              <summary ref={directorySummary}>按账单种类指定目录</summary>
+              <small>余额宝收益可单独指定目录。其余分录按账单来源保存，留空则使用默认位置。</small>
+              <div className="statement-directory-rules">
+                {(Object.keys(importStatementKinds) as ImportStatementKind[]).map((kind) => {
+                  const { label, exampleSource } = importStatementKinds[kind];
+                  const template = values.statementDirectories[kind] ?? "";
+                  const error = importDirectoryError(template);
+                  const id = `statement-directory-${kind}`;
+                  const placeholder = kind === "yuebao-interest" && values.statementDirectories.alipay
+                    ? "沿用支付宝账单目录" : "使用默认目录";
+                  return <div className="statement-directory-rule" key={kind}>
+                    <label htmlFor={id}>{label}</label>
+                    <input id={id} value={template} placeholder={placeholder} aria-invalid={error ? true : undefined}
+                      aria-describedby={template ? `${id}-example` : undefined} onChange={(event) => updateDirectory(kind, event.target.value)} />
+                    {template && <output id={`${id}-example`} className={error ? "error-line" : undefined}>
+                      {error ?? <code>{importTarget(values, exampleDate, exampleSource, "Assets:Bank", template)}</code>}
+                    </output>}
+                  </div>;
+                })}
+              </div>
+            </details>
           </section>
           <details className="settings-disclosure settings-advanced">
             <summary>高级设置</summary>
@@ -173,7 +213,7 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
           </label>
           <div className="toolbar settings-actions">
             <button type="button" className="btn primary" onClick={() => void save()}
-              disabled={picking !== null || !values.ledgerRoot.trim() || !values.mainFile.trim() || Boolean(directoryError)}>保存账本设置</button>
+              disabled={picking !== null || !values.ledgerRoot.trim() || !values.mainFile.trim() || Boolean(layoutError)}>保存账本设置</button>
           </div>
         </>}
       </fieldset>
