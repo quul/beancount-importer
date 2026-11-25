@@ -33,25 +33,42 @@ export function importLayoutError(layout: ImportLayout): string | undefined {
   }
 }
 
-export function importTarget(layout: ImportLayout, date: string, source: string, account: string, template = layout.monthlyDir): string {
-  const year = date.slice(0, 4), month = date.slice(5, 7);
-  const variables = { year, month, source: source.replace(/[^a-z0-9-]/gi, "_"), account: account.replaceAll(":", "_") };
-  const directory = template.replace(/\{(year|month|source|account)\}/g, (_, key: keyof typeof variables) => variables[key]);
-  const filename = layout.annualLayout ? `${year}-${month}.bean` : `${year}${month}.beancount`;
+function monthlyFileName(layout: ImportLayout, year: string, month: string): string {
+  return layout.annualLayout ? `${year}-${month}.bean` : `${year}${month}.beancount`;
+}
+
+function joinImportPath(directory: string, filename: string): string {
   const segments = directory.split(/[/\\]/).filter((segment) => segment && segment !== ".");
   return [...segments, filename].join("/");
 }
 
-function statementDirectoryKind(layout: ImportLayout, tx: ParsedTx): ImportStatementKind | undefined {
+export function importTargetTemplate(layout: ImportLayout, template = layout.monthlyDir): string {
+  return joinImportPath(template, monthlyFileName(layout, "{year}", "{month}"));
+}
+
+export function importTarget(layout: ImportLayout, date: string, source: string, account: string, template = layout.monthlyDir): string {
+  const year = date.slice(0, 4), month = date.slice(5, 7);
+  const variables = { year, month, source: source.replace(/[^a-z0-9-]/gi, "_"), account: account.replaceAll(":", "_") };
+  const directory = template.replace(/\{(year|month|source|account)\}/g, (_, key: keyof typeof variables) => variables[key]);
+  return joinImportPath(directory, monthlyFileName(layout, year, month));
+}
+
+export function importDirectoryRule(layout: ImportLayout, kind: ImportStatementKind): { template: string; kind?: ImportStatementKind } {
   const directories = layout.statementDirectories;
-  if (!directories) return;
+  const selected = directories?.[kind];
+  if (selected) return { template: selected, kind };
+  if (kind === "yuebao-interest" && directories?.alipay) return { template: directories.alipay, kind: "alipay" };
+  return { template: layout.monthlyDir };
+}
+
+function statementDirectoryKind(tx: ParsedTx): ImportStatementKind | undefined {
   if (tx.source === "alipay") {
-    if (directories["yuebao-interest"] && tx.eventType === "income" && tx.direction === "in" && tx.rawAccount === "余额宝"
+    if (tx.eventType === "income" && tx.direction === "in" && tx.rawAccount === "余额宝"
       && isYuebaoInterestDescription(tx.note.split(" · ", 1)[0])) return "yuebao-interest";
-    return directories.alipay ? "alipay" : undefined;
+    return "alipay";
   }
-  if (tx.source === "wechat" || tx.source === "yunshanfu") return directories[tx.source] ? tx.source : undefined;
-  if (tx.source.startsWith("bank-") && directories.bank) return "bank";
+  if (tx.source === "wechat" || tx.source === "yunshanfu") return tx.source;
+  if (tx.source.startsWith("bank-")) return "bank";
 }
 
 export function importFundingAccount(tx: ParsedTx, postings = transactionPostings(tx)): string {
@@ -66,9 +83,10 @@ export function transactionImportTarget(layout: ImportLayout, tx: ParsedTx, {
 }: { account: string; date?: string; members?: readonly (ParsedTx | undefined)[] }): { file: string; kinds: ImportStatementKind[] } {
   const matches = members.flatMap((member) => {
     if (!member) return [];
-    const kind = statementDirectoryKind(layout, member);
-    const directory = kind && layout.statementDirectories?.[kind];
-    return kind && directory ? [{ kind, file: importTarget(layout, date, member.source, account, directory) }] : [];
+    const statementKind = statementDirectoryKind(member);
+    if (!statementKind) return [];
+    const { kind, template } = importDirectoryRule(layout, statementKind);
+    return kind ? [{ kind, file: importTarget(layout, date, member.source, account, template) }] : [];
   });
   const first = matches[0];
   if (first && matches.length === members.length && matches.every(({ file }) => file === first.file)) {

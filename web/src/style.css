@@ -655,7 +655,8 @@ input[aria-invalid="true"]:not(:focus) { border-color: var(--danger); }
 .settings-actions { justify-content: flex-end; padding-top: 12px; border-top: 1px solid var(--line); }
 .settings-path { display: flex; align-items: stretch; gap: 8px; margin-top: 5px; }
 .settings-path input { flex: 1; }
-.settings-destination { display: grid; gap: 6px; margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.settings-destination, .statement-directory-settings { margin: 12px 0; padding: 12px; border: 1px solid var(--line); border-radius: 8px; }
+.settings-destination { display: grid; gap: 6px; }
 .settings-destination h3, .preview-targets h3 { margin: 0; font-size: 14px; }
 .settings-destination output { display: block; overflow-wrap: anywhere; }
 .settings-destination output code { font-weight: 600; }
@@ -664,9 +665,14 @@ input[aria-invalid="true"]:not(:focus) { border-color: var(--danger); }
 .settings-disclosure > input { width: 100%; margin-top: 4px; }
 .settings-variables { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
 .settings-advanced { margin-block: 12px; }
+.statement-directory-settings > summary { font-weight: 600; }
 .statement-directory-rules { display: grid; gap: 10px; margin-top: 8px; }
 .statement-directory-rule { display: grid; gap: 4px; min-width: 0; }
-.statement-directory-rule > output { font-size: 12px; }
+.statement-directory-rule > output { font-size: 12px; overflow-wrap: anywhere; }
+.statement-recognition-rule { color: var(--muted); font-size: 12px; }
+.statement-recognition-rule > summary { width: fit-content; padding-block: 4px; cursor: pointer; }
+.statement-recognition-rule > ul { margin: 4px 0; padding-inline-start: 18px; }
+.statement-recognition-rule > p { margin: 4px 0 0; }
 .settings-switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 12px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
 .settings-switch small { margin-top: 2px; }
 .settings-switch input { appearance: none; display: flex; align-items: center; flex: none; width: 36px; height: 22px; margin: 0; padding: 3px; border-radius: 11px; background: var(--muted); cursor: inherit; }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { importDirectoryError, importLayoutError, importStatementKinds, importTarget } from "../../src/shared/import-paths.js";
+import { importDirectoryError, importDirectoryRule, importLayoutError, importStatementKinds, importTarget, importTargetTemplate } from "../../src/shared/import-paths.js";
 import type { AppConfig, ImportStatementKind, ParsedAccount } from "../../src/shared/types.js";
 import AccountSelect from "./AccountSelect";
 import { api, ApiError, type ConfigResponse, type PathField } from "./api";
@@ -174,29 +174,39 @@ export default function ConfigPanel({ section, config, accounts, busy, lockedByD
                 <span><code>{"{account}"}</code> 资金账户（Assets_Bank）</span>
               </small>
             </details>
-            <details className="settings-disclosure" open={section === "directories" || undefined}>
-              <summary ref={directorySummary}>按账单种类指定目录</summary>
-              <small>余额宝收益可单独指定目录。其余分录按账单来源保存，留空则使用默认位置。</small>
-              <div className="statement-directory-rules">
-                {(Object.keys(importStatementKinds) as ImportStatementKind[]).map((kind) => {
-                  const { label, exampleSource } = importStatementKinds[kind];
-                  const template = values.statementDirectories[kind] ?? "";
-                  const error = importDirectoryError(template);
-                  const id = `statement-directory-${kind}`;
-                  const placeholder = kind === "yuebao-interest" && values.statementDirectories.alipay
-                    ? "沿用支付宝账单目录" : "使用默认目录";
-                  return <div className="statement-directory-rule" key={kind}>
-                    <label htmlFor={id}>{label}</label>
-                    <input id={id} value={template} placeholder={placeholder} aria-invalid={error ? true : undefined}
-                      aria-describedby={template ? `${id}-example` : undefined} onChange={(event) => updateDirectory(kind, event.target.value)} />
-                    {template && <output id={`${id}-example`} className={error ? "error-line" : undefined}>
-                      {error ?? <code>{importTarget(values, exampleDate, exampleSource, "Assets:Bank", template)}</code>}
-                    </output>}
-                  </div>;
-                })}
-              </div>
-            </details>
           </section>
+          <details className="settings-disclosure statement-directory-settings" open={section === "directories" || undefined}>
+            <summary ref={directorySummary}>按账单种类指定目录</summary>
+            <div className="statement-directory-rules">
+              {(Object.keys(importStatementKinds) as ImportStatementKind[]).map((kind) => {
+                const { label, exampleSource } = importStatementKinds[kind];
+                const template = values.statementDirectories[kind] ?? "";
+                const destination = importDirectoryRule(values, kind);
+                const error = importDirectoryError(destination.template);
+                const id = `statement-directory-${kind}`;
+                const target = template ? importTarget(values, exampleDate, exampleSource, "Assets:Bank", destination.template)
+                  : importTargetTemplate(values, destination.template);
+                return <div className="statement-directory-rule" key={kind}>
+                  <label htmlFor={id}>{label}</label>
+                  <input id={id} value={template} placeholder="填写目录（可选）" aria-invalid={template && error ? true : undefined}
+                    aria-describedby={`${id}-example`} onChange={(event) => updateDirectory(kind, event.target.value)} />
+                  <output id={`${id}-example`} className={error ? "error-line" : undefined}>
+                    {!template && !error && <span className="muted">留空时写入 </span>}
+                    {error ?? <code>{target}</code>}
+                  </output>
+                  {kind === "yuebao-interest" && <details className="statement-recognition-rule">
+                    <summary>查看余额宝收益识别规则</summary>
+                    <ul>
+                      <li>来源是支付宝账单，交易被识别为收入。</li>
+                      <li>账单的收付款方式是「余额宝」。</li>
+                      <li>商品说明采用 <code>余额宝-{exampleYear}.{String(exampleMonth).padStart(2, "0")}.01-收益发放</code> 这样的格式。</li>
+                    </ul>
+                    <p>支付宝标为「不计收支」的流水，如果类别为「投资理财」、状态为「交易成功」且收益金额大于零，也会识别为收入。</p>
+                  </details>}
+                </div>;
+              })}
+            </div>
+          </details>
           <details className="settings-disclosure settings-advanced">
             <summary>高级设置</summary>
             <label className="check-label"><input type="checkbox" checked={values.annualLayout} aria-describedby="annual-layout-help"

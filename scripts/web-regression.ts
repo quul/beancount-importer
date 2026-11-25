@@ -7,7 +7,7 @@ import { calculatePostingAmount } from "../web/src/postingCalculator.js";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
 import { buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch, reviewCategoryOptions } from "../web/src/reviewRows.js";
 import { LEDGER_DUPLICATE_ISSUE } from "../src/shared/types.js";
-import { importDirectoryError, importTarget } from "../src/shared/import-paths.js";
+import { importDirectoryError, importDirectoryRule, importTarget, importTargetTemplate } from "../src/shared/import-paths.js";
 import { planCategoryAllocations, savedCategoryAllocations } from "../src/shared/categoryAllocations.js";
 import { mergeSource, planTransactionMerge } from "../src/shared/transactionMerge.js";
 import type { ParsedAccount, ParsedTx } from "../src/shared/types.js";
@@ -290,12 +290,18 @@ try {
   assert.equal(importDirectoryError(layout.monthlyDir), undefined);
   assert.equal(importTarget(layout, "2026-11-01", "alipay", "Assets:Bank"), "2026/11/alipay/Assets_Bank/2026-11.bean");
   assert.equal(importTarget({ ...layout, annualLayout: false, monthlyDir: "" }, "2026-11-01", "alipay", "Assets:Bank"), "202611.beancount");
+  assert.equal(importTargetTemplate({ ...layout, monthlyDir: "{year}/" }), "{year}/{year}-{month}.bean");
+  assert.equal(importTargetTemplate({ ...layout, annualLayout: false }, "平台/{source}"), "平台/{source}/{year}{month}.beancount");
   assert.ok(importDirectoryError("../{year}"));
   console.log("✓ settings path examples share the output naming rules and support the directory template variables");
 
   const summaryLayout = { annualLayout: true, monthlyDir: "{year}", statementDirectories: {
     "yuebao-interest": "理财/余额宝收益", alipay: "平台/支付宝", bank: "银行/{account}",
   } };
+  assert.deepEqual(importDirectoryRule(summaryLayout, "yuebao-interest"), { template: "理财/余额宝收益", kind: "yuebao-interest" });
+  assert.deepEqual(importDirectoryRule({ ...summaryLayout, statementDirectories: { alipay: "平台/支付宝" } }, "yuebao-interest"),
+    { template: "平台/支付宝", kind: "alipay" });
+  assert.deepEqual(importDirectoryRule({ monthlyDir: "{year}" }, "yuebao-interest"), { template: "{year}" });
   const yieldRow = { ...income, id: "destination-yuebao", date: "2026-11-01", source: "alipay", status: "pending",
     rawAccount: "余额宝", note: "余额宝-2026.11.01-收益发放 · 备注" } satisfies ParsedTx;
   const alipayRow = { ...yieldRow, id: "destination-alipay", note: "其他利息", status: "ready" } satisfies ParsedTx;

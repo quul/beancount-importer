@@ -310,11 +310,14 @@ export default function App() {
   const previewRepairButton = useRef<HTMLButtonElement>(null);
   const focusPreviewRepair = useRef(false);
   const deleteDialog = useRef<HTMLDialogElement>(null);
+  const deleteNoticeTimeout = useRef<number>();
   const locked = useRef(false);
   const batchListRequest = useRef<AbortController | null>(null);
   const decisionQueue = useRef(Promise.resolve());
   const batchRef = useRef<ImportPreview | null>(null);
   const batchIdRef = useRef("");
+
+  useEffect(() => () => window.clearTimeout(deleteNoticeTimeout.current), []);
 
   const navigateBatch = (id: string, { replace = false, hash = window.location.hash } = {}) => {
     const target = batchUrl(id, hash);
@@ -1185,7 +1188,10 @@ export default function App() {
     }
     if (batchIdFromUrl() === target.batchId) navigateBatch("", { replace: true });
     setBatches((previous) => previous.filter((item) => item.batchId !== target.batchId));
-    setNotice("已删除批次");
+    const message = "已删除批次";
+    setNotice(message);
+    window.clearTimeout(deleteNoticeTimeout.current);
+    deleteNoticeTimeout.current = window.setTimeout(() => setNotice((current) => current === message ? "" : current), 5000);
   });
 
   const closeBatchDialog = () => {
