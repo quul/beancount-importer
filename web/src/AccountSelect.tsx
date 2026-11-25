@@ -1,100 +1,26 @@
-import { useId, useLayoutEffect, useRef, useState, type RefObject } from "react";
+import type { RefObject } from "react";
 import type { ParsedAccount } from "../../src/shared/types.js";
 import { isFundingAccount } from "../../src/shared/funding.js";
-import useAnchoredOptions from "./useAnchoredOptions";
+import SearchSelect from "./SearchSelect";
 
 type AccountOption = Pick<ParsedAccount, "account" | "closedAt">;
 
-export default function AccountSelect({ value, accounts, onChange, disabled, funding = false, label, inputId, placeholder = "搜索账户",
-  autoHighlight = false, confirmCurrent = false, matchReason, validationMessage, optionsBottomBoundary }: {
+export default function AccountSelect({ value, accounts, funding = false, placeholder = "搜索账户", ...props }: {
   value: string; accounts: AccountOption[]; onChange: (value: string) => void;
   disabled?: boolean; funding?: boolean; label: string; inputId?: string; placeholder?: string; validationMessage?: string;
   autoHighlight?: boolean; confirmCurrent?: boolean; matchReason?: string;
   optionsBottomBoundary?: RefObject<HTMLElement>;
 }) {
-  const listId = useId();
-  const input = useRef<HTMLInputElement>(null);
-  const control = useRef<HTMLDivElement>(null);
-  const list = useRef<HTMLUListElement>(null);
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState<string | null>(null);
-  const [activeIndex, setActiveIndex] = useState(-1);
-  const allowed = (option: AccountOption) => !funding || isFundingAccount(option.account);
-  const current = value ? accounts.find((option) => option.account === value && allowed(option)) : undefined;
+  const allowed = funding ? accounts.filter(({ account }) => isFundingAccount(account)) : accounts;
+  const current = value ? allowed.find((option) => option.account === value) : undefined;
   const hint = current?.closedAt ? `关闭于 ${current.closedAt}` : value && !current ? "未在账本定义" : undefined;
-  const displayedHint = validationMessage || hint;
-  const description = [displayedHint && `${listId}-hint`, matchReason && `${listId}-match`].filter(Boolean).join(" ") || undefined;
-  const title = [hint ? `${value}（${hint}）` : value, matchReason].filter(Boolean).join("\n") || undefined;
   const nameStart = value.lastIndexOf("-") + 1;
   const hasName = nameStart > 0 && nameStart < value.length;
-  const words = query?.normalize("NFKC").toLowerCase().trim().split(/\s+/).filter(Boolean) ?? [];
-  const matches = open ? accounts.filter((option) => {
-    if (!allowed(option)) return false;
-    const name = option.account.normalize("NFKC").toLowerCase();
-    return words.every((word) => name.includes(word));
-  }) : [];
-  if (autoHighlight && current && !words.length) {
-    const index = matches.indexOf(current);
-    if (index > 0) matches.unshift(...matches.splice(index, 1));
-  }
-  const activeOption = matches[activeIndex];
-  const activeId = activeOption ? `${listId}-${activeIndex}` : undefined;
-
-  useAnchoredOptions(open, input, list, optionsBottomBoundary, validationMessage ? control : undefined);
-
-  useLayoutEffect(() => {
-    if (activeId) document.getElementById(activeId)?.scrollIntoView({ block: "nearest" });
-  }, [activeId]);
-
-  const close = () => { setOpen(false); setQuery(null); setActiveIndex(-1); };
-  const openChoices = () => {
-    if (!open && autoHighlight) setActiveIndex(0);
-    setOpen(true);
-  };
-  const select = (account: string) => {
-    close();
-    if (account !== value || confirmCurrent) onChange(account);
-  };
-
-  return <div ref={control} className={`account-select${matchReason ? " funding-unverified" : ""}`}>
-    <div className="account-select-field">
-      <input ref={input} id={inputId} role="combobox" aria-label={label} aria-autocomplete="list" aria-expanded={open}
-        className={hasName ? "has-account-name" : undefined}
-        aria-controls={open ? listId : undefined} aria-activedescendant={activeId} aria-describedby={description} aria-invalid={Boolean(validationMessage) || undefined}
-        title={title} spellCheck={false} autoComplete="off" disabled={disabled}
-        value={query ?? value} placeholder={placeholder} onFocus={(event) => { event.currentTarget.select(); openChoices(); }}
-        onClick={openChoices} onBlur={close}
-        onChange={(event) => { setQuery(event.target.value); setActiveIndex(0); setOpen(true); }}
-        onKeyDown={(event) => {
-          if (event.nativeEvent.isComposing) return;
-          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-            event.preventDefault();
-            setOpen(true);
-            setActiveIndex((index) => !open ? 0 : Math.max(0, Math.min(matches.length - 1, index + (event.key === "ArrowDown" ? 1 : -1))));
-          } else if (event.key === "Enter") {
-            event.preventDefault();
-            if (activeOption) select(activeOption.account);
-            else if (matches.length === 1) select(matches[0].account);
-            else { setOpen(true); setActiveIndex(0); }
-          } else if (event.key === "Escape" && open) {
-            event.preventDefault();
-            event.stopPropagation();
-            close();
-          }
-        }} />
-      {hasName && <span className="account-selected-value" aria-hidden="true">
-        <span className="account-path">{value.slice(0, nameStart)}</span>
-        <span className="account-name">{value.slice(nameStart)}</span>
-      </span>}
-    </div>
-    {displayedHint && <small id={`${listId}-hint`} className={validationMessage ? "review-field-error" : "account-value-hint"}>{displayedHint}</small>}
-    {matchReason && <span id={`${listId}-match`} hidden>{matchReason}</span>}
-    {open && <ul id={listId} ref={list} className="account-options" role="listbox" aria-label={label}>
-      {matches.length ? matches.map((option, index) => <li key={option.account} id={`${listId}-${index}`} role="option"
-        aria-selected={option.account === value} className={`account-option${index === activeIndex ? " active" : ""}`}
-        onMouseDown={(event) => event.preventDefault()} onClick={() => select(option.account)}>
-        <span>{option.account}</span>{option.closedAt && <small>关闭于 {option.closedAt}</small>}
-      </li>) : <li role="option" aria-disabled="true" className="account-empty">{accounts.some(allowed) ? "没有匹配的账户" : "没有可用账户"}</li>}
-    </ul>}
-  </div>;
+  return <SearchSelect {...props} value={value} placeholder={placeholder} hint={hint}
+    options={allowed.map(({ account, closedAt }) => ({ value: account, detail: closedAt ? `关闭于 ${closedAt}` : undefined }))}
+    emptyMessage={allowed.length ? "没有匹配的账户" : "没有可用账户"} inputClassName={hasName ? "has-account-name" : undefined}
+    selectedContent={hasName && <span className="account-selected-value" aria-hidden="true">
+      <span className="account-path">{value.slice(0, nameStart)}</span>
+      <span className="account-name">{value.slice(nameStart)}</span>
+    </span>} />;
 }

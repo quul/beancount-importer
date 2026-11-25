@@ -7,6 +7,7 @@ import {
 import { planSuspectedDuplicateExclusions } from "../../src/shared/duplicateExclusions.js";
 import { exclusionKind, reviewStatusPatch } from "../../src/shared/exclusions.js";
 import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement, originalForeignAmount } from "../../src/shared/settlement.js";
+import { canSetCurrencyExchange } from "../../src/shared/currency-exchange.js";
 import { savedCategoryAllocations } from "../../src/shared/categoryAllocations.js";
 import { FUNDING_SPLIT_REQUIRED, amountText, missingPostingAccount, missingPostingAccountMessage, requiresFundingSplit } from "../../src/shared/postings.js";
 import { accountIsActive, hasFundingPosting, isCombinedPayment, isFundingAccount, reusablePaymentMethod } from "../../src/shared/funding.js";
@@ -19,6 +20,7 @@ import BatchReviewDialog from "./BatchReviewDialog";
 import BeancountCode from "./BeancountCode";
 import ConfigPanel, { SETTINGS_LINKS, type SettingsSection } from "./ConfigPanel";
 import CnySettlement from "./CnySettlement";
+import CurrencyExchange from "./CurrencyExchange";
 import DateRangeFilter from "./DateRangeFilter";
 import EntryPreview from "./EntryPreview";
 import ExclusionFilters from "./ExclusionFilters";
@@ -35,6 +37,7 @@ import {
   buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, EMPTY_REVIEW_DATE_RANGE, isEditablePostingStatus, isExclusionFilter, matchesReviewDateRange,
   matchesReviewFilter, matchesReviewSearch, refundFollowsCategory, remainingReviewProblems, reviewCategoryOptions, type ReviewFilter, type ReviewRow, type ReviewTarget,
 } from "./reviewRows";
+import { clearReviewView, readReviewView, updateReviewView } from "./reviewViewUrl";
 
 const STATUS_TABS: Array<{ key: ReviewFilter; label: string }> = [
   { key: "all", label: "全部" }, { key: "pending", label: "待确认" }, { key: "ready", label: "待入账" }, { key: "duplicate", label: "重复" },
@@ -52,6 +55,7 @@ const batchIdFromUrl = () => new URLSearchParams(window.location.search).get("ba
 
 function batchUrl(id: string, hash = window.location.hash): string {
   const url = new URL(window.location.href);
+  if (url.searchParams.get("batch") !== id) clearReviewView(url.searchParams);
   if (id) url.searchParams.set("batch", id);
   else url.searchParams.delete("batch");
   url.hash = hash;
@@ -101,7 +105,8 @@ function ReviewIcon({ name }: { name: keyof typeof reviewIcons }) {
 }
 
 function pendingCategory(row: ReviewRow) {
-  const canClassify = (tx: ParsedTx) => tx.status === "pending" && !tx.postings && !tx.excludedReason && !tx.reviewConflictId && !needsCnySettlement(tx);
+  const canClassify = (tx: ParsedTx) => tx.status === "pending" && !tx.currencyExchange && !tx.postings && !tx.excludedReason
+    && !tx.reviewConflictId && !needsCnySettlement(tx);
   if (canClassify(row.tx) && !row.refund?.postings) return { id: row.tx.id, detail: false };
   const entry = row.refund && row.entries.find(canClassify);
   return entry ? { id: entry.id, detail: true } : undefined;
@@ -265,7 +270,9 @@ export default function App() {
   const [mappingTarget, setMappingTarget] = useState<ParsedTx | null>(null);
   const [batch, setBatch] = useState<ImportPreview | null>(null);
   const [batchId, setBatchId] = useState("");
-  const [routedBatchId, setRoutedBatchId] = useState(batchIdFromUrl);
+  const [locationSearch, setLocationSearch] = useState(() => window.location.search);
+  const params = useMemo(() => new URLSearchParams(locationSearch), [locationSearch]);
+  const routedBatchId = params.get("batch") ?? "";
   const reviewSessionId = useMemo(() => routedBatchId
     ? Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("")
     : "", [routedBatchId]);
@@ -277,10 +284,8 @@ export default function App() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [settings, setSettings] = useState(settingsRoute);
-  const [filter, setFilter] = useState("");
-  const [dateRange, setDateRange] = useState(EMPTY_REVIEW_DATE_RANGE);
-  const [statusFilter, setStatusFilter] = useState<ReviewFilter>("pending");
-  const [sort, setSort] = useState<"date" | "amount" | "payee">("date");
+  const defaultReviewStatus = batch?.committed || batch?.mergedInto ? "all" : "pending";
+  const { filter, dateRange, statusFilter, sort } = useMemo(() => readReviewView(params, defaultReviewStatus), [params, defaultReviewStatus]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [detailTxId, setDetailTxId] = useState<string | null>(null);
   const [detailAsDrawer, setDetailAsDrawer] = useState(() => window.matchMedia(DETAIL_DRAWER_QUERY).matches);
@@ -325,9 +330,22 @@ export default function App() {
       if (replace) window.history.replaceState(null, "", target);
       else window.history.pushState(null, "", target);
     }
-    setRoutedBatchId(id);
+    setLocationSearch(window.location.search);
     setSettings(settingsRoute());
   };
+
+  const changeReviewView = (changes: Parameters<typeof updateReviewView>[1]) => {
+    const url = new URL(window.location.href);
+    if (!batchIdRef.current || url.searchParams.get("batch") !== batchIdRef.current) return;
+    updateReviewView(url.searchParams, changes);
+    if (url.search === window.location.search) return;
+    window.history.replaceState(window.history.state, "", url);
+    setLocationSearch(url.search);
+  };
+  const setFilter = (value: string) => changeReviewView({ filter: value });
+  const setDateRange = (value: typeof dateRange) => changeReviewView({ dateRange: value });
+  const setStatusFilter = (value: ReviewFilter) => changeReviewView({ statusFilter: value });
+  const setSort = (value: typeof sort) => changeReviewView({ sort: value });
 
   const replaceBatch = (value: ImportPreview | null, id = batchIdRef.current) => {
     const previous = batchRef.current;
@@ -418,7 +436,7 @@ export default function App() {
 
   useEffect(() => {
     const navigate = () => {
-      setRoutedBatchId(batchIdFromUrl());
+      setLocationSearch(window.location.search);
       setSettings(settingsRoute());
     };
     window.addEventListener("hashchange", navigate);
@@ -529,7 +547,7 @@ export default function App() {
   const bulkEditDisabled = editingDisabled || detailDraftIds.length > 0 || !targets.length;
   const bulkTagDisabled = bulkEditDisabled || !parseTags(bulkTags).length || Boolean(bulkTagErrors.length);
   const canApplyBulkCategory = !bulkEditDisabled && !reviewIsSaving && bulkCategory?.options.some(({ account }) => account === bulkCategoryAccount);
-  const pendingHigh = active.filter((tx) => tx.status === "pending" && !tx.reviewConflictId && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 1) >= 0.9
+  const pendingHigh = active.filter((tx) => tx.status === "pending" && !tx.currencyExchange && !tx.reviewConflictId && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 1) >= 0.9
     && !tx.issues?.length && tx.suggestedAccount && !missingPostingAccount({ ...tx, finalAccount: tx.suggestedAccount }));
   const readyCount = active.filter((tx) => tx.status === "ready").length;
   const showDecisionStatus = statusFilter === "all";
@@ -634,7 +652,7 @@ export default function App() {
     const { id, field } = reviewFocus;
     const tableRow = document.getElementById(`review-row-${row.tx.id}`);
     const inRefundDetail = id !== row.tx.id || Boolean(row.refund?.postings && (field === "category" || field === "funding"));
-    const inDetail = inRefundDetail || field === "postings" || field === "tags" || field === "settlement";
+    const inDetail = inRefundDetail || field === "postings" || field === "tags" || field === "settlement" || field === "exchange";
     if (inDetail && detailTxId !== row.tx.id) {
       tableRow?.scrollIntoView({ block: "nearest" });
       setDetailTxId(row.tx.id);
@@ -647,7 +665,7 @@ export default function App() {
     let input: HTMLElement | null = null;
     if (field === "category") input = document.getElementById(categoryInputId(id, inRefundDetail));
     if (field === "funding") input = document.getElementById(fundingInputId(id, inRefundDetail));
-    if (field === "tags" || field === "postings" || field === "settlement") input = document.getElementById(`review-${field}-${id}`);
+    if (field === "tags" || field === "postings" || field === "settlement" || field === "exchange") input = document.getElementById(`review-${field}-${id}`);
     const leg = inRefundDetail || row.refund ? document.getElementById(`refund-leg-${id}`) : null;
     if (inDetail && leg) leg.querySelector("details.refund-leg-actions")?.setAttribute("open", "");
     const target = input ?? (inDetail ? leg ?? detailHeading.current : tableRow);
@@ -752,7 +770,6 @@ export default function App() {
     setReviewFocus(null);
     setUndoFlashIds(null);
     setDrafts({}); setNarrationDrafts({}); setSelected(new Set()); setDetailTxId(null);
-    setFilter(""); setDateRange(EMPTY_REVIEW_DATE_RANGE); setStatusFilter(value.committed || value.mergedInto ? "all" : "pending");
     setBulkScope("selected"); setBulkTags("");
     invalidate(); setNotice(value.mergedInto ? "已合并" : value.committed ? "已提交" : resumed && value.txs.length > 0 ? "已恢复审批进度" : "");
   };
@@ -816,7 +833,7 @@ export default function App() {
 
   const reloadBatch = () => void perform(async () => {
     await decisionQueue.current;
-    await loadReview(batchId, "reload");
+    await Promise.all([loadReview(batchId, "reload"), api.ledger().then(setLedger)]);
   });
 
   const confirmFunding = (target: FundingTarget, mappings: FundingMappingChoice[]) => void perform(async () => {
@@ -1119,8 +1136,8 @@ export default function App() {
     if (!current || current.committed || !preview || preview.revision !== current.revision) return;
     const result = await api.commit(batchIdRef.current, preview.revision);
     replaceBatch(await api.batch(batchIdRef.current));
-    setBatches(await api.batches());
     setNotice(result.alreadyCommitted ? "已提交" : `已写入 ${result.written.length} 个文件`);
+    await Promise.all([api.batches().then(setBatches), api.ledger().then(setLedger)]);
   });
 
   const clearReview = () => {
@@ -1334,6 +1351,7 @@ export default function App() {
     const includeHint = requiresFundingSplit(tx) ? FUNDING_SPLIT_REQUIRED
       : missing === "category" && tx.eventType === "transfer" ? "请选择转账对方账户" : missing ? missingPostingAccountMessage[missing] : undefined;
     const include = () => {
+      if (tx.currencyExchange && missing) { revealReviewTarget([{ id: tx.id, field: "exchange" }]); return; }
       if (missing === "postings") { revealReviewTarget([{ id: tx.id, field: missing }]); return; }
       if (missing) {
         const inputId = missing === "funding" ? fundingInputId(tx.id, !compact) : categoryInputId(tx.id, !compact);
@@ -1341,7 +1359,7 @@ export default function App() {
         return;
       }
       const decision: TxDecision = {
-        id: tx.id, status: "ready", ...(!tx.postings && !tx.fundingAccount2 && !tx.finalAccount ? { account: category } : {}),
+        id: tx.id, status: "ready", ...(!tx.currencyExchange && !tx.postings && !tx.fundingAccount2 && !tx.finalAccount ? { account: category } : {}),
       };
       savePostingDecisions([decision], { followedRefundIds: refund ? [refund.id] : [], advanceAfter: tx.id });
     };
@@ -1396,7 +1414,7 @@ export default function App() {
 
   const renderPostingEditor = (tx: ParsedTx, showValidation: boolean, leg?: string) => {
     const error = fieldProblem(tx.id, "postings");
-    if (tx.reviewConflictId || tx.duplicateOf?.refundCopy || (tx.merge && !error) || (needsCnySettlement(tx) && !tx.postings && !error)) return null;
+    if (tx.currencyExchange || tx.reviewConflictId || tx.duplicateOf?.refundCopy || (tx.merge && !error) || (needsCnySettlement(tx) && !tx.postings && !error)) return null;
     return <div className="detail-posting-editor" key={tx.id}>
       {leg && <h4>{leg}</h4>}
       <ReviewPostingFields tx={tx} accounts={accounts} draft={drafts[tx.id]?.value ?? makeDraft(tx)}
@@ -1418,6 +1436,7 @@ export default function App() {
     tagError={fieldProblem(tx.id, "tags")} onChange={(next) => changeDraft(tx, next)} />;
 
   const renderFundingReview = (tx: ParsedTx, disabled: boolean, leg?: string) => {
+    if (tx.currencyExchange) return null;
     const combined = combinedPaymentIssue(tx);
     const reason = fundingMatchReason(tx);
     if (combined) return <FundingAllocationDetails key={tx.id} tx={tx} issue={combined} readOnly={readOnly} leg={leg} />;
@@ -1482,7 +1501,7 @@ export default function App() {
   </div>;
 
   const renderHistoryMatch = (tx: ParsedTx, match: LedgerMatch, disabled: boolean, label?: string) =>
-    <HistoryMatch key={match.id} match={match} disabled={disabled} hasPostings={Boolean(tx.postings)}
+    <HistoryMatch key={match.id} match={match} disabled={disabled} hasPostings={Boolean(tx.postings || tx.currencyExchange)}
       onApply={(account) => saveReviewDecisions([{ id: tx.id, account, status: isEditablePostingStatus(tx) ? undefined : tx.status }])}
       counterpart={active.find((other) => other.id === match.id)}
       onAdopt={() => void saveDecisions([{ id: tx.id, postings: match.postings, status: "ready" }])}
@@ -1501,6 +1520,7 @@ export default function App() {
   const renderTransactionDetails = ({ tx, entries, refund, originals, amount }: ReviewRow) => {
     const fieldsDisabled = editingDisabled || entries.some(({ id }) => Boolean(drafts[id]));
     const rowDisabled = editingDisabled || entries.some((entry) => Boolean(entry.reviewConflictId || drafts[entry.id]));
+    const exchangeEditable = !readOnly && canSetCurrencyExchange(tx);
     const editableEntries = entries.filter((entry) => !entry.reviewConflictId);
     const hasEdits = editableEntries.some(({ id }) => Boolean(drafts[id]));
     const status = refund && refund.status !== tx.status ? "分别核对" : postingStatusLabel(tx, posted);
@@ -1533,6 +1553,23 @@ export default function App() {
         </div>}
       </header>
       <div className="transaction-detail-body">
+        {(tx.currencyExchange || exchangeEditable) && <CurrencyExchange
+          key={`${tx.id}:${tx.currencyExchange?.account ?? ""}:${tx.currencyExchange?.currency ?? ""}:${tx.currencyExchange?.amount ?? ""}`}
+          tx={tx} accounts={accounts} ledgerCurrencies={ledger?.currencies ?? []} editable={exchangeEditable}
+          disabled={fieldsDisabled || blockBatchChanges} problem={fieldProblem(tx.id, "exchange")}
+          onSave={(exchange) => enqueueReviewSave(async (id, current) => {
+            const result = await api.saveCurrencyExchange(id, current.revision ?? 0, tx.id, exchange, reviewSessionId);
+            return { batch: result.batch, notice: exchange ? "已保存货币兑换，待入账" : "已恢复普通交易" };
+          }, { blocking: true, onSaved: () => {
+            if (batchIdFromUrl() !== batchId) return;
+            if (exchange) {
+              setStatusFilter("ready");
+              closeDetails();
+              setReviewFocus({ id: tx.id });
+            } else if (statusFilter === "ready") {
+              setStatusFilter("pending");
+            }
+          } })} />}
         {tx.merge && needsCnySettlement(tx) && <p className="reason">先撤销合并，再确认原交易的人民币金额。</p>}
         {entries.filter(originalForeignAmount).map((entry) => <CnySettlement
           key={`${entry.id}:${entry.currency}:${entry.amount}:${entry.cnySettlement?.repayment?.key ?? ""}`}
@@ -1676,7 +1713,7 @@ export default function App() {
     const shownTags = detailRow && !detailAsDrawer ? 1 : 2;
     const remainingTags = tags.slice(shownTags);
     const directionLabel = tx.direction === "in" ? "收入" : "支出";
-    const eventLabel = EVENT_LABELS[tx.eventType ?? (tx.direction === "in" ? "income" : "expense")];
+    const eventLabel = tx.currencyExchange ? "货币兑换" : EVENT_LABELS[tx.eventType ?? (tx.direction === "in" ? "income" : "expense")];
     const sourceType = tx.recognition?.label || (tx.source === "wechat" || tx.source === "yunshanfu" ? tx.rawCategory?.trim() : "");
     let typeLabel = eventLabel;
     if (sourceType && sourceType !== eventLabel) {
@@ -1774,7 +1811,8 @@ export default function App() {
         </div>}
       </td>
       <td role="cell" className="tx-account-cell">
-        {tx.merge ? <><div className="account-caption">{tx.postings?.length ?? 0} 条分录</div>
+        {tx.currencyExchange ? <><div className="account-caption">到账 {amountText(tx.currencyExchange.amount)} {tx.currencyExchange.currency}</div>
+          <code className="merged-funding-account">{tx.currencyExchange.account}</code></> : tx.merge ? <><div className="account-caption">{tx.postings?.length ?? 0} 条分录</div>
           {tx.fundingAccount && <code className="merged-funding-account">{tx.fundingAccount}</code>}</> : awaitingCny ?
           <><div className="account-caption">资金账户</div>{tx.fundingAccount
             ? <code className="merged-funding-account">{tx.fundingAccount}</code> : <span className="muted">待选择</span>}</>

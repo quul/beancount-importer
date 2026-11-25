@@ -1,4 +1,4 @@
-import type { AppConfig, AutomaticExclusionRule, BatchRevision, CnyRepaymentChoice, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, StatementName, StatementSource, TxDecision } from "../../src/shared/types.js";
+import type { AppConfig, AutomaticExclusionRule, BatchRevision, CnyRepaymentChoice, CurrencyExchangeInput, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, StatementName, StatementSource, TxDecision } from "../../src/shared/types.js";
 
 export type ConfigResponse = AppConfig & { nativePathPicker?: boolean };
 export type PathField = "ledgerRoot" | "pythonPath";
@@ -28,6 +28,7 @@ export interface LedgerSummary {
   accountCount: number;
   txCount: number;
   accounts: ParsedAccount[];
+  currencies: string[];
   errors?: LedgerError[];
   loader?: string;
 }
@@ -79,7 +80,7 @@ async function json<T>(response: Response): Promise<T> {
     if (parsed.code === "review_incomplete" && typeof parsed.error === "string") {
       const problems = Array.isArray(parsed.reviewProblems) ? parsed.reviewProblems.filter((item): item is ReviewProblem =>
         item && typeof item.id === "string" && typeof item.message === "string"
-        && (item.field === undefined || ["funding", "category", "postings", "tags", "settlement"].includes(item.field))) : [];
+        && (item.field === undefined || ["funding", "category", "postings", "tags", "settlement", "exchange"].includes(item.field))) : [];
       throw new IncompleteReviewError(response.status, parsed.error, problems);
     }
     const describe = (detail: unknown): string => {
@@ -129,6 +130,8 @@ export const api = {
     send<CnyRepaymentChoice[]>(`/api/batch/${encodeURIComponent(id)}/cny-repayments/${encodeURIComponent(txId)}`),
   settleInCny: (id: string, revision: number, txId: string, amount: string, repaymentKey?: string) =>
     post<{ batch: ImportPreview }>(`/api/batch/${encodeURIComponent(id)}/cny-settlement`, { revision, id: txId, amount, repaymentKey }),
+  saveCurrencyExchange: (id: string, revision: number, txId: string, exchange: CurrencyExchangeInput | null, reviewSessionId?: string) =>
+    post<{ batch: ImportPreview }>(`/api/batch/${encodeURIComponent(id)}/currency-exchange`, { revision, id: txId, exchange, reviewSessionId }),
   pdfPreview: (id: string, txId: string, signal?: AbortSignal) =>
     send<PdfPreview>(`/api/batch/${encodeURIComponent(id)}/pdf-preview/${encodeURIComponent(txId)}`, { signal }),
   recheckLedger: (id: string, revision: number) => post<{ batch: ImportPreview; suspected: number }>(`/api/batch/${encodeURIComponent(id)}/recheck-ledger`, { revision }),

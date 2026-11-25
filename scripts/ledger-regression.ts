@@ -65,6 +65,22 @@ try {
     assert.equal(parseLedgerText(source, python).transactions.length, 2);
     assert.equal(validateLedgerFile(path.join(tmp, "main.bean"), python).ok, true);
   });
+  check("ledger currencies include declarations, account restrictions and amounts in included entries", () => {
+    fs.writeFileSync(path.join(tmp, "currencies.bean"), `2020-01-01 commodity USDC
+2020-01-01 open Assets:Wallet USDT
+2020-01-01 open Assets:Exchange
+2020-01-01 open Assets:Cash
+2025-01-01 price JPY 0.9 CHF
+2025-01-02 * "Purchase"
+  original-amount: 100 HKD
+  Assets:Exchange 10 BTC {2.00 EUR}
+  Assets:Cash -20.00 EUR
+`);
+    fs.writeFileSync(path.join(tmp, "currency-ledger.bean"), 'option "operating_currency" "CNY"\ninclude "currencies.bean"\n');
+    const discovered = parseLedger(tmp, "currency-ledger.bean", python);
+    assert.deepEqual(discovered.errors, []);
+    assert.deepEqual(discovered.currencies, ["BTC", "CHF", "CNY", "EUR", "HKD", "JPY", "USDC", "USDT"]);
+  });
   check("native validation rejects invalid balances, Chinese tags and inactive accounts", () => {
     assert.equal(validateLedgerText('2020-01-01 open Assets:A\n2025-01-01 * "test"\n  Assets:A = 1 CNY\n', python).ok, false);
     assert.equal(validateLedgerText('2020-01-01 open Assets:A\n2025-01-01 * "test" #中文标签\n  Assets:A 0 CNY\n', python).ok, false);

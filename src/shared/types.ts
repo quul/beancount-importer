@@ -28,6 +28,16 @@ export interface DraftPosting {
   currency: string;
 }
 
+export interface CurrencyExchange extends DraftPosting {
+  previousEventType?: EventType;
+}
+
+export interface CurrencyExchangeInput {
+  account: string;
+  currency: string;
+  quantity: string;
+}
+
 export interface OriginalAmount {
   amount: number;
   currency: string;
@@ -167,6 +177,7 @@ export interface ParsedTx extends RawTx {
   status: TxStatus;
   requireCnySettlement?: boolean;
   cnySettlement?: CnySettlement;
+  currencyExchange?: CurrencyExchange;
   /** The review action that excluded this row. Statement rules use excludedReason. */
   reviewExclusion?: ReviewExclusionKind;
   /** inferred beancount asset/liability account for the funding leg */
@@ -278,6 +289,7 @@ export interface LedgerInfo {
   errors?: LedgerError[];
   loader?: string;
   operatingCurrencies?: string[];
+  currencies?: string[];
   /** Explicit native ledger inputs for reusing a verified account list. */
   accountSources?: { file: string; sha256: string }[];
 }
@@ -372,7 +384,7 @@ export interface AppConfig {
   llm: LlmConfig;
 }
 
-export type ReviewField = "funding" | "category" | "postings" | "tags" | "settlement";
+export type ReviewField = "funding" | "category" | "postings" | "tags" | "settlement" | "exchange";
 
 export interface ReviewProblem {
   id: string;

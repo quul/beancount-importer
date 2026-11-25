@@ -10,7 +10,7 @@ const transfer = (tx: ParsedTx) => tx.eventType === "transfer" || TRANSFER_RE.te
 
 export function pairTransfers(txs: ParsedTx[]): PairResult {
   const pairs: PairResult["pairs"] = [], used = new Set<string>();
-  const candidates = txs.filter((tx) => tx.status !== "excluded" && tx.status !== "duplicate" && !tx.excludedReason && transfer(tx)
+  const candidates = txs.filter((tx) => tx.status !== "excluded" && tx.status !== "duplicate" && !tx.excludedReason && !tx.currencyExchange && transfer(tx)
     && /^(Assets|Liabilities):/.test(tx.fundingAccount) && !/FixMe|Unknown/.test(tx.fundingAccount));
   for (const from of candidates.filter((tx) => tx.direction === "out")) {
     if (used.has(from.id)) continue;
@@ -79,4 +79,13 @@ export function clearTransferSuggestion(tx: ParsedTx): void {
   tx.matches = tx.matches?.filter((match) => !match.reason.startsWith("转账配对建议"));
   tx.issues = tx.issues?.filter((issue) => !transferPairIssue(issue));
   delete tx.fundingAccount2;
+}
+
+export function clearTransferPairMatches(txs: readonly ParsedTx[], id: string): void {
+  for (const tx of txs) {
+    const matches = tx.matches?.filter((match) => match.reason !== "转账配对建议" || (tx.id !== id && match.id !== id));
+    if (!matches || matches.length === tx.matches?.length) continue;
+    tx.matches = matches;
+    if (!matches.some((match) => match.reason === "转账配对建议")) tx.issues = tx.issues?.filter((issue) => !transferPairIssue(issue));
+  }
 }

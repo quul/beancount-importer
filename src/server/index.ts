@@ -11,9 +11,11 @@ import { duplicateReviewIssue, isFamilyCard, MAX_NARRATION_LENGTH } from "../sha
 import { planSuspectedDuplicateExclusions } from "../shared/duplicateExclusions.js";
 import { reviewStatusPatch } from "../shared/exclusions.js";
 import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement, originalForeignAmount, readCnySettlementAmount } from "../shared/settlement.js";
+import { canSetCurrencyExchange, readExchangeQuantity } from "../shared/currency-exchange.js";
 import { MAX_CATEGORY_ALLOCATIONS, planCategoryAllocations, savedCategoryAllocations } from "../shared/categoryAllocations.js";
 import { activeTransactions, mergeSource, planTransactionMerge } from "../shared/transactionMerge.js";
-import { FUNDING_SPLIT_REQUIRED, missingPostingAccount, missingPostingAccountMessage, requiresFundingSplit, statusAfterCategorization, validDate } from "../shared/postings.js";
+import { FUNDING_SPLIT_REQUIRED, isExchangeAssetAccount, isExchangeCurrency, isExchangeFundingAccount, missingPostingAccount,
+  missingPostingAccountMessage, requiresFundingSplit, statusAfterCategorization, validDate } from "../shared/postings.js";
 import { hasFundingPosting, isFundingAccount, isStatementOnlyPayment, reusablePaymentMethod } from "../shared/funding.js";
 import { configWithDefaults, defaultActiveLedgerFile, loadConfig, readLedgerSettings, saveConfig } from "./config.js";
 import { discoverPython, LedgerAccessError, parseLedger, parseLedgerAsync, validateLedgerFile } from "./lib/ledger.js";
@@ -32,7 +34,7 @@ import { loadWechatRules, recognizeWechatTransaction, wechatExclusionReason } fr
 import { parseYunshanfu, isYunshanfu } from "./parsers/yunshanfu.js";
 import { detectBank, parseBank } from "./parsers/banks.js";
 import { parsePdfBank, PDF_RETRY_HINT } from "./parsers/pdf.js";
-import { pairTransfers, transferPairIssue } from "./lib/transfers.js";
+import { clearTransferPairMatches, pairTransfers, transferPairIssue } from "./lib/transfers.js";
 import { isParsedStatementRow, parseFundingParts, readSheet, UNREADABLE_TRANSACTION } from "./parsers/common.js";
 import { BatchStore, isBatchId, profileId, type StoredBatch, type StoredPdfUpload } from "./lib/batches.js";
 import { applyStatementNames, combineBatchReviews, resolveBatchReviewConflict, statementsForBatches } from "./lib/batch-review-merge.js";
@@ -95,9 +97,12 @@ function draftProblems(txs: ParsedTx[], ledger: LedgerInfo, opening: Set<string>
       problems.push({ id: tx.id, field, message });
     };
     for (const [index, { account, currency }] of transactionPostings(tx).entries()) {
-      const field = tx.postings ? "postings" : index === 0 ? "funding" : "category";
+      const accountField = tx.postings ? "postings" : index === 0 ? "funding" : "category";
+      const field = tx.currencyExchange ? "exchange" : accountField;
       const defined = accounts.get(account);
-      if (!defined && !opening.has(account)) add(account ? `账户 ${account} 未在账本开户` : missingPostingAccountMessage[field], field);
+      if (!defined && (!opening.has(account) || (tx.currencyExchange && index === 0))) {
+        add(account ? `账户 ${account} 未在账本开户` : missingPostingAccountMessage[accountField], field);
+      }
       else if (defined && ((defined.openedAt && tx.date < defined.openedAt) || (defined.closedAt && tx.date > defined.closedAt))) add(`账户 ${account} 在交易日未生效`, field);
       else if (defined?.currencies?.length && !defined.currencies.includes(currency)) add(`账户 ${account} 不支持币种 ${currency}`, field);
     }
@@ -494,6 +499,10 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
         };
         delete tx.fundingAccount2;
         delete tx.postings;
+        if (tx.currencyExchange) {
+          tx.eventType = tx.currencyExchange.previousEventType;
+          delete tx.currencyExchange;
+        }
         delete tx.reviewNote;
         delete tx.narration;
         delete tx.refundReviewMode;
@@ -649,6 +658,55 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   app.get("/api/batch/:id", (req, res) => {
     res.json(publicReviewBatch(getBatch(req.params.id)));
   });
+  app.post("/api/batch/:id/currency-exchange", withBatchWrite((req, res, batch) => {
+    if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
+    requireRevision(batch, req.body?.revision);
+    const sessionId = readReviewSessionId(req.body?.reviewSessionId);
+    const active = activeTransactions(batch.txs);
+    const tx = active.find((row) => row.id === req.body?.id);
+    if (!tx || !canSetCurrencyExchange(tx) || !validDate(tx.date)) throw new ImportError(422, "这笔交易无法设为货币兑换");
+    const exchange = req.body?.exchange;
+    const previousStatuses = exchange === null ? undefined : reviewStatuses(active);
+    const currentLedger = ledger();
+    if (exchange === null) {
+      if (!tx.currencyExchange) throw new ImportError(422, "这笔交易尚未设置货币兑换");
+      tx.eventType = tx.currencyExchange.previousEventType;
+      delete tx.currencyExchange;
+    } else {
+      const account = typeof exchange?.account === "string" ? exchange.account.trim() : "";
+      const currency = typeof exchange?.currency === "string" ? exchange.currency.trim().normalize("NFKC").toUpperCase() : "";
+      const amount = readExchangeQuantity(exchange?.quantity);
+      if (account.length > 256 || !isExchangeAssetAccount(account) || account === tx.fundingAccount) {
+        throw new ImportError(400, "请输入不同于付款账户的有效资产账户");
+      }
+      if (!isExchangeCurrency(currency)) throw new ImportError(400, "请输入有效的到账币种，例如 USDC");
+      if (amount === undefined) throw new ImportError(400, "请输入大于 0 的到账数量，最多八位小数");
+      const payment = currentLedger.accounts.find((entry) => entry.account === tx.fundingAccount);
+      if (!payment || !isExchangeFundingAccount(payment.account) || !accountIsActive(payment, tx.date, "CNY")) {
+        throw new ImportError(422, "请先选择在交易日可用的人民币资金账户");
+      }
+      const receipt = currentLedger.accounts.find((entry) => entry.account === account);
+      if (receipt && !accountIsActive(receipt, tx.date, currency)) {
+        throw new ImportError(422, "到账账户在交易日期尚未生效或不支持到账币种");
+      }
+      const previous = tx.currencyExchange;
+      if (tx.status === "ready" && previous && previous.account === account && previous.currency === currency && previous.amount === amount) {
+        res.json({ batch: publicReviewBatch(batch) });
+        return;
+      }
+      const previousEventType = previous ? previous.previousEventType : tx.eventType;
+      tx.currencyExchange = { account, currency, amount, previousEventType };
+      tx.eventType = "transfer";
+      Object.assign(tx, reviewStatusPatch(tx, "ready"));
+      clearTransferPairMatches(active, tx.id);
+    }
+    if (exchange === null && tx.status !== "excluded") Object.assign(tx, reviewStatusPatch(tx, "pending"));
+    refreshLedgerDuplicateHints([tx], currentLedger.transactions);
+    syncStatementRefunds(active, currentLedger.transactions);
+    if (previousStatuses) rememberReviewStatusChange(batch, active, previousStatuses, "approve", sessionId);
+    saveBatchRevision(batch);
+    res.json({ batch: publicReviewBatch(batch) });
+  }));
   const settlementRow = (batch: StoredBatch, id: unknown) => {
     if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
     const tx = activeTransactions(batch.txs).find((row) => row.id === id);
@@ -1012,6 +1070,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const tx = txs.find(({ id }) => id === req.body?.id);
     if (!tx) throw new ImportError(404, "交易不存在");
     if (tx.reviewConflictId) throw new ImportError(422, "请先核对这笔交易的审批冲突");
+    if (tx.currencyExchange) throw new ImportError(422, "请先恢复为普通交易，再修改付款账户");
     const payment = reusablePaymentMethod(tx);
     if (!payment) throw new ImportError(422, "账单缺少可保存的单一付款方式");
     if (!hasFundingPosting(tx)) throw new ImportError(422, "请先在拆分分录中核对资金账户");
@@ -1025,7 +1084,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
 
     const key = normalizePaymentMethod(payment);
     const affected = txs.filter((other) => other === tx || (other.source === tx.source
-      && !other.reviewConflictId
+      && !other.reviewConflictId && !other.currencyExchange
       && (other.fundingConfidence ?? 1) < 1 && !other.postings && !other.fundingAccount2 && !other.excludedReason
       && (other.status === "pending" || other.status === "ready") && accountIsActive(account, other.date, other.currency)
       && normalizePaymentMethod(reusablePaymentMethod(other)) === key));
@@ -1058,6 +1117,10 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       if (!tx) throw new ImportError(400, "交易不存在");
       if (tx.reviewConflictId) throw new ImportError(422, "请先核对这笔交易的审批冲突");
       const { categoryAllocations, ...changes } = input;
+      if (tx.currencyExchange && (categoryAllocations !== undefined || changes.account !== undefined
+        || changes.funding !== undefined || changes.postings !== undefined)) {
+        throw new ImportError(422, "请在交易详情中修改货币兑换");
+      }
       if (tx.merge && (categoryAllocations !== undefined || changes.account !== undefined || changes.funding !== undefined || changes.postings !== undefined)) {
         throw new ImportError(422, "要调整分录，请先撤销合并并编辑原交易");
       }
@@ -1211,13 +1274,13 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     res.json(result);
   }));
   app.get("/api/ledger", asyncRoute(async (_req, res) => {
-    if (!config.ledgerRoot) { res.json({ accountCount: 0, txCount: 0, accounts: [] }); return; }
+    if (!config.ledgerRoot) { res.json({ accountCount: 0, txCount: 0, accounts: [], currencies: [] }); return; }
     const root = ledgerRoot();
     const { mainFile, pythonPath } = config;
     const key = catalogKey(root, mainFile, pythonPath);
     const current = await parseLedgerAsync(root, mainFile, pythonPath, true);
     rememberAccountNames(key, current);
-    res.json({ accountCount: current.accounts.length, txCount: current.transactions.length, accounts: current.accounts,
+    res.json({ accountCount: current.accounts.length, txCount: current.transactions.length, accounts: current.accounts, currencies: current.currencies ?? [],
       errors: current.errors ?? [], loader: current.loader, ledgerRoot: root, mainFile });
   }));
   app.get("/api/validate", (_req, res) => {

@@ -6,6 +6,7 @@ import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, valida
 import { calculatePostingAmount } from "../web/src/postingCalculator.js";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
 import { buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch, reviewCategoryOptions } from "../web/src/reviewRows.js";
+import { clearReviewView, readReviewView, updateReviewView } from "../web/src/reviewViewUrl.js";
 import { LEDGER_DUPLICATE_ISSUE } from "../src/shared/types.js";
 import { importDirectoryError, importDirectoryRule, importTarget, importTargetTemplate } from "../src/shared/import-paths.js";
 import { planCategoryAllocations, savedCategoryAllocations } from "../src/shared/categoryAllocations.js";
@@ -45,6 +46,21 @@ try {
   assert.equal(requests.at(-1)?.init?.method, "DELETE");
   assert.deepEqual(JSON.parse(String(requests.at(-1)?.init?.body)), { revision: 9 });
   console.log("✓ config is parsed; review saves, undo and commit use their expected request fields");
+
+  const view = new URL("https://fixture.test/?batch=batch-one&keep=1#ledger");
+  const filters = { statusFilter: "excluded:manual", filter: "兑换 USDT + #凭证&",
+    dateRange: { start: "2026-10-01", end: "2026-10-31" }, sort: "amount" } as const;
+  updateReviewView(view.searchParams, filters);
+  assert.deepEqual(readReviewView(new URL(view.href).searchParams, "pending"), filters);
+  updateReviewView(view.searchParams, { statusFilter: "ready" });
+  assert.deepEqual(readReviewView(view.searchParams, "pending"), { ...filters, statusFilter: "ready" });
+  updateReviewView(view.searchParams, { filter: "", dateRange: { start: "", end: "" }, sort: "date" });
+  assert.equal(view.search, "?batch=batch-one&keep=1&status=ready");
+  clearReviewView(view.searchParams);
+  assert.equal(view.href, "https://fixture.test/?batch=batch-one&keep=1#ledger");
+  assert.deepEqual(readReviewView(new URLSearchParams("status=bogus&from=2026-02-31&to=2026-03-01&sort=bogus"), "all"),
+    { statusFilter: "all", filter: "", dateRange: { start: "", end: "2026-03-01" }, sort: "date" });
+  console.log("✓ review search, filters and sorting round-trip through the batch URL");
 
   assert.deepEqual(parseTags("#trip trip,checked，!bad"), ["trip", "checked", "!bad"]);
   assert.deepEqual(invalidTags("trip2026 checked.one refund/a other_tag ok-tag"), []);
@@ -353,5 +369,5 @@ try {
   await assert.rejects(() => api.upload([]), (error: unknown) => error instanceof ApiError && error.temporary
     && error.message === "服务连接中断，请重试");
   console.log("✓ empty responses, proxy pages and network exceptions get friendly retry messages");
-  console.log("Web contract regression passed (16 groups).");
+  console.log("Web contract regression passed (17 groups).");
 } finally { globalThis.fetch = originalFetch; }

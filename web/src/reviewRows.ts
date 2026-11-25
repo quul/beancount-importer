@@ -79,7 +79,7 @@ export function reviewCategoryOptions(tx: ParsedTx, accounts: ParsedAccount[]): 
 export function buildBulkCategoryPlan(rows: readonly ReviewRow[], accounts: ParsedAccount[], selected?: ReadonlySet<string>) {
   const scoped = selected ? rows.filter(({ entries }) => entries.some(({ id }) => selected.has(id))) : rows;
   const eligible = scoped.filter(({ tx, refund }) => (!selected || selected.has(tx.id))
-    && isEditablePostingStatus(tx) && !tx.excludedReason && !tx.merge && !tx.postings && !refund?.postings);
+    && isEditablePostingStatus(tx) && !tx.excludedReason && !tx.merge && !tx.currencyExchange && !tx.postings && !refund?.postings);
   const options = eligible.length ? accounts.filter((option) => eligible.every(({ tx, refund }) =>
     option.account !== tx.fundingAccount && accountIsActive(option, tx.date, tx.currency)
     && (!refund || !canFollowPurchaseRefund(refund) || accountIsActive(option, refund.date, refund.currency)))) : [];
@@ -92,11 +92,11 @@ function planApproval(tx: ParsedTx, accounts: ReadonlySet<string>): { decision: 
   const postings = transactionPostings(reviewed);
   const problems = transactionReviewProblems(reviewed, postings);
   if (problems.length) return { target: { id: tx.id, field: problems.find(({ field }) => field)?.field } };
-  const missing = postings.findIndex(({ account }) => !accounts.has(account));
+  const missing = postings.findIndex(({ account }, index) => !(tx.currencyExchange && index === 1) && !accounts.has(account));
   if (missing !== -1) {
-    return { target: { id: tx.id, field: tx.postings ? "postings" : missing === 0 ? "funding" : "category" } };
+    return { target: { id: tx.id, field: tx.currencyExchange ? "exchange" : tx.postings ? "postings" : missing === 0 ? "funding" : "category" } };
   }
-  const decision: TxDecision = !tx.postings && !tx.fundingAccount2 && finalAccount !== tx.finalAccount
+  const decision: TxDecision = !tx.currencyExchange && !tx.postings && !tx.fundingAccount2 && finalAccount !== tx.finalAccount
     ? { id: tx.id, account: finalAccount, status: "ready" }
     : { id: tx.id, status: "ready" };
   return { decision };
@@ -151,6 +151,8 @@ export function remainingReviewProblems(problems: ReviewProblem[], before: Parse
       && Boolean(original.postings) === Boolean(updated.postings);
     if (field === "postings") return original.fundingAccount2 === updated.fundingAccount2 && JSON.stringify(original.postings) === JSON.stringify(updated.postings);
     if (field === "tags") return JSON.stringify(original.tags) === JSON.stringify(updated.tags);
+    if (field === "exchange") return original.fundingAccount === updated.fundingAccount
+      && JSON.stringify(original.currencyExchange) === JSON.stringify(updated.currencyExchange);
     return original.date === updated.date && original.amount === updated.amount && original.currency === updated.currency && original.flag === updated.flag;
   });
 }
@@ -176,6 +178,7 @@ export function matchesReviewSearch(row: ReviewRow, query: string): boolean {
     return [tx.payee, tx.note, tx.narration, tx.rawAccount, tx.recognition?.label, tx.recognition?.fundingMethod,
     tx.finalAccount, tx.fundingAccount, tx.reviewNote, tx.sourceStatus, tx.excludedReason, tx.sourceTxId, tx.amount.toFixed(2), ...(tx.tags ?? []),
     original && `${original.amount} ${original.currency}`,
+    tx.currencyExchange?.account, tx.currencyExchange && `${tx.currencyExchange.amount} ${tx.currencyExchange.currency}`,
     ...(tx.postings?.map(({ account }) => account) ?? [])]
       .join(" ").toLowerCase().includes(query);
   });

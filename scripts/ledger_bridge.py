@@ -81,6 +81,34 @@ def account_sources(filename, options, load_started):
     return sources
 
 
+def ledger_currencies(entries, options, data):
+    from beancount.core.amount import Amount
+
+    currencies = set(options.get("operating_currency", []))
+
+    def include_amounts(amounts):
+        currencies.update(amount.currency for amount in amounts if isinstance(amount, Amount) and isinstance(amount.currency, str))
+
+    for entry in entries:
+        include_amounts((entry.meta or {}).values())
+        if isinstance(entry, data.Open):
+            currencies.update(entry.currencies or [])
+        elif isinstance(entry, data.Commodity):
+            currencies.add(entry.currency)
+        elif isinstance(entry, data.Price):
+            currencies.add(entry.currency)
+            include_amounts([entry.amount])
+        elif isinstance(entry, data.Balance):
+            include_amounts([entry.amount])
+        elif isinstance(entry, data.Transaction):
+            for posting in entry.postings:
+                include_amounts([posting.units, posting.price])
+                include_amounts((posting.meta or {}).values())
+                if posting.cost and isinstance(posting.cost.currency, str):
+                    currencies.add(posting.cost.currency)
+    return sorted(currencies)
+
+
 def run(request):
     try:
         from beancount import loader
@@ -109,6 +137,7 @@ def run(request):
     if request["operation"] == "validate":
         return result
     result["operatingCurrencies"] = options.get("operating_currency", [])
+    result["currencies"] = ledger_currencies(entries, options, data)
     if "file" in request and request.get("trackAccountSources") and not errors:
         sources = account_sources(filename, options, load_started)
         if sources:

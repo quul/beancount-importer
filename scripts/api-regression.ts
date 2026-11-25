@@ -139,6 +139,7 @@ async function fixturePdf(pages: PdfRow[][]): Promise<Uint8Array> {
 try {
   let base = await boot(config, dataDir);
   const info = await request(base, "/api/ledger"); assert.equal(info.accountCount, 4); assert.deepEqual(info.errors, []);
+  assert.deepEqual(info.currencies, ["CNY"]);
   let batch = await upload(base, csv());
   assert.equal(batch.txs.length, 2); assert.equal(batch.parseStats?.excluded, 1); assert.ok(batch.txs.every((tx) => tx.sourceFileHash?.length === 64));
   assert.equal(batch.txs[0].fundingAccount, "Assets:CN:BOC:1111"); passed("multipart upload retains source rows, exclusion reasons and funding identity");
@@ -837,6 +838,91 @@ try {
     });
     assert.equal(finished.batch.txs[0].currency, "CNY");
     passed("CNY review blocks unknown foreign amounts, keeps original units, and supports audited repayment allocations");
+  }
+  {
+    const exchangeRoot = path.join(temporary, "exchange-ledger");
+    const exchangeData = path.join(temporary, "exchange-data");
+    const payer = "Assets:CN:BOC:1111";
+    const receipt = "Assets:Crypto:USDC";
+    const meal = "Expenses:Food:Meals:Dine";
+    fs.mkdirSync(exchangeRoot);
+    fs.writeFileSync(path.join(exchangeRoot, "main.bean"), definitions);
+    const exchangeBase = await boot({ ...config, ledgerRoot: exchangeRoot, requireCnySettlement: true }, exchangeData);
+    const statement = await upload(exchangeBase, [
+      csv().split("\n")[0],
+      "2026-01-02 10:00:00,餐饮美食,兑换平台,购买,支出,1080.00,中国银行储蓄卡(1111),交易成功,exchange-usdc",
+    ].join("\n"));
+    const [payment] = statement.txs;
+    assert.equal(payment.fundingAccount, payer);
+    assert.equal(payment.amount, 1080);
+    const store = new BatchStore(path.join(exchangeData, "batches"));
+    const foreign: ParsedTx = { ...payment, id: "exchange-ordinary-usd", sourceTxId: "exchange-ordinary-usd",
+      date: "2026-01-03", payee: "境外餐厅", eventType: "expense", status: "pending", amount: 7.5, currency: "USD",
+      requireCnySettlement: true, originalAmount: { amount: 7.5, currency: "USD" }, finalAccount: meal };
+    const stored = store.get(statement.batchId)!;
+    stored.txs[0].finalAccount = "";
+    stored.txs[0].suggestedAccount = "";
+    stored.txs.push(foreign,
+      { ...payment, id: "exchange-automatic", sourceTxId: "exchange-automatic", status: "excluded", excludedReason: "交易未完成" },
+      { ...payment, id: "exchange-deduplicated", sourceTxId: "exchange-deduplicated", status: "excluded", reviewExclusion: "deduplicate" });
+    store.save(stored);
+    const route = `/api/batch/${statement.batchId}`;
+    const decide = (revision: number, id: string, decision: object, expected = 200) =>
+      request(exchangeBase, route + "/decide", { revision, decisions: [{ id, ...decision }] }, expected);
+    const exchange = { account: receipt, currency: "usdc", quantity: "150", amount: 1 };
+    const setExchange = (revision: number, value: object | null, expected = 200, id = payment.id) =>
+      request(exchangeBase, route + "/currency-exchange", { revision, id, exchange: value, reviewSessionId }, expected);
+    const excluded = await decide(statement.revision, payment.id, { status: "excluded" });
+    assert.equal(excluded.batch.txs[0].reviewExclusion, "manual");
+    await setExchange(excluded.revision, { ...exchange, quantity: "0" }, 400);
+    await setExchange(excluded.revision, exchange, 422, "exchange-automatic");
+    await setExchange(excluded.revision, exchange, 422, "exchange-deduplicated");
+    assert.equal((await request(exchangeBase, route)).txs[0].status, "excluded");
+    const fromExcluded = (await setExchange(excluded.revision, exchange)).batch;
+    assert.deepEqual([fromExcluded.txs[0].status, fromExcluded.txs[0].reviewExclusion, fromExcluded.txs[0].finalAccount],
+      ["ready", undefined, ""]);
+    assert.equal(fromExcluded.reviewUndo.action, "approve");
+    const undone = await request(exchangeBase, route + "/undo-review-status", { revision: fromExcluded.revision, reviewSessionId });
+    assert.deepEqual([undone.batch.txs[0].status, undone.batch.txs[0].reviewExclusion], ["excluded", "manual"]);
+    const resumedExchange = (await setExchange(undone.batch.revision, exchange)).batch;
+    assert.deepEqual([resumedExchange.txs[0].status, resumedExchange.txs[0].reviewExclusion], ["ready", undefined]);
+    const original = (await setExchange(resumedExchange.revision, null)).batch;
+    const classified = await decide(original.revision, payment.id, { account: meal, status: "ready" });
+    await setExchange(classified.revision, exchange, 422, foreign.id);
+    await setExchange(classified.revision, { ...exchange, currency: "CNY" }, 400);
+    await setExchange(classified.revision, { ...exchange, account: payer }, 400);
+    await setExchange(classified.revision, { ...exchange, account: "Assets:CN:BOC:2222" }, 422);
+    await setExchange(classified.revision, { ...exchange, quantity: "0.000000001" }, 400);
+    const saved = (await setExchange(classified.revision, exchange)).batch;
+    assert.deepEqual(saved.txs[0].currencyExchange, { account: receipt, currency: "USDC", amount: 150, previousEventType: "expense" });
+    assert.deepEqual([saved.txs[0].eventType, saved.txs[0].status, saved.txs[0].amount], ["transfer", "ready", 1080]);
+    await setExchange(classified.revision, null, 409);
+    assert.equal((await setExchange(saved.revision, exchange)).batch.revision, saved.revision);
+    await decide(saved.revision, payment.id, { account: meal }, 422);
+    const restored = (await setExchange(saved.revision, null)).batch;
+    assert.equal(restored.txs[0].currencyExchange, undefined);
+    assert.deepEqual([restored.txs[0].eventType, restored.txs[0].finalAccount, restored.txs[0].status], ["expense", meal, "pending"]);
+    const converted = (await setExchange(restored.revision, exchange)).batch;
+    assert.equal(converted.txs[0].status, "ready");
+    const pending = await decide(converted.revision, payment.id, { status: "pending" });
+    const approved = (await setExchange(pending.revision, exchange)).batch;
+    assert.equal(approved.txs[0].status, "ready");
+    await decide(approved.revision, foreign.id, { status: "ready" }, 422);
+    const settled = await request(exchangeBase, route + "/cny-settlement", { revision: approved.revision, id: foreign.id, amount: "54.00" });
+    await setExchange(settled.batch.revision, exchange, 422, foreign.id);
+    const ready = await decide(settled.batch.revision, foreign.id, { status: "ready" });
+    const preview = await request(exchangeBase, route + "/generate", { revision: ready.revision });
+    assert.equal(preview.generated, 2);
+    assert.match(preview.entries, /150\.00 USDC \{\{1080\.00 CNY\}\}/);
+    assert.match(preview.entries, /original-amount: 7\.50 USD/);
+    await request(exchangeBase, route + "/commit", { revision: preview.revision });
+    const imported = parseLedger(exchangeRoot, "main.bean", python);
+    assert.deepEqual(imported.errors, []);
+    assert.deepEqual(imported.transactions.map(({ postings }) => postings), [
+      [{ account: payer, amount: -1080, currency: "CNY" }, { account: receipt, amount: 150, currency: "USDC" }],
+      [{ account: payer, amount: -54, currency: "CNY" }, { account: meal, amount: 54, currency: "CNY" }],
+    ]);
+    passed("saving a currency exchange marks it ready, supports undo and preserves foreign purchase settlement");
   }
   {
     const mergeRoot = path.join(temporary, "merge-ledger");
@@ -2009,7 +2095,7 @@ try {
   const activeLedgerFile = path.join(temporary, "user-data", "active-ledger.json");
   const firstStart = await boot({ ...config, ledgerRoot: "" }, dataDir, activeLedgerFile);
   assert.deepEqual(await request(firstStart, "/api/batches"), []);
-  assert.deepEqual(await request(firstStart, "/api/ledger"), { accountCount: 0, txCount: 0, accounts: [] });
+  assert.deepEqual(await request(firstStart, "/api/ledger"), { accountCount: 0, txCount: 0, accounts: [], currencies: [] });
   const missingLedger = await request(firstStart, "/api/validate", undefined, 400);
   assert.match(missingLedger.error, /先在账本设置/);
   const selected = await request(firstStart, "/api/config", { ledgerRoot: otherRoot });

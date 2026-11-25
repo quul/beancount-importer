@@ -34,6 +34,7 @@ export function planTransactionMerge(members: readonly ParsedTx[], accounts: Rea
   const incomeFundingTotals = new Map<string, bigint>();
   if (members.length < 2) errors.push("请选择至少两笔原交易");
   if (members.some((tx) => tx.merge)) errors.push("先撤销所选交易的现有合并，再选择原交易");
+  if (members.some((tx) => tx.currencyExchange)) errors.push("货币兑换须单独入账");
   if (members.some((tx) => tx.refundCounterpartId)) errors.push("已配对的消费和退款按各自的日期记账");
   const keys = members.map((tx) => sourceKey(tx.source, tx.sourceTxId, tx.sourceFileHash, tx.row)).filter(Boolean);
   if (new Set(keys).size !== keys.length || members.some((tx) => tx.status === "duplicate" || isSuspectedDuplicate(tx)
