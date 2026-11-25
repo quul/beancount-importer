@@ -11,6 +11,28 @@ const requiredColumns = {
   amount: ["金额", "金额（元）", "金额(元)"],
 };
 
+interface TimedRow { tx: RawTx; timestamp: number }
+const walletTransferWindowMs = 30_000;
+
+function excludePairedWalletTransfers(transfers: TimedRow[], receiptsByAmount: Map<number, TimedRow[]>) {
+  const candidates = new Map<RawTx, TimedRow[]>();
+  const transferCounts = new Map<RawTx, number>();
+  for (const { tx, timestamp } of transfers) {
+    const receipts = (receiptsByAmount.get(tx.amount) ?? []).filter((receipt) =>
+      receipt.timestamp < timestamp && timestamp - receipt.timestamp <= walletTransferWindowMs);
+    candidates.set(tx, receipts);
+    for (const receipt of receipts) {
+      transferCounts.set(receipt.tx, (transferCounts.get(receipt.tx) ?? 0) + 1);
+    }
+  }
+  for (const [tx, receipts] of candidates) {
+    if (receipts.length !== 1 || transferCounts.get(receipts[0].tx) !== 1) continue;
+    tx.eventType = "transfer";
+    tx.excludedReason = "支付宝余额转入余额宝";
+    tx.issues = tx.issues?.filter((issue) => issue !== "收支待确认");
+  }
+}
+
 function findAlipayHeader(rows: string[][]): number {
   return rows.findIndex((row) => Object.values(requiredColumns).every((names) => col(row, names) >= 0));
 }
@@ -29,6 +51,8 @@ export function parseAlipay(file: string): ParseResult {
   const headerIdx = findAlipayHeader(rows);
   const errors: ParseResult["errors"] = [];
   const txs: RawTx[] = [];
+  const walletTransfers: TimedRow[] = [];
+  const receiptsByAmount = new Map<number, TimedRow[]>();
   if (headerIdx < 0) return { source: "alipay", txs, errors: [{ row: 0, message: "未找到支付宝交易明细表头" }] };
   const header = rows[headerIdx].map((h) => h.trim());
   const indexes = {
@@ -47,7 +71,8 @@ export function parseAlipay(file: string): ParseResult {
     const parsed = parseDate(rawDate);
     const amount = parseAmount(cell("amount"));
     const sourceStatus = cell("status"), originalDirection = cell("direction"), category = cell("category"), rawAccount = cell("method"), payee = cell("payee");
-    const note = [...new Set([cell("note"), cell("remark")].filter(Boolean))].join(" · ");
+    const description = cell("note");
+    const note = [...new Set([description, cell("remark")].filter(Boolean))].join(" · ");
     const issues: string[] = [];
     let excludedReason: string | undefined;
     if (/关闭|失败|取消/.test(sourceStatus)) excludedReason = `交易未完成：${sourceStatus}`;
@@ -57,12 +82,17 @@ export function parseAlipay(file: string): ParseResult {
     else if (amount === 0) excludedReason ??= "零金额";
     const refund = category === "退款" || (originalDirection.includes("收入") && /退款/.test(note))
       || (sourceStatus === "退款成功" && Boolean(alipayRefundOrderId(sourceTxId)));
-    const transfer = /信用借还|账户存取/.test(category) || /还款|提现|转入余额|余额转出/.test(`${category} ${note}`);
+    const yuEBaoInterest = !excludedReason && amount !== null && amount > 0 && category === "投资理财"
+      && rawAccount === "余额宝" && sourceStatus === "交易成功" && originalDirection === "不计收支"
+      && /^余额宝-\d{4}\.\d{2}\.\d{2}-收益发放$/.test(description);
+    const income = yuEBaoInterest || originalDirection.includes("收入");
+    const transfer = !yuEBaoInterest && (/信用借还|账户存取/.test(category) || /还款|提现|转入余额|余额转出/.test(`${category} ${note}`));
     // 亲情卡/亲友代付: someone else's card paid for this purchase. The funding
     // description (e.g. 浙商银行信用卡(5103)) belongs to THEM, never to my mapping.
-    const familyCard = /亲情卡|亲属卡/.test(note) || /亲友代付|亲情代付/.test(category);
-    let eventType: EventType = refund ? "refund" : transfer ? "transfer" : familyCard ? "familyCard" : originalDirection.includes("收入") ? "income" : originalDirection.includes("支出") ? "expense" : "unknown";
-    let direction: "in" | "out" = refund || originalDirection.includes("收入") ? "in" : "out";
+    const familyCard = !yuEBaoInterest && (/亲情卡|亲属卡/.test(note) || /亲友代付|亲情代付/.test(category));
+    let eventType: EventType = refund ? "refund" : transfer ? "transfer" : familyCard ? "familyCard"
+      : income ? "income" : originalDirection.includes("支出") ? "expense" : "unknown";
+    let direction: "in" | "out" = refund || income ? "in" : "out";
     if (!refund && /退款成功/.test(sourceStatus)) { eventType = "expense"; issues.push("已退款，核对退款流水"); }
     else if (transfer) { direction = /转入|存入|充值/.test(note) && !/还款/.test(note) ? "in" : "out"; issues.push("转账"); }
     else if (eventType === "unknown") issues.push("收支待确认");
@@ -77,6 +107,17 @@ export function parseAlipay(file: string): ParseResult {
     const evidence = statementRefundEvidence(tx);
     if (evidence) tx.refundEvidence = evidence;
     txs.push(tx);
+    if (excludedReason || !parsed?.time || !/\d{1,2}:\d{2}:\d{2}\b/.test(rawDate)
+      || amount === null || amount <= 0 || rawAccount !== "账户余额" || sourceStatus !== "交易成功") continue;
+    const timestamp = Date.parse(`${date}T${parsed.time}Z`);
+    if (category === "投资理财" && originalDirection === "不计收支" && payee === "余额宝" && description === "转账收款到余额宝") {
+      walletTransfers.push({ tx, timestamp });
+    } else if (category === "转账红包" && originalDirection === "收入" && eventType === "income" && direction === "in") {
+      const receipts = receiptsByAmount.get(amount) ?? [];
+      receipts.push({ tx, timestamp });
+      receiptsByAmount.set(amount, receipts);
+    }
   }
+  excludePairedWalletTransfers(walletTransfers, receiptsByAmount);
   return { source: "alipay", txs, errors };
 }

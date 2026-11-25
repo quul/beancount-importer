@@ -55,6 +55,62 @@ try {
     fs.writeFileSync(aliFile, ["导出说明", alipayHeader, ...[...aliRows].reverse()].join("\n"));
     for (const item of parseAlipay(aliFile).txs) assert.equal(item.id, ids.get(item.sourceTxId));
   });
+  check("Alipay excludes only uniquely paired balance transfers to Yu'ebao", () => {
+    const file = path.join(tmp, "alipay-wallet-transfers.csv");
+    const receipt = (time: string, amount: number, id: string, method = "账户余额", status = "交易成功") =>
+      `${time},转账红包,测试付款人,收款,收入,${amount},${method},${status},${id}`;
+    const transfer = (time: string, amount: number, id: string, description = "转账收款到余额宝") =>
+      `${time},投资理财,余额宝,${description},不计收支,${amount},账户余额,交易成功,${id}`;
+    fs.writeFileSync(file, [alipayHeader + ",备注",
+      transfer("2026-01-02 00:00:20", 10, "paired") + ",测试备注",
+      receipt("2026-01-01 23:59:50", 10, "kept"),
+      transfer("2026-01-02 12:00:10", 20, "ambiguous"),
+      receipt("2026-01-02 12:00:06", 20, "receipt-one"),
+      receipt("2026-01-02 12:00:07", 20, "receipt-two"),
+      transfer("2026-01-02 12:00:11", 30, "shared-one"),
+      transfer("2026-01-02 12:00:12", 30, "shared-two"),
+      receipt("2026-01-02 12:00:09", 30, "shared-receipt"),
+      transfer("2026-01-02 12:00:31", 40, "too-late"),
+      receipt("2026-01-02 12:00:00", 40, "old-receipt"),
+      transfer("2026-01-02 12:00:10", 50, "bank-receipt"),
+      receipt("2026-01-02 12:00:09", 50, "bank", "银行卡"),
+      transfer("2026-01-02 12:00:10", 60, "failed-receipt"),
+      receipt("2026-01-02 12:00:09", 60, "failed", "账户余额", "交易失败"),
+      transfer("2026-01-02 12:00:10", 70, "remark-only", "普通说明") + ",转账收款到余额宝",
+      receipt("2026-01-02 12:00:09", 70, "ordinary-receipt"),
+      transfer("2026-01-02 12:00", 80, "missing-seconds"),
+      receipt("2026-01-02 11:59:59", 80, "before-minute"),
+      "2026-01-02 12:00:10,投资理财,测试基金,余额宝-2026.01.01-收益发放,不计收支,1,余额宝,交易成功,interest",
+    ].join("\n"));
+    const { txs, errors } = parseAlipay(file);
+    assert.deepEqual(errors, []);
+    assert.equal(txs.length, 19);
+    assert.deepEqual(txs.filter((tx) => tx.excludedReason).map(({ sourceTxId, excludedReason }) => [sourceTxId, excludedReason]), [
+      ["paired", "支付宝余额转入余额宝"], ["failed", "交易未完成：交易失败"],
+    ]);
+    assert.equal(txs[0].eventType, "transfer");
+    assert.deepEqual([txs[1].direction, txs[1].eventType], ["in", "income"]);
+    assert.ok(txs[2].issues?.includes("收支待确认"));
+  });
+  check("Alipay posts successful Yu'ebao distributions as income when the export labels them neutral", () => {
+    const file = path.join(tmp, "alipay-yuebao-interest.csv");
+    fs.writeFileSync(file, [alipayHeader + ",备注",
+      "2026-01-02 12:00:00,投资理财,测试基金,余额宝-2026.01.01-收益发放,不计收支,0.06,余额宝,交易成功,interest,测试备注",
+      "2026-01-02 12:00:01,投资理财,测试基金,余额宝-2026.01.01-收益发放,不计收支,0.06,余额宝,交易失败,failed",
+      "2026-01-02 12:00:02,投资理财,测试基金,其他理财业务,不计收支,0.06,余额宝,交易成功,other,余额宝-2026.01.01-收益发放",
+      "2026-01-02 12:00:03,餐饮美食,测试商户,午餐,支出,12,余额宝,交易成功,purchase",
+    ].join("\n"));
+    const { txs, errors } = parseAlipay(file);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(txs.map(({ direction, eventType, excludedReason }) => [direction, eventType, excludedReason]), [
+      ["in", "income", undefined],
+      ["out", "unknown", "交易未完成：交易失败"],
+      ["out", "unknown", undefined],
+      ["out", "expense", undefined],
+    ]);
+    assert.equal(txs[0].originalDirection, "不计收支");
+    assert.deepEqual(txs[0].issues, []);
+  });
   check("legacy Alipay GBK headers parse transaction columns and skip the report summary", () => {
     const file = path.join(tmp, "renamed-statement.csv");
     const text = [
