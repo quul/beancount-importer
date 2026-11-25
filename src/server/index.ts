@@ -10,7 +10,8 @@ import type { AppConfig, AutomaticExclusionRule, BatchRevision, FundingMappingCh
 import { duplicateReviewIssue, isFamilyCard, MAX_NARRATION_LENGTH } from "../shared/types.js";
 import { planSuspectedDuplicateExclusions } from "../shared/duplicateExclusions.js";
 import { reviewStatusPatch } from "../shared/exclusions.js";
-import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement, originalForeignAmount, readCnySettlementAmount } from "../shared/settlement.js";
+import { mayHaveSplitCharges } from "../shared/split-charges.js";
+import { CNY_SETTLEMENT_REQUIRED, needsCnySettlement, originalForeignAmount, readPositiveCnyAmount } from "../shared/settlement.js";
 import { canSetCurrencyExchange, readExchangeQuantity } from "../shared/currency-exchange.js";
 import { MAX_CATEGORY_ALLOCATIONS, planCategoryAllocations, savedCategoryAllocations } from "../shared/categoryAllocations.js";
 import { activeTransactions, mergeSource, planTransactionMerge } from "../shared/transactionMerge.js";
@@ -18,7 +19,7 @@ import { FUNDING_SPLIT_REQUIRED, isExchangeAssetAccount, isExchangeCurrency, isE
   missingPostingAccountMessage, requiresFundingSplit, statusAfterCategorization, validDate } from "../shared/postings.js";
 import { hasFundingPosting, isFundingAccount, isStatementOnlyPayment, reusablePaymentMethod } from "../shared/funding.js";
 import { configWithDefaults, defaultActiveLedgerFile, loadConfig, readLedgerSettings, saveConfig } from "./config.js";
-import { discoverPython, LedgerAccessError, parseLedger, parseLedgerAsync, validateLedgerFile } from "./lib/ledger.js";
+import { discoverPython, LedgerAccessError, parseLedger, parseLedgerAsync, readLedgerBalanceSnapshot, validateLedgerFile } from "./lib/ledger.js";
 import { markDuplicates, refreshLedgerDuplicateHints, sourceKey } from "./lib/dedup.js";
 import { matchStatementRefunds, restoreFullRefundPurchases, syncStatementRefunds } from "./lib/refunds.js";
 import { availableReviewUndo, rememberReviewStatusChange, reviewStatuses } from "./lib/review-undo.js";
@@ -44,6 +45,8 @@ import { isLocalRequest } from "./lib/local-request.js";
 import { createPdfPreviewLoader } from "./lib/pdf-preview.js";
 import { archiveStatement, ledgerUploadsDirectory } from "./lib/statement-uploads.js";
 import { applyCnyReview, cnyRepayments } from "./lib/cny-settlement.js";
+import { readManualBatch } from "./lib/manual-batch.js";
+import { findSplitChargeReview } from "./lib/split-charges.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const TAG_RE = /^[A-Za-z0-9][A-Za-z0-9_./-]*$/;
@@ -373,7 +376,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     }) : batch.txs;
     const undo = availableReviewUndo(batch, active);
     return { ...batch, file: batchFileLabel(batch), txs, errors: publicParseErrors(batch.errors),
-      preview: undefined, pdfUploads: undefined, ledgerProfile: undefined, reviewStatusHistory: undefined, parseStats: stats(batch),
+      preview: undefined, pdfUploads: undefined, ledgerProfile: undefined, manualInputHash: undefined,
+      reviewStatusHistory: undefined, parseStats: stats(batch),
       reviewUndo: undo ? { sessionId: undo.history.sessionId, depth: undo.depth, action: undo.operation.action, count: undo.operation.entries.length } : undefined };
   };
   const publicReviewBatch = (batch: StoredBatch) => {
@@ -474,6 +478,40 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     res.json(rules);
   });
   app.get("/api/batches", (_req, res) => res.json(listBatches()));
+  app.post("/api/batches/manual", (req, res) => {
+    const id = req.body?.batchId;
+    if (typeof id !== "string" || !isBatchId(id)) throw new ImportError(400, "手录批次 ID 无效");
+    const ledgerProfile = profile();
+    if (req.body.ledgerProfile !== ledgerProfile) throw new ImportError(409, "账本已切换，请回到主页重新加载账本后再录入");
+    const release = lockBatch(id);
+    try {
+      const manualInputHash = crypto.createHash("sha256").update(JSON.stringify([req.body.fundingAccount, req.body.rows])).digest("hex");
+      const previous = batches.get(id);
+      if (previous) {
+        if (previous.ledgerProfile !== ledgerProfile || previous.manualInputHash !== manualInputHash) {
+          throw new ImportError(409, "这次录入与已保存的批次冲突");
+        }
+        res.json({ batch: publicReviewBatch(previous), summary: summarizeBatch(previous) });
+        return;
+      }
+      const currentLedger = ledger();
+      const { file, txs } = readManualBatch(id, req.body.fundingAccount, req.body.rows, currentLedger, config.requireCnySettlement);
+      const memory = loadMemory(memoryLocation());
+      for (const tx of txs) {
+        if (config.requireCnySettlement) applyCnyReview(tx);
+        const suggestion = classifyLocal(tx, memory, currentLedger);
+        if (suggestion) {
+          tx.suggestedAccount = tx.finalAccount = suggestion.account;
+          tx.confidence = suggestion.confidence;
+          tx.reason = suggestion.reason;
+        }
+      }
+      const dedup = markDuplicates(txs, currentLedger.transactions).stats;
+      const batch = batches.create({ file, source: "manual", txCount: txs.length, txs, errors: [],
+        accountsDetected: detectAccounts(txs), ledgerProfile, ledgerErrors: currentLedger.errors ?? [], dedup, manualInputHash }, id);
+      res.status(201).json({ batch: publicReviewBatch(batch), summary: summarizeBatch(batch) });
+    } finally { release(); }
+  });
   app.post("/api/batches/merge-options", (req, res) => {
     const selected = mergeInputs(mergeSelection(req.body?.batches));
     res.json({ batches: selected.map(summarizeBatch), sources: statementsForBatches(selected) });
@@ -658,6 +696,60 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   app.get("/api/batch/:id", (req, res) => {
     res.json(publicReviewBatch(getBatch(req.params.id)));
   });
+  app.get("/api/batch/:id/split-charges", asyncRoute(async (req, res) => {
+    const batch = getBatch(req.params.id);
+    const readOnly = batch.committed || batch.mergedInto || batch.combinedFundingPending;
+    const current = !readOnly && mayHaveSplitCharges(activeTransactions(batch.txs), { requireRefund: true })
+      ? await parseLedgerAsync(ledgerRoot(), config.mainFile, config.pythonPath) : undefined;
+    const latest = getBatch(batch.batchId);
+    const review = findSplitChargeReview(latest.txs, current?.transactions ?? [], latest.splitChargeMatches);
+    if (latest.committed || latest.mergedInto || latest.combinedFundingPending) {
+      review.candidates = [];
+      review.confirmed.forEach((match) => { match.canExcludeOffsets = false; });
+      review.limited = false;
+    }
+    res.set("Cache-Control", "no-store").json(review);
+  }));
+  app.post("/api/batch/:id/split-charges", withBatchWrite((req, res, batch) => {
+    if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
+    requireRevision(batch, req.body?.revision);
+    const { id, action } = req.body ?? {};
+    if (typeof id !== "string" || !/^[a-f0-9]{24}$/.test(id) || !["confirm", "exclude", "clear"].includes(action)) {
+      throw new ImportError(400, "拆单匹配选项无效");
+    }
+    const saved = batch.splitChargeMatches ?? [];
+    if (action === "clear") {
+      if (!saved.some((match) => match.id === id)) throw new ImportError(409, "这组匹配已变更");
+      batch.splitChargeMatches = saved.filter((match) => match.id !== id);
+    } else if (action === "confirm") {
+      const active = activeTransactions(batch.txs);
+      const posted = mayHaveSplitCharges(active, { requireRefund: true }) ? ledger().transactions : [];
+      const review = findSplitChargeReview(active, posted, saved);
+      const candidate = review.candidates.find((match) => match.id === id);
+      if (!candidate) throw new ImportError(409, "这组匹配已变更，请重新核对相关流水");
+      const { overlaps: _overlaps, ...match } = candidate;
+      batch.splitChargeMatches = [...saved, match];
+    } else {
+      const sessionId = readReviewSessionId(req.body?.reviewSessionId);
+      const release = acquireWriteLock(path.join(dataDir, "locks", batch.ledgerProfile + ".json"), "另一个批次正在写入该账本，请稍后重试");
+      try {
+        const active = activeTransactions(batch.txs);
+        const match = findSplitChargeReview(active, ledger().transactions, saved).confirmed.find((item) => item.id === id);
+        if (!match?.refund || !match.canExcludeOffsets) throw new ImportError(409, "请选择已确认且尚未入账的原扣款与等额退款");
+        const before = reviewStatuses(active);
+        for (const tx of active) {
+          if (tx.id === match.original.id || tx.id === match.refund.id) Object.assign(tx, reviewStatusPatch(tx, "excluded"));
+        }
+        syncStatementRefunds(active);
+        rememberReviewStatusChange(batch, active, before, "exclude", sessionId);
+        saveBatchRevision(batch);
+        res.json({ batch: publicReviewBatch(batch) });
+      } finally { release(); }
+      return;
+    }
+    saveBatchRevision(batch);
+    res.json({ batch: publicReviewBatch(batch) });
+  }));
   app.post("/api/batch/:id/currency-exchange", withBatchWrite((req, res, batch) => {
     if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");
     requireRevision(batch, req.body?.revision);
@@ -727,7 +819,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   app.post("/api/batch/:id/cny-settlement", withBatchWrite((req, res, batch) => {
     requireRevision(batch, req.body?.revision);
     const tx = settlementRow(batch, req.body?.id);
-    const amount = readCnySettlementAmount(req.body?.amount);
+    const amount = readPositiveCnyAmount(req.body?.amount);
     if (amount === undefined) throw new ImportError(400, "请输入大于 0 的人民币金额，最多两位小数");
     if (tx.postings && tx.currency === "CNY") throw new ImportError(422, "请先恢复为两条分录，再修改人民币金额");
     const repaymentKey: unknown = req.body?.repaymentKey;
@@ -1281,7 +1373,25 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     const current = await parseLedgerAsync(root, mainFile, pythonPath, true);
     rememberAccountNames(key, current);
     res.json({ accountCount: current.accounts.length, txCount: current.transactions.length, accounts: current.accounts, currencies: current.currencies ?? [],
-      errors: current.errors ?? [], loader: current.loader, ledgerRoot: root, mainFile });
+      errors: current.errors ?? [], loader: current.loader, ledgerRoot: root, mainFile, ledgerProfile: profileId(root, mainFile) });
+  }));
+  app.get("/api/ledger/balances", asyncRoute(async (req, res) => {
+    const date = req.query.date;
+    if (typeof date !== "string" || date.startsWith("0000") || !validDate(date)) throw new ImportError(400, "余额日期无效");
+    const root = ledgerRoot();
+    const { mainFile, pythonPath } = config;
+    const ledgerProfile = profileId(root, mainFile);
+    const assertProfile = () => {
+      if (req.query.ledgerProfile !== ledgerProfile || profile() !== ledgerProfile) {
+        throw new ImportError(409, "当前账本已切换，请重新打开手动录入");
+      }
+    };
+    assertProfile();
+    const { balances, recentExpenses } = await readLedgerBalanceSnapshot(root, mainFile, date, pythonPath);
+    assertProfile();
+    const onlyFunding = <T>(values: Record<string, T>) =>
+      Object.fromEntries(Object.entries(values).filter(([account]) => isFundingAccount(account)));
+    res.set("Cache-Control", "no-store").json({ balances: onlyFunding(balances), recentExpenses: onlyFunding(recentExpenses) });
   }));
   app.get("/api/validate", (_req, res) => {
     const result = validateLedgerFile(path.resolve(ledgerRoot(), config.mainFile), config.pythonPath);

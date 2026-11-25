@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFile, spawnSync } from "node:child_process";
-import type { LedgerError, LedgerInfo } from "../../shared/types.js";
+import type { LedgerBalanceSnapshot, LedgerError, LedgerInfo } from "../../shared/types.js";
 
 const BRIDGE = path.resolve(import.meta.dirname, "../../../scripts/ledger_bridge.py");
 const READ_LEDGER_HINT = "无法读取账本。请在「账本设置」中检查主文件和 Python 路径。";
@@ -18,8 +18,9 @@ export interface LedgerValidation {
   errors: LedgerError[];
 }
 
-type BridgeResult = LedgerInfo & LedgerValidation & { fatal?: string };
-type BridgeRequest = { operation: "inspect" | "validate"; file?: string; text?: string; trackAccountSources?: boolean };
+type BridgeResult = LedgerInfo & LedgerValidation & { balanceSnapshot?: LedgerBalanceSnapshot; fatal?: string };
+type BridgeRequest = { operation: "inspect" | "validate"; file?: string; text?: string; trackAccountSources?: boolean }
+  | { operation: "balances"; file: string; balanceDate: string };
 const bridgeOptions = () => ({
   encoding: "utf-8" as const,
   env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1", PYTHONIOENCODING: "utf-8" },
@@ -75,9 +76,7 @@ export function parseLedger(rootDir: string, mainFile: string, pythonPath?: stri
 }
 
 /** Interactive reads wait for Python without blocking other HTTP requests. */
-export async function parseLedgerAsync(rootDir: string, mainFile: string, pythonPath?: string, trackAccountSources = false): Promise<LedgerInfo> {
-  const file = ledgerFile(rootDir, mainFile);
-  const python = pythonPath || discoverPython(rootDir);
+function bridgeAsync(request: BridgeRequest, python: string): Promise<BridgeResult> {
   return new Promise((resolve, reject) => {
     const child = execFile(python, ["-B", BRIDGE], bridgeOptions(), (error, stdout, stderr) => {
       const status = error?.code;
@@ -86,15 +85,26 @@ export async function parseLedgerAsync(rootDir: string, mainFile: string, python
         return;
       }
       try {
-        resolve(ledgerInfo(bridgeOutput(python, stdout, stderr, typeof status === "number" ? status : 0)));
+        resolve(bridgeOutput(python, stdout, stderr, typeof status === "number" ? status : 0));
       } catch (failure) {
         reject(failure);
       }
     });
     // execFile reports subprocess failures, including an early exit while stdin is being written.
     child.stdin?.on("error", () => {});
-    child.stdin?.end(JSON.stringify({ operation: "inspect", file, trackAccountSources }));
+    child.stdin?.end(JSON.stringify(request));
   });
+}
+
+export async function parseLedgerAsync(rootDir: string, mainFile: string, pythonPath?: string, trackAccountSources = false): Promise<LedgerInfo> {
+  const result = await bridgeAsync({ operation: "inspect", file: ledgerFile(rootDir, mainFile), trackAccountSources }, pythonPath || discoverPython(rootDir));
+  return ledgerInfo(result);
+}
+
+export async function readLedgerBalanceSnapshot(rootDir: string, mainFile: string, balanceDate: string, pythonPath?: string): Promise<LedgerBalanceSnapshot> {
+  const result = await bridgeAsync({ operation: "balances", file: ledgerFile(rootDir, mainFile), balanceDate }, pythonPath || discoverPython(rootDir));
+  if (!result.balanceSnapshot) throw new LedgerAccessError("Beancount 桥接未返回账户余额", READ_LEDGER_HINT);
+  return result.balanceSnapshot;
 }
 
 /** Text parsing is native as well; no regex fallback silently drops directives. */

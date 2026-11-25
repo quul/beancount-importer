@@ -25,7 +25,7 @@ const OTHER_PAYEE_REASON = "日期、金额相同，商户不同";
 const ROUNDING_REASON = "账本资金金额自动补全时发生舍入";
 function addIssue(tx: ParsedTx, issue: string) { tx.issues = [...new Set([...(tx.issues ?? []), issue])]; tx.status = "pending"; }
 
-function ledgerSourceKeys(tx: LedgerTx): string[] {
+export function ledgerSourceKeys(tx: LedgerTx): string[] {
   const key = sourceKey(tx.source ?? tx.metadata?.["import-source"], tx.sourceTxId ?? tx.metadata?.["import-id"], tx.metadata?.["source-file-hash"], tx.metadata?.["source-row"]);
   const keys = key ? [key] : [];
   const members = tx.metadata?.["import-members"];

@@ -9,6 +9,7 @@ export type SourceType =
   | "wechat"
   | "yunshanfu"
   | `bank-${string}`
+  | "manual"
   | "merged"
   | "unknown";
 
@@ -99,7 +100,7 @@ export interface RefundEvidence {
   restoreWhenFullyRefunded?: boolean;
 }
 
-/** One normalized transaction parsed from a statement file. */
+/** One normalized source transaction. */
 export interface RawTx {
   /** stable hash for dedup: date|amount|direction|payee-normalized */
   id: string;
@@ -125,6 +126,8 @@ export interface RawTx {
   balanceIsDayEnd?: boolean;
   /** unique id inside the source system (Alipay 交易号, bank 流水号) */
   sourceTxId?: string;
+  /** Merchant order reference, when the statement supplies it separately. */
+  orderId?: string;
   source: SourceType;
   sourceFile: string;
   /** Hash of original uploaded bytes; enables safe replay checks for files without transaction IDs. */
@@ -282,6 +285,14 @@ export interface LedgerError {
   type?: string;
 }
 
+/** Posted units, indexed by the exact account and currency. */
+export type LedgerBalances = Record<string, Record<string, string>>;
+
+export interface LedgerBalanceSnapshot {
+  balances: LedgerBalances;
+  recentExpenses: Record<string, { date: string; amounts: { currency: string; amount: string }[] }[]>;
+}
+
 export interface LedgerInfo {
   accounts: ParsedAccount[];
   transactions: LedgerTx[];
@@ -338,12 +349,43 @@ export interface ImportPreview {
   mergedInto?: string;
   statementSources?: StatementSource[];
   reviewConflicts?: BatchReviewConflict[];
+  splitChargeMatches?: SplitChargeMatch[];
   reviewUndo?: ReviewStatusUndo;
   committedAt?: string;
   written?: string[];
   parseStats?: { total: number; excluded: number; pending: number; duplicate: number; ready: number };
   ledgerErrors?: LedgerError[];
   dedup?: { crossSourceDuplicates: number; ledgerDuplicates: number; transferPairs?: number; familyCardPairs?: number };
+}
+
+export interface SplitChargeLine {
+  id: string;
+  date: string;
+  time?: string;
+  amount: number;
+  payee: string;
+  sourceTxId?: string;
+  orderId?: string;
+  file?: string;
+  line?: number;
+  posted?: boolean;
+}
+
+export interface SplitChargeMatch {
+  id: string;
+  fundingAccount: string;
+  currency: string;
+  original: SplitChargeLine;
+  refund?: SplitChargeLine;
+  parts: SplitChargeLine[];
+  refundEvidence?: "reference" | "order" | "amount";
+  splitEvidence: "order" | "merchant" | "amount";
+}
+
+export interface SplitChargeReview {
+  candidates: Array<SplitChargeMatch & { overlaps: boolean }>;
+  confirmed: Array<SplitChargeMatch & { canExcludeOffsets: boolean; offsetsExcluded: boolean }>;
+  limited: boolean;
 }
 
 export interface LlmConfig {

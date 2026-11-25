@@ -6,7 +6,7 @@ const TRANSFER_PAIR_ISSUE = "疑似转账配对";
 export const transferPairIssue = (issue: string) => issue === TRANSFER_PAIR_ISSUE || issue.startsWith("这可能是同一笔转账的两条流水");
 export interface PairResult { pairs: Array<{ from: ParsedTx; to: ParsedTx }>; absorbed: Set<string>; familyCardPairs: number }
 const dateDiff = (a: string, b: string) => Math.abs(Date.parse(a) - Date.parse(b)) / 86400000;
-const transfer = (tx: ParsedTx) => tx.eventType === "transfer" || TRANSFER_RE.test(`${tx.payee} ${tx.note} ${tx.rawCategory}`);
+const transfer = (tx: ParsedTx) => tx.eventType === "transfer" || (tx.source !== "manual" && TRANSFER_RE.test(`${tx.payee} ${tx.note} ${tx.rawCategory}`));
 
 export function pairTransfers(txs: ParsedTx[]): PairResult {
   const pairs: PairResult["pairs"] = [], used = new Set<string>();

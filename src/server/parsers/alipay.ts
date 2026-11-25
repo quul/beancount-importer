@@ -60,6 +60,7 @@ export function parseAlipay(file: string): ParseResult {
     amount: col(header, requiredColumns.amount), status: col(header, ["交易状态"]), method: col(header, ["收/付款方式"]),
     category: col(header, ["交易分类", "类型"]), tag: col(header, ["标签"]), note: col(header, ["商品说明", "商品名称"]),
     remark: col(header, ["备注"]), id: col(header, ["交易订单号", "交易号", "订单号"]),
+    order: col(header, ["商家订单号", "商户订单号"]),
   };
   for (let r = headerIdx + 1; r < rows.length; r++) {
     const row = rows[r];
@@ -102,7 +103,7 @@ export function parseAlipay(file: string): ParseResult {
     const date = parsed?.date ?? "";
     const tx: RawTx = { id: txId(date, Math.abs(amount ?? 0), direction, payee, `${parsed?.time ?? ""}|${note}|${rawAccount}`, "alipay", sourceTxId),
       date, time: parsed?.time, amount: Math.abs(amount ?? 0), direction, currency: "CNY", payee, note,
-      rawCategory: cell("tag") || category, rawAccount, sourceTxId, source: "alipay", sourceFile: file, row: r + 1,
+      rawCategory: cell("tag") || category, rawAccount, sourceTxId, orderId: cell("order") || undefined, source: "alipay", sourceFile: file, row: r + 1,
       eventType, sourceStatus, originalDirection, excludedReason, issues, fundingParts: split.fundingParts };
     const evidence = statementRefundEvidence(tx);
     if (evidence) tx.refundEvidence = evidence;

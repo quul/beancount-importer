@@ -78,7 +78,7 @@ function norm(s: string) { return s.replace(/\s+/g, "").toLowerCase(); }
 export function classificationMemoryKey(payee: string, category: string) { return `${payee.replace(/\s+/g, "").slice(0, 32)}|${category.slice(0, 24)}`; }
 function isRefund(tx: ParsedTx) { return tx.eventType === "refund" || (tx.direction === "in" && /退款|退货|退回/.test(`${tx.rawCategory} ${tx.note}`)); }
 function isTransfer(tx: ParsedTx) {
-  return tx.eventType === "transfer" || (!isRefund(tx) && /还款|转账|转出|转入|提现|充值|取现|存现/.test(`${tx.payee} ${tx.note} ${tx.rawCategory}`));
+  return tx.eventType === "transfer" || (tx.source !== "manual" && !isRefund(tx) && /还款|转账|转出|转入|提现|充值|取现|存现/.test(`${tx.payee} ${tx.note} ${tx.rawCategory}`));
 }
 
 function allowed(account: string, tx: ParsedTx, ledger: LedgerInfo): boolean {

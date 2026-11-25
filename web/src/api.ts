@@ -1,4 +1,5 @@
-import type { AppConfig, AutomaticExclusionRule, BatchRevision, CnyRepaymentChoice, CurrencyExchangeInput, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, StatementName, StatementSource, TxDecision } from "../../src/shared/types.js";
+import type { AppConfig, AutomaticExclusionRule, BatchRevision, CnyRepaymentChoice, CurrencyExchangeInput, FundingMappingChoice, FundingMappingGroup, ImportPreview, LedgerBalanceSnapshot, LedgerError, ParsedAccount, ParsedTx, ReviewProblem, SplitChargeReview, StatementName, StatementSource, TxDecision } from "../../src/shared/types.js";
+import type { ManualBatchInput } from "../../src/shared/manual-batch.js";
 
 export type ConfigResponse = AppConfig & { nativePathPicker?: boolean };
 export type PathField = "ledgerRoot" | "pythonPath";
@@ -31,6 +32,7 @@ export interface LedgerSummary {
   currencies: string[];
   errors?: LedgerError[];
   loader?: string;
+  ledgerProfile?: string;
 }
 
 export interface GeneratedPreview {
@@ -117,6 +119,8 @@ export const api = {
     return send<UploadSummary>("/api/upload", { method: "POST", body });
   },
   batches: (signal?: AbortSignal) => send<BatchSummary[]>("/api/batches", { signal }),
+  createManualBatch: (input: ManualBatchInput) =>
+    post<{ batch: ImportPreview; summary: BatchSummary }>("/api/batches/manual", input),
   exclusionRules: () => send<AutomaticExclusionRule[]>("/api/exclusion-rules"),
   batchMergeOptions: (batches: BatchRevision[]) => post<BatchMergeOptions>("/api/batches/merge-options", { batches }),
   mergeBatches: (batches: BatchRevision[], keepProgress: string[], names: StatementName[]) =>
@@ -126,6 +130,10 @@ export const api = {
   resolveReviewConflict: (id: string, revision: number, conflictId: string, sourceBatchId: string | null) =>
     post<{ batch: ImportPreview }>("/api/batch/" + encodeURIComponent(id) + "/review-conflicts", { revision, conflictId, sourceBatchId }),
   batch: (id: string) => send<ImportPreview>(`/api/batch/${encodeURIComponent(id)}`),
+  splitChargeReview: (id: string, signal?: AbortSignal) =>
+    send<SplitChargeReview>(`/api/batch/${encodeURIComponent(id)}/split-charges`, { signal }),
+  updateSplitChargeMatch: (batchId: string, revision: number, id: string, action: "confirm" | "exclude" | "clear", reviewSessionId: string) =>
+    post<{ batch: ImportPreview }>(`/api/batch/${encodeURIComponent(batchId)}/split-charges`, { revision, id, action, reviewSessionId }),
   cnyRepayments: (id: string, txId: string) =>
     send<CnyRepaymentChoice[]>(`/api/batch/${encodeURIComponent(id)}/cny-repayments/${encodeURIComponent(txId)}`),
   settleInCny: (id: string, revision: number, txId: string, amount: string, repaymentKey?: string) =>
@@ -158,6 +166,8 @@ export const api = {
   generate: (id: string, revision: number) => post<GeneratedPreview>(`/api/batch/${encodeURIComponent(id)}/generate`, { revision }),
   commit: (id: string, revision: number) => post<{ ok: boolean; written: string[]; opens?: string[]; alreadyCommitted?: boolean; validation?: unknown }>(`/api/batch/${encodeURIComponent(id)}/commit`, { revision }),
   ledger: () => send<LedgerSummary>("/api/ledger"),
+  ledgerBalances: (date: string, ledgerProfile: string, signal?: AbortSignal) =>
+    send<LedgerBalanceSnapshot>("/api/ledger/balances?" + new URLSearchParams({ date, ledgerProfile }), { signal }),
   validate: () => send<{ available: boolean; ok: boolean; output: string }>("/api/validate"),
   fava: () => post<{ running: boolean; port: number; alreadyRunning?: boolean; error?: string }>("/api/fava", {}),
   config: () => send<ConfigResponse>("/api/config"),

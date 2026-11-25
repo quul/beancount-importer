@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { amountText } from "../../src/shared/postings.js";
-import { originalForeignAmount, readCnySettlementAmount } from "../../src/shared/settlement.js";
+import { originalForeignAmount, readPositiveCnyAmount } from "../../src/shared/settlement.js";
 import type { CnyRepaymentChoice, ParsedTx } from "../../src/shared/types.js";
 import { api } from "./api";
 
@@ -21,7 +21,7 @@ export default function CnySettlement({ tx, batchId, editable, disabled, onSave 
   const bookedAmount = tx.currency === "CNY" ? `¥${tx.amount.toFixed(2)}`
     : showsCny ? "待确认" : `${amountText(tx.amount)} ${tx.currency}`;
   const selectedChoice = Array.isArray(choices) ? choices.find(({ key }) => key === selected) : undefined;
-  const entered = readCnySettlementAmount(amount);
+  const entered = readPositiveCnyAmount(amount);
   const overAllocated = entered !== undefined && selectedChoice && entered > selectedChoice.remaining;
   const load = () => {
     setChoices("loading");

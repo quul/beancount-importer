@@ -14,6 +14,7 @@ export const isStatementOnlyPayment = (tx: ParsedTx, raw: string) =>
   tx.source.startsWith("bank-") && (/^(?:[A-Za-z]:)?[\\/]/.test(raw) || raw === tx.sourceFile);
 
 export function reusablePaymentMethod(tx: ParsedTx): string {
+  if (tx.source === "manual") return "";
   const raw = singlePaymentMethod(tx);
   return isStatementOnlyPayment(tx, raw) ? "" : raw;
 }

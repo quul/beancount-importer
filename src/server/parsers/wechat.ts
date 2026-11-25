@@ -16,6 +16,7 @@ export function parseWechat(file: string, rules = loadWechatRules()): ParseResul
     date: col(header, ["交易时间"]), type: col(header, ["交易类型"]), payee: col(header, ["交易对方"]), goods: col(header, ["商品"]),
     amount: col(header, ["金额(元)", "金额"]), status: col(header, ["当前状态", "交易状态"]), method: col(header, ["支付方式"]),
     id: col(header, ["交易单号", "商户单号"]), direction: col(header, ["收/支"]), remark: col(header, ["备注"]),
+    order: col(header, ["商户单号", "商户订单号"]),
   };
   for (let r = headerIdx + 1; r < rows.length; r++) {
     const row = rows[r], cell = (key: keyof typeof indexes) => indexes[key] >= 0 ? (row[indexes[key]] ?? "").trim() : "";
@@ -49,7 +50,7 @@ export function parseWechat(file: string, rules = loadWechatRules()): ParseResul
     const sourceTxId = cell("id") || undefined, date = parsed?.date ?? "";
     const tx: RawTx = { id: txId(date, Math.abs(amount ?? 0), direction, payee, `${parsed?.time ?? ""}|${note}|${rawAccount}`, "wechat", sourceTxId),
       date, time: parsed?.time, amount: Math.abs(amount ?? 0), direction, currency: "CNY", payee, note,
-      rawCategory, rawAccount, sourceTxId, source: "wechat", sourceFile: file, row: r + 1, eventType, sourceStatus, originalDirection,
+      rawCategory, rawAccount, sourceTxId, orderId: cell("order") || undefined, source: "wechat", sourceFile: file, row: r + 1, eventType, sourceStatus, originalDirection,
       excludedReason, issues, fundingParts: split.fundingParts };
     tx.excludedReason ??= wechatExclusionReason(tx, rules);
     const recognition = recognizeWechatTransaction(tx, rules);

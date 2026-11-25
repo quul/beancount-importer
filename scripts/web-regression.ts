@@ -4,6 +4,7 @@ import { groupBatchList } from "../web/src/batchList.js";
 import { summarizeImportDirectories } from "../web/src/ImportDestinationSummary.js";
 import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, validatePostingDraft } from "../web/src/ReviewEditor.js";
 import { calculatePostingAmount } from "../web/src/postingCalculator.js";
+import { projectManualBalances } from "../web/src/manualBalancePreview.js";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
 import { buildBulkCategoryPlan, buildBulkPostingPlan, buildReviewRows, matchesReviewDateRange, matchesReviewFilter, matchesReviewSearch, reviewCategoryOptions } from "../web/src/reviewRows.js";
 import { clearReviewView, readReviewView, updateReviewView } from "../web/src/reviewViewUrl.js";
@@ -46,6 +47,35 @@ try {
   assert.equal(requests.at(-1)?.init?.method, "DELETE");
   assert.deepEqual(JSON.parse(String(requests.at(-1)?.init?.body)), { revision: 9 });
   console.log("✓ config is parsed; review saves, undo and commit use their expected request fields");
+
+  {
+    const asset = "Assets:Wallet", income = "Income:Rewards";
+    const accounts = new Map<string, ParsedAccount>([
+      [asset, { account: asset, type: "assets", currencies: ["CNY", "USD"] }],
+      [income, { account: income, type: "income", currency: "CNY" }],
+    ]);
+    const opening = { [asset]: { CNY: "1000", USD: "1.000000009" }, [income]: { CNY: "-50" } };
+    const first = { date: "2026-02-03", amount: "128", description: "" };
+    const foreign = { ...first, amount: "0.12345678", currency: "USD" };
+    const preview = projectManualBalances([first, { ...first, date: "2026-02-01", amount: "39.90" },
+      { ...first, amount: "0.03", fundingAccount: income }, foreign, { ...first, amount: "−9.90" },
+      { ...foreign, amount: "-0.00000001" }, { ...first, amount: "" }], asset, accounts, opening, false);
+    assert.deepEqual(preview.opening, [{ currency: "CNY", amount: "1000.00" }, { currency: "USD", amount: "1.000000009" }]);
+    assert.deepEqual(preview.steps, [
+      { account: asset, currency: "CNY", amount: "872.00" },
+      { account: asset, currency: "CNY", amount: "832.10" },
+      { account: income, currency: "CNY", amount: "-50.03" },
+      { account: asset, currency: "USD", amount: "0.876543229" },
+      { account: asset, currency: "CNY", amount: "842.00" },
+      { account: asset, currency: "USD", amount: "0.876543239" },
+      { account: asset, currency: "CNY", message: "待填金额" },
+    ]);
+    assert.deepEqual(preview.closing, [{ currency: "CNY", amount: "842.00" }, { currency: "USD", amount: "0.876543239" }]);
+    const awaiting = projectManualBalances([foreign, first], asset, accounts, opening, true);
+    assert.ok(awaiting.steps.every((step) => "message" in step && step.message === "请先确认人民币金额"));
+    assert.deepEqual(awaiting.closing, [{ currency: "CNY", message: "请先确认人民币金额" }, { currency: "USD", amount: "1.000000009" }]);
+    console.log("✓ manual balances follow entry order, use exact account and currency units, and wait for required settlements");
+  }
 
   const view = new URL("https://fixture.test/?batch=batch-one&keep=1#ledger");
   const filters = { statusFilter: "excluded:manual", filter: "兑换 USDT + #凭证&",
@@ -369,5 +399,5 @@ try {
   await assert.rejects(() => api.upload([]), (error: unknown) => error instanceof ApiError && error.temporary
     && error.message === "服务连接中断，请重试");
   console.log("✓ empty responses, proxy pages and network exceptions get friendly retry messages");
-  console.log("Web contract regression passed (17 groups).");
+  console.log("Web contract regression passed (18 groups).");
 } finally { globalThis.fetch = originalFetch; }

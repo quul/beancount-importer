@@ -140,6 +140,188 @@ try {
   let base = await boot(config, dataDir);
   const info = await request(base, "/api/ledger"); assert.equal(info.accountCount, 4); assert.deepEqual(info.errors, []);
   assert.deepEqual(info.currencies, ["CNY"]);
+  {
+    const manualRoot = path.join(temporary, "manual-ledger"), manualData = path.join(temporary, "manual-data");
+    fs.mkdirSync(manualRoot);
+    const credit = "Liabilities:CN:JD:Baitiao", debit = "Assets:CN:BOC:2222", category = "Expenses:Food:Meals:Dine";
+    const foreignAccount = "Assets:USD:Cash", foreignCategory = "Expenses:Travel", income = "Income:Rewards";
+    fs.writeFileSync(path.join(manualRoot, "main.bean"), definitions + [
+      "2025-01-01 open " + credit + " CNY", "2025-01-01 open " + foreignAccount + " USD",
+      "2025-01-01 open " + foreignCategory + " USD", "2025-01-01 open " + income + " CNY", "2025-01-01 open Equity:Opening",
+      "2025-01-02 pad " + debit + " Equity:Opening", "2025-01-03 balance " + debit + " 1000.00 CNY",
+      '2025-01-04 * "Opening credit"', "  " + credit + " -200 CNY", "  Equity:Opening 200 CNY",
+      '2025-01-04 * "Opening cash"', "  " + foreignAccount + " 10.123456789 USD", "  Equity:Opening -10.123456789 USD",
+      ...[10, 20, 30].flatMap((amount, index) => [
+        "2025-01-0" + (index + 5) + ' * "Past purchase"', "  " + debit + " -" + amount + " CNY", "  " + category + " " + amount + " CNY",
+      ]),
+      '2025-01-08 * "Repayment"', "  " + debit + " -10 CNY", "  " + credit + " 10 CNY",
+      '2025-01-09 * "Refund"', "  " + debit + " 5 CNY", "  " + category + " -5 CNY",
+      '2027-01-01 * "Future posting"', "  " + debit + " -50 CNY", "  " + category + " 50 CNY", "",
+    ].join("\n"));
+    const manualBase = await boot({ ...config, ledgerRoot: manualRoot }, manualData);
+    const { ledgerProfile } = await request(manualBase, "/api/ledger");
+    const balancesRoute = "/api/ledger/balances?ledgerProfile=" + ledgerProfile + "&date=";
+    await request(manualBase, balancesRoute + "2026-02-30", undefined, 400);
+    await request(manualBase, "/api/ledger/balances?date=2026-02-03&ledgerProfile=" + info.ledgerProfile, undefined, 409);
+    const postedExpense = (date: string, amount: string, currency = "CNY") => ({ date, amounts: [{ currency, amount }] });
+    const starting = await request(manualBase, balancesRoute + "2026-02-03");
+    assert.deepEqual(starting.balances, {
+      [debit]: { CNY: "935.00" }, [credit]: { CNY: "-190" }, [foreignAccount]: { USD: "10.123456789" },
+    });
+    assert.deepEqual(starting.recentExpenses, {
+      [debit]: [postedExpense("2025-01-06", "20"), postedExpense("2025-01-07", "30")],
+    });
+    const create = "/api/batches/manual";
+    const common = { date: "2026-02-03", amount: "12.34", description: "午餐" };
+    const foreign = { ...common, date: "2026-02-04", amount: "7.125", currency: "USD" };
+    const reward = { date: "2026-02-05", amount: "3.50", description: "活动奖励支付" };
+    const difference = { ...common, date: "2026-02-05", amount: "-2.34", description: "部分退差价" };
+    const input = { batchId: "b1760000000000-0123456789ab", ledgerProfile, fundingAccount: credit,
+      rows: [common, { ...common }, { ...common, date: "2026-02-04", amount: "5", fundingAccount: debit },
+        { ...foreign, fundingAccount: foreignAccount }, { ...reward, fundingAccount: income }, difference] };
+    await request(manualBase, create, { ...input, ledgerProfile: info.ledgerProfile }, 409);
+    await request(manualBase, create, { ...input, rows: [common, { ...common, amount: "1.234" }] }, 400);
+    await request(manualBase, create, { ...input, rows: [{ ...difference, amount: "-0.00" }] }, 400);
+    await request(manualBase, create, { ...input, rows: [{ ...common, date: "2024-12-31" }] }, 400);
+    await request(manualBase, create, { ...input, rows: [{ ...common, fundingAccount: category }] }, 400);
+    await request(manualBase, create, { ...input, rows: [{ ...common, currency: "无效" }] }, 400);
+    await request(manualBase, create, { ...input, rows: [foreign] }, 400);
+    assert.deepEqual(await request(manualBase, "/api/batches"), []);
+    const { batch: manual, summary } = await request(manualBase, create, input, 201);
+    assert.deepEqual(manual.txs.map(({ fundingAccount }: ParsedTx) => fundingAccount), [credit, credit, debit, foreignAccount, income, credit]);
+    assert.deepEqual(manual.txs.map(({ currency }: ParsedTx) => currency), ["CNY", "CNY", "CNY", "USD", "CNY", "CNY"]);
+    assert.deepEqual([manual.txs[5].eventType, manual.txs[5].direction, manual.txs[5].amount], ["refund", "in", 2.34]);
+    assert.ok(manual.txs.every(({ status, source, sourceFileHash }: ParsedTx) => status === "pending" && source === "manual" && !sourceFileHash));
+    assert.equal(new Set(manual.txs.map(({ id }: ParsedTx) => id)).size, 6);
+    assert.deepEqual(await request(manualBase, create, input), { batch: manual, summary });
+    await request(manualBase, create, { ...input, fundingAccount: debit }, 409);
+    assert.deepEqual(await request(manualBase, "/api/batches"), [summary]);
+    assert.deepEqual(fs.readdirSync(path.join(manualData, "uploads")), []);
+    assert.equal(fs.existsSync(path.join(manualRoot, "uploads")), false);
+    const route = "/api/batch/" + summary.batchId;
+    const reopened = await request(manualBase, route);
+    assert.deepEqual(reopened.txs, manual.txs);
+    const reviewed = await request(manualBase, route + "/decide", { revision: reopened.revision,
+      decisions: reopened.txs.map(({ id, currency }: ParsedTx) => ({ id, account: currency === "USD" ? foreignCategory : category, status: "ready" })) });
+    const preview = await request(manualBase, route + "/generate", { revision: reviewed.revision });
+    assert.equal(preview.generated, 6);
+    assert.match(preview.entries, /Liabilities:CN:JD:Baitiao\s+-12\.34 CNY/);
+    assert.match(preview.entries, /Assets:CN:BOC:2222\s+-5\.00 CNY/);
+    assert.match(preview.entries, /Assets:USD:Cash\s+-7\.125 USD/);
+    assert.match(preview.entries, /Income:Rewards\s+-3\.50 CNY/);
+    assert.match(preview.entries, /import-event: "refund"[\s\S]*?Liabilities:CN:JD:Baitiao\s+2\.34 CNY\s+Expenses:Food:Meals:Dine\s+-2\.34 CNY/);
+    const committed = await request(manualBase, route + "/commit", { revision: reviewed.revision });
+    assert.equal(committed.ok, true);
+    const afterCommit = await request(manualBase, balancesRoute + "2026-02-06");
+    assert.deepEqual(afterCommit.balances, {
+      [debit]: { CNY: "930.00" }, [credit]: { CNY: "-212.34" }, [foreignAccount]: { USD: "2.998456789" }, [income]: { CNY: "-3.50" },
+    });
+    assert.deepEqual(afterCommit.recentExpenses, {
+      [debit]: [postedExpense("2025-01-07", "30"), postedExpense("2026-02-04", "5.00")],
+      [credit]: [postedExpense("2026-02-03", "12.34"), postedExpense("2026-02-03", "12.34")],
+      [foreignAccount]: [postedExpense("2026-02-04", "7.125", "USD")],
+      [income]: [postedExpense("2026-02-05", "3.50")],
+    });
+    const found = await request(manualBase, create, { ...input, batchId: "b1760000000000-1123456789ab", fundingAccount: income, rows: [reward] }, 201);
+    assert.equal(found.batch.txs[0].fundingAccount, income);
+    assert.equal(found.batch.txs[0].status, "pending");
+    assert.ok(found.batch.txs[0].issues.includes("疑似重复入账"));
+    const cnyBase = await boot({ ...config, ledgerRoot: manualRoot, requireCnySettlement: true }, path.join(temporary, "manual-cny-data"));
+    const { batch: awaiting } = await request(cnyBase, create, {
+      ...input, batchId: "b1760000000000-2123456789ab", rows: [foreign, { ...foreign, amount: "-1.125" }],
+    }, 201);
+    assert.equal(awaiting.txs[0].fundingAccount, credit);
+    assert.equal(awaiting.txs[0].requireCnySettlement, true);
+    assert.deepEqual(awaiting.txs[0].originalAmount, { amount: 7.125, currency: "USD" });
+    const settlementRoute = "/api/batch/" + awaiting.batchId + "/cny-settlement";
+    const settled = await request(cnyBase, settlementRoute,
+      { revision: awaiting.revision, id: awaiting.txs[0].id, amount: "51.20" });
+    assert.deepEqual([settled.batch.txs[0].fundingAccount, settled.batch.txs[0].amount, settled.batch.txs[0].currency], [credit, 51.2, "CNY"]);
+    assert.deepEqual(awaiting.txs[1].originalAmount, { amount: 1.125, currency: "USD" });
+    const settledRefund = await request(cnyBase, settlementRoute,
+      { revision: settled.batch.revision, id: awaiting.txs[1].id, amount: "8.20" });
+    const refundRow = settledRefund.batch.txs[1];
+    assert.deepEqual([refundRow.fundingAccount, refundRow.amount, refundRow.currency, refundRow.eventType, refundRow.direction],
+      [credit, 8.2, "CNY", "refund", "in"]);
+    passed("manual purchases and partial refunds preserve funding and currencies through review, settlement and commit");
+  }
+  {
+    const splitRoot = path.join(temporary, "split-charge-ledger");
+    fs.mkdirSync(splitRoot);
+    const account = "Assets:CN:BOC:1111", expense = "Expenses:Food:Meals:Dine";
+    fs.writeFileSync(path.join(splitRoot, "main.bean"), definitions + [
+      '2026-03-01 * "购物卡"',
+      "  " + account + " -100 CNY", "  " + expense + " 100 CNY", "",
+    ].join("\n"));
+    const splitBase = await boot({ ...config, ledgerRoot: splitRoot }, path.join(temporary, "split-charge-data"));
+    const { ledgerProfile } = await request(splitBase, "/api/ledger");
+    const purchase = "202603010001", order = "shop-order-1";
+    const statement = [
+      "交易时间,交易分类,交易对方,商品说明,收/支,金额,收/付款方式,交易状态,交易订单号,商家订单号",
+      ...[100, -100, 25, 25, 25, 15, 10].map((amount, index) => {
+        const refund = amount < 0;
+        return [`2026-02-01 10:0${index}:00`, refund ? "退款" : "日用百货", "购物卡", refund ? "退款" : "消费",
+          refund ? "收入" : "支出", Math.abs(amount), "中国银行储蓄卡(1111)", refund ? "退款成功" : "交易成功",
+          refund ? purchase + "_1" : index ? purchase + index : purchase, order].join(",");
+      }),
+    ].join("\n");
+    const imported = await upload(splitBase, statement, "alipay-split.csv");
+    const route = "/api/batch/" + imported.batchId;
+    const scan = route + "/split-charges";
+    let review = await request(splitBase, scan);
+    assert.equal(review.candidates.length, 1);
+    const match = review.candidates[0];
+    assert.deepEqual(match.parts.map(({ amount }: ParsedTx) => amount), [25, 25, 25, 15, 10]);
+    assert.equal(new Set(match.parts.map(({ id }: ParsedTx) => id)).size, 5);
+    assert.deepEqual([match.refundEvidence, match.splitEvidence, match.original.orderId, match.refund.time], ["reference", "order", order, "10:01:00"]);
+    assert.ok(imported.txs.every(({ status }) => status !== "excluded"));
+    const confirmed = await request(splitBase, scan, { revision: imported.revision, id: match.id, action: "confirm" });
+    review = await request(splitBase, scan);
+    assert.equal(review.candidates.length, 0);
+    assert.equal(review.confirmed[0].canExcludeOffsets, true);
+    const excluded = await request(splitBase, scan, { revision: confirmed.batch.revision, id: match.id, action: "exclude", reviewSessionId });
+    assert.deepEqual(excluded.batch.txs.filter(({ status }: ParsedTx) => status === "excluded").map(({ id }: ParsedTx) => id),
+      [match.original.id, match.refund.id]);
+    assert.equal((await request(splitBase, scan)).confirmed[0].offsetsExcluded, true);
+    const restored = await request(splitBase, route + "/undo-review-status", { revision: excluded.batch.revision, reviewSessionId });
+    await request(splitBase, scan, { revision: restored.batch.revision, id: match.id, action: "clear" });
+    assert.equal((await request(splitBase, scan)).candidates.length, 1);
+
+    const create = async (batchId: string, date: string, amounts: number[]) => request(splitBase, "/api/batches/manual", {
+      batchId, ledgerProfile, fundingAccount: account, rows: amounts.map((amount) => ({ amount: String(amount), date, description: "购物卡" })),
+    }, 201);
+    const { batch: ambiguous } = await create("b1760000000000-3123456789ab", "2026-02-10", [100, 100, -100, 50, 50, 60, 40]);
+    const ambiguousRoute = "/api/batch/" + ambiguous.batchId + "/split-charges";
+    const alternatives = (await request(splitBase, ambiguousRoute)).candidates;
+    assert.equal(alternatives.length, 4);
+    assert.ok(alternatives.every((candidate: { overlaps: boolean }) => candidate.overlaps));
+    const chosen = await request(splitBase, ambiguousRoute, { revision: ambiguous.revision, id: alternatives[0].id, action: "confirm" });
+    await request(splitBase, ambiguousRoute, { revision: chosen.batch.revision, id: alternatives[2].id, action: "confirm" }, 409);
+    assert.equal((await request(splitBase, ambiguousRoute)).confirmed.length, 1);
+
+    const { batch: posted } = await create("b1760000000000-4123456789ab", "2026-03-02", [-100, 60, 40]);
+    const postedRoute = "/api/batch/" + posted.batchId + "/split-charges";
+    const postedMatch = (await request(splitBase, postedRoute)).candidates[0];
+    assert.equal(postedMatch.original.posted, true);
+    const recorded = await request(splitBase, postedRoute, { revision: posted.revision, id: postedMatch.id, action: "confirm" });
+    assert.equal((await request(splitBase, postedRoute)).confirmed[0].canExcludeOffsets, false);
+    await request(splitBase, postedRoute, { revision: recorded.batch.revision, id: postedMatch.id, action: "exclude", reviewSessionId }, 409);
+    assert.ok(recorded.batch.txs.every(({ status }: ParsedTx) => status === "pending"));
+
+    const { batch: amountOnly } = await create("b1760000000000-5123456789ab", "2026-11-04", [182.28, 8.71, 138.75, 34.82, -2.34]);
+    const amountRoute = "/api/batch/" + amountOnly.batchId + "/split-charges";
+    const amountReview = await request(splitBase, amountRoute);
+    assert.equal(amountReview.candidates.length, 1);
+    const amountMatch = amountReview.candidates[0];
+    assert.equal(amountMatch.original.amount, 182.28);
+    assert.deepEqual(amountMatch.parts.map(({ amount }: ParsedTx) => amount), [8.71, 138.75, 34.82]);
+    assert.equal(amountMatch.refund, undefined);
+    const amountConfirmed = await request(splitBase, amountRoute, { revision: amountOnly.revision, id: amountMatch.id, action: "confirm" });
+    assert.equal((await request(splitBase, amountRoute)).confirmed[0].canExcludeOffsets, false);
+    await request(splitBase, amountRoute, { revision: amountConfirmed.batch.revision, id: amountMatch.id, action: "exclude", reviewSessionId }, 409);
+    assert.ok(amountConfirmed.batch.txs.every(({ status }: ParsedTx) => status === "pending"));
+    passed("split charges show exact distinct rows and evidence, reserve shared candidates, and exclude only unposted offsets with undo");
+  }
   let batch = await upload(base, csv());
   assert.equal(batch.txs.length, 2); assert.equal(batch.parseStats?.excluded, 1); assert.ok(batch.txs.every((tx) => tx.sourceFileHash?.length === 64));
   assert.equal(batch.txs[0].fundingAccount, "Assets:CN:BOC:1111"); passed("multipart upload retains source rows, exclusion reasons and funding identity");

@@ -202,14 +202,14 @@ export function ReviewPostingFields({ tx, draft, accounts, disabled, postingErro
 
 export function TransactionSourceDetails({ tx, counterpart, sources }: { tx: ParsedTx; counterpart?: ParsedTx; sources?: StatementSource[] }) {
   return <dl className="tx-meta source-details">
-    <div><dt>原始来源</dt><dd>{tx.sourceFile} · 第 {tx.row} 行 · {tx.source}</dd></div>
+    <div><dt>原始来源</dt><dd>{tx.sourceFile} · 第 {tx.row} {tx.source === "manual" ? "笔" : "行 · " + tx.source}</dd></div>
     {sources && sources.length > 1 && <div><dt>来源账单</dt><dd>{sources.map(({ file, id }) => <div key={id}>{file}</div>)}</dd></div>}
     {tx.sourceStatus && <div><dt>账单状态</dt><dd>{tx.sourceStatus}</dd></div>}
     {tx.note && <div><dt>账单备注</dt><dd>{tx.note}</dd></div>}
-    {tx.rawAccount && <div><dt>支付方式</dt><dd>{tx.rawAccount}</dd></div>}
+    {tx.rawAccount && <div><dt>{tx.source === "manual" ? "录入时的资金账户" : "支付方式"}</dt><dd>{tx.rawAccount}</dd></div>}
     {tx.recognition?.fundingMethod && <div><dt>推断资金方式</dt><dd>{tx.recognition.fundingMethod}</dd></div>}
     {tx.originalDirection && <div><dt>原始收支</dt><dd>{tx.originalDirection}</dd></div>}
-    {tx.sourceTxId && <div><dt>交易号</dt><dd><code>{tx.sourceTxId}</code></dd></div>}
+    {tx.sourceTxId && tx.source !== "manual" && <div><dt>交易号</dt><dd><code>{tx.sourceTxId}</code></dd></div>}
     {counterpart && <div><dt>{tx.eventType === "refund" ? "原消费" : "对应退款"}</dt>
       <dd>{amountText(counterpart.amount)} {counterpart.currency} · {counterpart.date}{counterpart.time && ` ${counterpart.time}`}
         {counterpart.sourceTxId && <><br /><code>{counterpart.sourceTxId}</code></>}

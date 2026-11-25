@@ -172,6 +172,7 @@ export function parseBank(file: string, def: BankDef): ParseResult {
   const iBalance = col(header, def.balanceCols);
   const iAccount = col(header, def.accountCols);
   const iTxNo = col(header, def.txNoCols);
+  const iOrder = header.findIndex((name) => ["商户订单号", "商家订单号", "订单号"].includes(name.trim()));
   const iCurrency = col(header, ["交易币种", "币种", "currency"]);
 
   if (iDate < 0 || iAmount < 0) {
@@ -245,6 +246,7 @@ export function parseBank(file: string, def: BankDef): ParseResult {
       rawAccount: cell(iAccount) || file,
       balanceAfter: balance ?? undefined,
       sourceTxId: cell(iTxNo) || undefined,
+      orderId: cell(iOrder) || undefined,
       source: def.source,
       sourceFile: file,
       row: r + 1,

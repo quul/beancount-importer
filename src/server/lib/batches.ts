@@ -12,6 +12,8 @@ export interface StoredBatch extends ImportPreview {
   committed: boolean;
   /** Never allow an old batch to follow a change to the configured ledger. */
   ledgerProfile: string;
+  /** Identifies the input for a retried manual submission. */
+  manualInputHash?: string;
   /** Storage names of the original PDFs, keyed by their upload digest. */
   pdfUploads?: Record<string, StoredPdfUpload>;
   preview?: { revision: number; result: GenerateResult; opens: string[] };
@@ -75,10 +77,11 @@ export class BatchStore {
     }
   }
 
-  create(input: Omit<StoredBatch, "batchId" | "createdAt" | "revision" | "committed" | "mergedInto">): StoredBatch {
+  create(input: Omit<StoredBatch, "batchId" | "createdAt" | "revision" | "committed" | "mergedInto">,
+    batchId = `b${Date.now()}-${crypto.randomBytes(6).toString("hex")}`): StoredBatch {
     const batch: StoredBatch = {
       ...input,
-      batchId: `b${Date.now()}-${crypto.randomBytes(6).toString("hex")}`,
+      batchId,
       createdAt: Date.now(),
       revision: 1,
       committed: false,

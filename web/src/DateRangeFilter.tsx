@@ -1,31 +1,10 @@
 import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { validDate } from "../../src/shared/postings.js";
 import { EMPTY_REVIEW_DATE_RANGE, type ReviewDateRange } from "./reviewRows";
-
-const weekdays = ["一", "二", "三", "四", "五", "六", "日"];
-const dayKeyOffsets: Record<string, number | undefined> = { ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7 };
-const monthLabel = new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "long", timeZone: "UTC" });
-const dayLabel = new Intl.DateTimeFormat("zh-CN", { dateStyle: "full", timeZone: "UTC" });
-const fromDate = (date: Date) => date.toISOString().slice(0, 10);
-const toDate = (day: string) => new Date(`${day}T00:00:00Z`);
-
-function localToday(): string {
-  const today = new Date();
-  return fromDate(new Date(Date.UTC(today.getFullYear(), today.getMonth(), today.getDate())));
-}
+import { calendarWeeks, dayKeyOffsets, dayLabel, fromDate, localToday, monthLabel, toDate, weekdays } from "./calendarDates";
 
 function initialDay(value: ReviewDateRange, today: string): string {
   return validDate(value.start) ? value.start : today;
-}
-
-function calendarWeeks(month: string): (Date | null)[][] {
-  const first = toDate(`${month}-01`);
-  const offset = (first.getUTCDay() + 6) % 7;
-  return Array.from({ length: 6 }, (_, week) => Array.from({ length: 7 }, (_, column) => {
-    const date = new Date(first);
-    date.setUTCDate(week * 7 + column + 1 - offset);
-    return date.getUTCMonth() === first.getUTCMonth() ? date : null;
-  }));
 }
 
 function orderedRange(first: string, second: string): ReviewDateRange {

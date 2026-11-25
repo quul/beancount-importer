@@ -8,7 +8,8 @@ import hashlib
 import json
 import os
 import time
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -109,6 +110,42 @@ def ledger_currencies(entries, options, data):
     return sorted(currencies)
 
 
+def account_balance_snapshot(entries, data, as_of, expense_prefix):
+    balances = defaultdict(lambda: defaultdict(Decimal))
+    recent_expenses = defaultdict(lambda: deque(maxlen=2))
+    for entry in entries:
+        if not isinstance(entry, data.Transaction) or entry.date > as_of:
+            continue
+        movements = defaultdict(lambda: defaultdict(Decimal))
+        for posting in entry.postings:
+            units = posting.units
+            if units is not None and isinstance(units.currency, str) and isinstance(units.number, Decimal) and units.number.is_finite():
+                balances[posting.account][units.currency] += units.number
+                movements[posting.account][units.currency] += units.number
+        entry_meta = entry.meta or {}
+        if entry.flag == "P" or entry_meta.get("__automatic__") or entry_meta.get("import-event") in ("transfer", "refund", "income"):
+            continue
+        if not any(
+            account.startswith(expense_prefix) and any(amount > 0 for amount in amounts.values())
+            for account, amounts in movements.items()
+        ):
+            continue
+        for account, amounts in movements.items():
+            spent = [
+                {"currency": currency, "amount": format(amount.copy_abs(), "f")}
+                for currency, amount in sorted(amounts.items()) if amount < 0
+            ]
+            if spent:
+                recent_expenses[account].append({"date": str(entry.date), "amounts": spent})
+    return {
+        "balances": {
+            account: {currency: format(amount, "f") for currency, amount in sorted(amounts.items())}
+            for account, amounts in balances.items()
+        },
+        "recentExpenses": {account: list(expenses) for account, expenses in recent_expenses.items()},
+    }
+
+
 def run(request):
     try:
         from beancount import loader
@@ -116,8 +153,8 @@ def run(request):
     except ImportError as exc:
         raise RuntimeError("所选 Python 未安装 Beancount，请选择账本的 venv/bin/python") from exc
 
-    if request.get("operation") not in ("inspect", "validate"):
-        raise ValueError("operation must be inspect or validate")
+    if request.get("operation") not in ("inspect", "validate", "balances"):
+        raise ValueError("operation must be inspect, validate or balances")
     if ("file" in request) == ("text" in request):
         raise ValueError("provide exactly one of file or text")
     if "file" in request:
@@ -136,6 +173,10 @@ def run(request):
     result = {"ok": not diagnostics, "loader": "beancount-native", "errors": diagnostics}
     if request["operation"] == "validate":
         return result
+    if request["operation"] == "balances":
+        return {**result, "balanceSnapshot": account_balance_snapshot(
+            entries, data, date.fromisoformat(request["balanceDate"]), options.get("name_expenses", "Expenses") + ":"
+        )}
     result["operatingCurrencies"] = options.get("operating_currency", [])
     result["currencies"] = ledger_currencies(entries, options, data)
     if "file" in request and request.get("trackAccountSources") and not errors:

@@ -12,6 +12,7 @@ import { savedCategoryAllocations } from "../../src/shared/categoryAllocations.j
 import { FUNDING_SPLIT_REQUIRED, amountText, missingPostingAccount, missingPostingAccountMessage, requiresFundingSplit } from "../../src/shared/postings.js";
 import { accountIsActive, hasFundingPosting, isCombinedPayment, isFundingAccount, reusablePaymentMethod } from "../../src/shared/funding.js";
 import { activeTransactions } from "../../src/shared/transactionMerge.js";
+import type { ManualBatchInput } from "../../src/shared/manual-batch.js";
 import { api, ApiError, IncompleteReviewError, type BatchMergeOptions, type BatchSummary, type ConfigResponse, type GeneratedPreview, type LedgerSummary, type MergeDraft } from "./api";
 import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, ReviewMetadataFields, ReviewPostingFields, shakeInvalidFields, TransactionSourceDetails, validatePostingDraft, type ReviewDraft } from "./ReviewEditor";
 import AccountSelect from "./AccountSelect";
@@ -26,10 +27,12 @@ import EntryPreview from "./EntryPreview";
 import ExclusionFilters from "./ExclusionFilters";
 import FundingDialog from "./FundingDialog";
 import ImportDestinationSummary from "./ImportDestinationSummary";
+import ManualBatchDialog from "./ManualBatchDialog";
 import MergeDialog from "./MergeDialog";
 import PdfPreviewDialog from "./PdfPreviewDialog";
 import ReviewMenu from "./ReviewMenu";
 import ReviewConflictPanel from "./ReviewConflictPanel";
+import SplitChargeReviewPanel, { revealSplitChargeReview, type SplitChargeRowHints } from "./SplitChargeReview";
 import StatementSources from "./StatementSources";
 import TransactionFlag from "./TransactionFlag";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "./reviewChanges";
@@ -265,11 +268,13 @@ export default function App() {
   const [renameStatementsOpen, setRenameStatementsOpen] = useState(false);
   const [batchesRefreshing, setBatchesRefreshing] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [manualBatchOpen, setManualBatchOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null);
   const [fundingTarget, setFundingTarget] = useState<FundingTarget | null>(null);
   const [mappingTarget, setMappingTarget] = useState<ParsedTx | null>(null);
   const [batch, setBatch] = useState<ImportPreview | null>(null);
   const [batchId, setBatchId] = useState("");
+  const [splitChargeHints, setSplitChargeHints] = useState<SplitChargeRowHints>();
   const [locationSearch, setLocationSearch] = useState(() => window.location.search);
   const params = useMemo(() => new URLSearchParams(locationSearch), [locationSearch]);
   const routedBatchId = params.get("batch") ?? "";
@@ -881,6 +886,14 @@ export default function App() {
     });
   };
 
+  const createManualBatch = (input: ManualBatchInput) => void perform(async () => {
+    const { batch: savedBatch, summary } = await api.createManualBatch(input);
+    setBatches((previous) => [summary, ...previous.filter(({ batchId }) => batchId !== summary.batchId)]);
+    setManualBatchOpen(false);
+    navigateBatch(summary.batchId);
+    startReview(summary.batchId, savedBatch, false);
+  });
+
   const discardNarrationDraft = (id: string, savedValue?: string) => setNarrationDrafts((previous) => {
     if (savedValue !== undefined && previous[id] !== savedValue) return previous;
     const next = { ...previous };
@@ -1252,6 +1265,15 @@ export default function App() {
     replaceBatch(result.batch);
     setNotice(sourceBatchId ? "已沿用所选批次的审批进度" : "已恢复为待确认");
   });
+
+  const updateSplitChargeMatch = (id: string, action: "confirm" | "exclude" | "clear") => {
+    if (blockBatchChanges || readOnly) return;
+    enqueueReviewSave(async (batchId, current) => {
+      const { batch } = await api.updateSplitChargeMatch(batchId, current.revision ?? 0, id, action, reviewSessionId);
+      const notices = { confirm: "已确认拆单匹配", exclude: "已排除相抵的原扣款和退款", clear: "已取消拆单匹配" };
+      return { batch, notice: notices[action] };
+    }, { blocking: true });
+  };
 
   const saveConfig = async (values: Partial<AppConfig>) => {
     if (blockBatchChanges) return;
@@ -1741,6 +1763,7 @@ export default function App() {
       if (entry.duplicateOf && entry.status !== "ready") warnings.add(entry.duplicateOf.label);
     }
     const hasExcludedMatch = entries.some((entry) => exclusionKind(entry) === "deduplicate" && duplicateEvidence(entry));
+    const splitChargeEntry = splitChargeHints?.batchId === batchId && entries.find((entry) => splitChargeHints.ids.has(entry.id));
 
     return <tr key={tx.id} id={`review-row-${tx.id}`} role="row" tabIndex={-1} data-review-id={tx.id}
       aria-describedby={rowProblem ? `review-row-error-${tx.id}` : undefined}
@@ -1780,6 +1803,8 @@ export default function App() {
             {warnings.size > 0 && <ul role="list" aria-label="审批提示" className="tx-warnings">
               {[...warnings].map((warning) => <li key={warning}>{warning}</li>)}
             </ul>}
+            {splitChargeEntry && <button type="button" className="btn small quiet split-charge-row-hint"
+              onClick={() => revealSplitChargeReview(splitChargeEntry.id)}>查看拆单金额匹配</button>}
             {rowProblem && <p id={`review-row-error-${tx.id}`} className="review-field-error">{rowProblem}</p>}
             {renderNarration(tx, payee)}
             {statementSources.size > 0 && <StatementSources sources={sourcesFor(originals ?? entries)} />}
@@ -1850,7 +1875,7 @@ export default function App() {
           <a className="btn settings-entry settings-icon" href={SETTINGS_LINKS.ledger} aria-label="设置" title="设置"><ReviewIcon name="settings" /></a>}
       </div>
     </header>
-    {error && !fundingTarget && !mappingTarget && !mergeIds && !batchMergeOptions && !renameStatementsOpen
+    {error && !fundingTarget && !mappingTarget && !mergeIds && !batchMergeOptions && !renameStatementsOpen && !manualBatchOpen
       && <div className="card alert" role="alert"><b>操作未完成</b><p>{error}</p><button className="btn small" onClick={() => setError("")}>关闭</button></div>}
     {!settings && fundingTarget && fundingTarget.id === routedBatchId && <FundingDialog key={fundingTarget.id} groups={fundingTarget.groups} busy={busy} error={error}
       skipIncomplete={fundingTarget.batch.combinedFundingPending}
@@ -1866,6 +1891,10 @@ export default function App() {
       busy={busy} error={error} onClose={() => { setMergeIds(null); setError(""); }} onConfirm={createMerge} />}
     {!settings && !routedBatchId && batchMergeOptions && <BatchReviewDialog batches={batchMergeOptions.batches} sources={batchMergeOptions.sources}
       busy={busy} error={error} onClose={closeBatchDialog} onConfirm={mergeBatches} />}
+    {!settings && !routedBatchId && manualBatchOpen && ledger?.ledgerProfile &&
+      <ManualBatchDialog accounts={accounts} ledgerProfile={ledger.ledgerProfile} ledgerCurrencies={ledger.currencies}
+        requireCnySettlement={Boolean(config?.requireCnySettlement)} busy={busy} error={error} onSubmit={createManualBatch}
+        onClose={() => { setManualBatchOpen(false); setError(""); }} />}
     {!settings && renameStatementsOpen && batch?.statementSources && <BatchReviewDialog sources={batch.statementSources}
       busy={busy} error={error} onClose={closeBatchDialog} onConfirm={(_keep, names) => renameStatements(names)} />}
     {!settings && pdfPreviewTx && <PdfPreviewDialog key={pdfPreviewTx.id} batchId={batchId} tx={pdfPreviewTx} onClose={() => setPdfPreviewTx(null)} />}
@@ -1892,9 +1921,16 @@ export default function App() {
     {!settings && routedBatchId && batchId !== routedBatchId && fundingTarget?.id !== routedBatchId &&
       <section className="card" role="status">正在恢复审批…</section>}
     {!settings && !routedBatchId && !batch && <>
-      <section className="card"><div className={`dropzone${dragOver ? " over" : ""}`} role="button" tabIndex={0} aria-label="选择账单文件" aria-disabled={busy} onKeyDown={(event) => {
+      <section className="card batch-entry-options">
+        <button type="button" className="dropzone manual-batch-entry" aria-haspopup="dialog" disabled={busy || !ledger?.ledgerProfile}
+          title={!busy && !ledger?.ledgerProfile ? "请先在设置中选择账本" : undefined}
+          onClick={() => { setError(""); setManualBatchOpen(true); }}>
+          <span className="dz-glyph manual-batch-glyph" aria-hidden="true" /><span className="dz-main">手动录入一批</span>
+        </button>
+        <div className={`dropzone${dragOver ? " over" : ""}`} role="button" tabIndex={0} aria-label="选择账单文件" aria-disabled={busy} onKeyDown={(event) => {
         if (event.key === "Enter" || event.key === " ") { event.preventDefault(); if (!busy) fileInput.current?.click(); }
-      }} onClick={() => { if (!busy) fileInput.current?.click(); }} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={(event) => { event.preventDefault(); setDragOver(false); upload(event.dataTransfer.files); }}><span className="dz-glyph" aria-hidden="true" /><div className="dz-main">{uploading ? "正在读取账单…" : "拖入账单，或点击选择文件"}</div><div className="dz-sub">可同时选择多个 CSV / XLSX / PDF · ZIP 请先解压</div></div></section>
+        }} onClick={() => { if (!busy) fileInput.current?.click(); }} onDragOver={(event) => { event.preventDefault(); setDragOver(true); }} onDragLeave={() => setDragOver(false)} onDrop={(event) => { event.preventDefault(); setDragOver(false); upload(event.dataTransfer.files); }}><span className="dz-glyph" aria-hidden="true" /><div className="dz-main">{uploading ? "正在读取账单…" : "拖入账单，或点击选择文件"}</div><div className="dz-sub">可同时选择多个 CSV / XLSX / PDF · ZIP 请先解压</div></div>
+      </section>
       <section className="card" aria-busy={batchesRefreshing}>
         <div className="toolbar"><h2>导入批次</h2><span className="spacer" />
           {selectedBatches.length > 0 && <>
@@ -1969,6 +2005,8 @@ export default function App() {
         {rowErrors.length > 0 && <details className="review-diagnostic"><summary>需要核对的账单行（{rowErrors.length}）</summary>{rowErrors.map(({ row, message }, index) => <p className="error-line" key={index}>第 {row} 行：{message}</p>)}</details>}
         {batch.ledgerErrors?.length ? <details className="review-diagnostic"><summary>载入批次时的账本校验信息（{batch.ledgerErrors.length}）</summary>{batch.ledgerErrors.map((item, index) => <p className="error-line" key={index}>{item.file}{item.line ? `:${item.line}` : ""} {item.message}</p>)}</details> : null}
         {!readOnly && config && <ImportDestinationSummary layout={config} txs={txs} rulesHref={SETTINGS_LINKS.directories} />}
+        <SplitChargeReviewPanel key={batchId} batchId={batchId} batch={batch} disabled={busy || blockBatchChanges}
+          readOnly={readOnly} onAction={updateSplitChargeMatch} onRows={setSplitChargeHints} />
         <div className="filter-row">
           <div className="review-search">
             <input ref={searchInput} type="search" value={filter} onChange={(event) => setFilter(event.target.value)}

@@ -2,6 +2,7 @@
 import { isFamilyCard } from "../../shared/types.js";
 import type { AppConfig, LedgerInfo, ParsedAccount, ParsedTx, SourceType } from "../../shared/types.js";
 import { accountIsActive, isCombinedPayment, isFundingAccount, isMissingPaymentMethod, normalizePaymentMethod, singlePaymentMethod } from "../../shared/funding.js";
+import { needsCnySettlement } from "../../shared/settlement.js";
 import { parseFundingParts } from "../parsers/common.js";
 
 export { accountIsActive, isMissingPaymentMethod, normalizePaymentMethod, singlePaymentMethod } from "../../shared/funding.js";
@@ -89,6 +90,12 @@ export function unallocatedFundingParts(tx: ParsedTx): ParsedTx["fundingParts"] 
 }
 
 export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo): FundingGuess {
+  if (tx.source === "manual") {
+    const account = ledger?.accounts.find((entry) => entry.account === tx.rawAccount);
+    const currency = needsCnySettlement(tx) ? "CNY" : tx.currency;
+    if (!ledger || (account && accountIsActive(account, tx.date, currency))) return { account: tx.rawAccount, confidence: 1 };
+    return unknown("账户未映射");
+  }
   // 亲情卡/代付: the payment method belongs to the other person. Never match it
   // against my own wallet/card mappings (e.g. their 花呗 is not my Huabei account).
   if (isFamilyCard(tx)) return unknown("对方付款");

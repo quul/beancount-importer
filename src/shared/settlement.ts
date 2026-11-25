@@ -10,7 +10,7 @@ export function needsCnySettlement(tx: Pick<ParsedTx, "requireCnySettlement" | "
   return Boolean(tx.requireCnySettlement && (tx.currency !== "CNY" || tx.postings?.some(({ currency }) => currency !== "CNY")));
 }
 
-export function readCnySettlementAmount(value: unknown): number | undefined {
+export function readPositiveCnyAmount(value: unknown): number | undefined {
   if (typeof value !== "string" || !/^\d{1,12}(?:\.\d{1,2})?$/.test(value.trim())) return;
   const amount = Number(value);
   if (amount > 0) return amount;
