@@ -290,7 +290,26 @@ try {
     assert.equal(other.source, "bank-generic");
     assert.deepEqual(other.errors, []);
     assert.deepEqual(other.txs.map(({ date, amount, balanceAfter }) => [date, amount, balanceAfter]), [["2026-01-02", 3.25, 100]]);
+    assert.equal(other.txs[0].direction, "out");
     passed("PDF upload recognizes CMB credit-card sections, year rollover, billing currencies and card mappings, while preserving generic PDF parsing");
+
+    const cmbDebit = await upload(pdfBase, await fixturePdf([[
+      [760, [[43, "招商银行交易流水"]]],
+      [730, [[43, "记账日期"], [125, "货币"], [190, "交易金额"], [285, "联机余额"], [385, "交易摘要"]]],
+      [710, [[43, "2026-01-16"], [125, "CNY"], [190, "-200.00"], [285, "800.00"], [385, "转账汇款"]]],
+      [690, [[43, "2026-01-20"], [125, "CNY"], [190, "1,200.00"], [285, "2,000.00"], [385, "汇入汇款"]]],
+      [670, [[43, "2026-01-21"], [125, "CNY"], [190, "-52.44"], [285, "1,947.56"], [385, "快捷支付"]]],
+      [650, [[43, "2026-01-22"], [125, "CNY"], [190, "2.00"], [285, "1,949.56"], [385, "结息"]]],
+    ]]), "renamed-statement.pdf");
+    assert.equal(cmbDebit.source, "bank-generic");
+    assert.deepEqual(cmbDebit.errors, []);
+    assert.deepEqual(cmbDebit.txs.map(({ row, amount, balanceAfter, direction, eventType }) => [row, amount, balanceAfter, direction, eventType]), [
+      [1, 200, 800, "out", "transfer"],
+      [2, 1200, 2000, "in", "transfer"],
+      [3, 52.44, 1947.56, "out", "expense"],
+      [4, 2, 1949.56, "in", "income"],
+    ]);
+    passed("CMB transaction PDFs read direction from signed amounts and recognize incoming remittances");
 
     const transaction = (y: number, traded: string, booked: string, description: string, original: string, amount: string): PdfRow =>
       [y, [[8, traded], [74, booked], [159, "6363"], [214, description], [370, original], [482, amount]]];

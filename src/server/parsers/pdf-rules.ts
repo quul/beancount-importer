@@ -26,6 +26,7 @@ export interface PdfRules {
   tables: PdfTableRule[];
   fallback: {
     ignorePattern: RegExp; amountPattern: RegExp; outPattern: RegExp; inPattern: RegExp; transferPattern: RegExp;
+    signedAmountDocumentPattern?: RegExp;
     currency: string; category: string;
   };
 }
@@ -129,6 +130,8 @@ export function loadPdfRules(file: string | URL = rulesFile): PdfRules {
       outPattern: regex(fallback.outPattern, "fallback.outPattern"),
       inPattern: regex(fallback.inPattern, "fallback.inPattern", "i"),
       transferPattern: regex(fallback.transferPattern, "fallback.transferPattern"),
+      signedAmountDocumentPattern: fallback.signedAmountDocumentPattern === undefined ? undefined
+        : regex(fallback.signedAmountDocumentPattern, "fallback.signedAmountDocumentPattern"),
       currency: currency(fallback.currency, "fallback.currency"),
       category: text(fallback.category, "fallback.category"),
     },

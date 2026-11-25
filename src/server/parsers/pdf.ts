@@ -310,6 +310,7 @@ export async function parsePdfBank(file: string, source: ParseResult["source"], 
 
 function parseGenericStatement(file: string, source: ParseResult["source"], lines: TextLine[], rule: PdfRules["fallback"]): ParseResult {
   const txs: RawTx[] = [];
+  const signedAmount = lines.some(({ text }) => rule.signedAmountDocumentPattern?.test(compactPdfText(text)));
   interface Draft {
     date: string;
     time?: string;
@@ -335,15 +336,14 @@ function parseGenericStatement(file: string, source: ParseResult["source"], line
   }
 
   for (const d of drafts) {
-    // column semantics: debit column + credit column + balance column.
-    // The transaction amount is the first non-zero; the balance is the last.
-    const nonzero = d.amounts.filter((a) => a !== 0);
+    // Signed layouts put the transaction amount first. Other layouts may have separate debit and credit columns.
     const balance = d.amounts.length > 1 ? d.amounts[d.amounts.length - 1] : undefined;
-    const amount = nonzero[0] ?? d.amounts[0];
+    const amount = signedAmount ? d.amounts[0] : d.amounts.find((a) => a !== 0) ?? d.amounts[0];
     if (amount === 0) continue;
 
     let direction: "in" | "out";
-    if (amount < 0 || rule.outPattern.test(d.text)) direction = "out";
+    if (signedAmount) direction = amount > 0 ? "in" : "out";
+    else if (amount < 0 || rule.outPattern.test(d.text)) direction = "out";
     else if (rule.inPattern.test(d.text)) direction = "in";
     else direction = "out";
 
