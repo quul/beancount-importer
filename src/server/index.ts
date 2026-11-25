@@ -108,7 +108,7 @@ function draftProblems(txs: ParsedTx[], ledger: LedgerInfo, opening: Set<string>
 
 function referenceUncommittedBatches(txs: ParsedTx[], previous: StoredBatch[]) {
   const identities = new Map<string, Array<{ batch: StoredBatch; tx: ParsedTx }>>();
-  for (const batch of previous.filter((batch) => !batch.committed && !batch.mergedInto)) for (const tx of batch.txs) {
+  for (const batch of previous.filter((batch) => !batch.committed && !batch.mergedInto && !batch.combinedFundingPending)) for (const tx of batch.txs) {
     if (tx.status === "excluded" || tx.excludedReason || tx.status === "duplicate") continue;
     const key = sourceKey(tx.source, tx.sourceTxId, tx.sourceFileHash, tx.row);
     if (!key) continue;
@@ -219,14 +219,20 @@ function unmappedPayments(txs: ParsedTx[], wechatRules: ReturnType<typeof loadWe
   return groups;
 }
 
+function alipayCombinedParts(tx: ParsedTx) {
+  if (tx.source !== "alipay" || !isParsedStatementRow(tx) || isFamilyCard(tx)) return;
+  const parts = tx.fundingParts ?? parseFundingParts(tx.rawAccount).fundingParts;
+  if (parts && parts.length > 1) return parts;
+}
+
 function combinedFundingPayments(txs: ParsedTx[]) {
-  const groups = new Map<string, { label: string; combination: string; txs: Set<ParsedTx> }>();
+  const groups = new Map<string, { label: string; combination: string; first: boolean; txs: Set<ParsedTx> }>();
   const rows = new Map<ParsedTx, { parts: NonNullable<ParsedTx["fundingParts"]>; ids: string[] }>();
   for (const tx of txs) {
-    if (tx.source !== "alipay" || tx.status !== "pending" || tx.excludedReason || tx.postings || tx.fundingAccount2
-      || tx.fundingPartAccounts || (tx.fundingAccount && tx.fundingConfidence === 1) || isFamilyCard(tx)) continue;
-    const parts = tx.fundingParts ?? parseFundingParts(tx.rawAccount).fundingParts;
-    if (!parts || parts.length < 2) continue;
+    if (tx.status !== "pending" || tx.excludedReason || tx.postings || tx.fundingAccount2
+      || tx.fundingPartAccounts || (tx.fundingAccount && tx.fundingConfidence === 1)) continue;
+    const parts = alipayCombinedParts(tx);
+    if (!parts) continue;
     const labels = parts.map(({ rawAccount }) => rawAccount || "未标明支付方式");
     const keys = labels.map(normalizePaymentMethod);
     const key = [...keys].sort();
@@ -234,7 +240,7 @@ function combinedFundingPayments(txs: ParsedTx[]) {
     const ids = keys.map((label) => crypto.createHash("sha256")
       .update(JSON.stringify(["alipay-combined", key, label])).digest("hex"));
     ids.forEach((id, index) => {
-      const group = groups.get(id) ?? { label: labels[index], combination, txs: new Set<ParsedTx>() };
+      const group = groups.get(id) ?? { label: labels[index], combination, first: index === 0, txs: new Set<ParsedTx>() };
       group.txs.add(tx);
       groups.set(id, group);
     });
@@ -339,8 +345,9 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     if (typeof value !== "string" || !/^[a-f0-9]{32}$/.test(value)) throw new ImportError(400, "审批会话无效，请重新打开审批页");
     return value;
   };
-  const requireActiveBatch = (batch: StoredBatch) => {
+  const requireActiveBatch = (batch: StoredBatch, allowPendingFunding = false) => {
     if (batch.mergedInto) throw new ImportError(409, "此批次已合并，请打开合并后的批次");
+    if (batch.combinedFundingPending && !allowPendingFunding) throw new ImportError(409, "请先完成组合支付资金映射");
   };
   const saveBatchRevision = (batch: StoredBatch) => {
     if (batch.reviewStatusHistory) {
@@ -392,7 +399,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       const release = lockBatch(id);
       try {
         const batch = getBatch(id);
-        requireActiveBatch(batch);
+        requireActiveBatch(batch, req.method === "DELETE");
         handler(req, res, batch);
       }
       finally { release(); }
@@ -400,7 +407,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
 
   const summarizeBatch = (batch: StoredBatch) => ({
     batchId: batch.batchId, file: batchFileLabel(batch), createdAt: batch.createdAt, revision: batch.revision, committed: batch.committed,
-    mergedInto: batch.mergedInto,
+    mergedInto: batch.mergedInto, mergedFrom: batch.mergedFrom, combinedFundingPending: batch.combinedFundingPending,
     txCount: batch.txCount ?? batch.txs.filter((tx) => !tx.merge).length,
   });
   const listBatches = () => {
@@ -605,7 +612,8 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       }
       if (!importedFiles.size) throw new ImportError(422, "未导入任何账单。", errors.map(({ message }) => message));
 
-      restoreRefundedPurchases(txs, uploadConfig, currentLedger);
+      const combinedFundingPending = txs.some(alipayCombinedParts);
+      if (!combinedFundingPending) restoreRefundedPurchases(txs, uploadConfig, currentLedger);
       const llm = await classifyWithLlm(txs.filter((tx) => tx.status !== "excluded" && !needsCnySettlement(tx) && tx.confidence < 0.7), uploadConfig, currentLedger);
       for (const tx of txs) {
         const hit = llm.get(tx.id);
@@ -614,13 +622,16 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
         if (tx.status === "pending" && tx.confidence >= 0.9 && (tx.fundingConfidence ?? 0) >= 0.9 && !tx.issues?.length
           && !needsCnySettlement(tx) && !missingPostingAccount(tx)) tx.status = "ready";
       }
-      suggestRefundsFromBatch(txs, currentLedger);
+      if (!combinedFundingPending) suggestRefundsFromBatch(txs, currentLedger);
       const deduped = markDuplicates(txs, currentLedger.transactions), paired = pairTransfers(deduped.txs);
       if (profile() !== uploadProfile) throw new ImportError(409, "上传期间账本配置已切换，请在目标账本重新上传");
-      referenceUncommittedBatches(deduped.txs, batches.list().filter((previous) => previous.ledgerProfile === uploadProfile));
-      syncStatementRefunds(txs, currentLedger.transactions);
+      if (!combinedFundingPending) {
+        referenceUncommittedBatches(deduped.txs, batches.list().filter((previous) => previous.ledgerProfile === uploadProfile));
+        syncStatementRefunds(txs, currentLedger.transactions);
+      }
       const batch = batches.create({ file: [...importedFiles.values()].join(", "), source: sources.size === 1 ? [...sources][0] : "unknown",
         txCount: txs.length, txs: deduped.txs, errors,
+        ...(combinedFundingPending && { combinedFundingPending }),
         accountsDetected: detectAccounts(deduped.txs),
         ...(Object.keys(pdfUploads).length ? { pdfUploads } : {}),
         ledgerProfile: uploadProfile, ledgerErrors: currentLedger.errors ?? [], dedup: { ...deduped.stats, transferPairs: paired.pairs.length, familyCardPairs: paired.familyCardPairs } });
@@ -840,8 +851,9 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
   }));
   app.post("/api/batch/:id/funding", (req, res) => {
     const batch = getBatch(req.params.id);
-    requireActiveBatch(batch);
+    requireActiveBatch(batch, true);
     requireRevision(batch, req.body?.revision);
+    const finishCombinedFunding = Boolean(batch.combinedFundingPending);
     const txs = batch.committed ? [] : activeTransactions(batch.txs).filter((tx) => !tx.merge && !tx.reviewConflictId);
     const rules = wechatRulesFor(txs);
     const exclusionsChanged = applyWechatExclusions(txs, rules);
@@ -852,7 +864,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       return fundingParts ? [{ tx, fundingParts }] : [];
     });
     const statementDefaults = statementFundingDefaults(txs);
-    const currentLedger = payments.size || combined.groups.size || splitPayments.length || statementDefaults.size ? ledger() : undefined;
+    const currentLedger = finishCombinedFunding || payments.size || combined.groups.size || splitPayments.length || statementDefaults.size ? ledger() : undefined;
     const splits = splitPayments.map(({ tx, fundingParts }) => ({
       tx, fundingParts, guess: inferFundingAccount({ ...tx, fundingParts }, config, currentLedger),
     }));
@@ -896,13 +908,16 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
         assetMapping = setExactFundingMapping(assetMapping, source, raw, account);
       }
     }
-    for (const [id, { label, combination, txs: members }] of combined.groups) {
+    for (const [id, { label, combination, first, txs: members }] of combined.groups) {
       const rows = [...members];
       const accounts = currentLedger!.accounts.filter((account) => rows.every((tx) =>
         accountIsActive(account, tx.date, tx.currency))).map(({ account }) => account);
       const choice = choices.get(id);
       if (choice != null && !accounts.includes(choice)) throw new ImportError(400, `账户不可用：${combination} · ${label}`);
-      groups.push({ id, label, combination, source: "alipay", count: members.size, accounts });
+      const defaults = first ? new Set(rows.map((tx) => matchFundingAccount(label, tx, config, currentLedger, true).account)) : undefined;
+      const [matched] = defaults ?? [];
+      const defaultAccount = defaults?.size === 1 && accounts.includes(matched) ? matched : undefined;
+      groups.push({ id, label, combination, source: "alipay", count: members.size, accounts, defaultAccount });
     }
     if (groups.some(({ id }) => !choices.has(id))) { res.json({ groups }); return; }
 
@@ -921,6 +936,16 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       }
       fundingChanged = true;
     }
+    const skipped = new Set<ParsedTx>();
+    if (finishCombinedFunding) {
+      for (const tx of batch.txs) {
+        const parts = alipayCombinedParts(tx), selected = tx.fundingPartAccounts;
+        if (parts && (selected?.length !== parts.length || selected.some((account) => !account))) skipped.add(tx);
+      }
+      batch.txs = batch.txs.filter((tx) => !skipped.has(tx));
+      batch.txCount = batch.txs.length;
+      delete batch.combinedFundingPending;
+    }
     if (currentLedger) {
       for (const [tx, account] of resolved.size ? statementFundingDefaults(txs) : statementDefaults) {
         if (applyStatementFundingDefault(tx, account, currentLedger)) fundingChanged = true;
@@ -928,7 +953,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     }
     const fundingConfig = { ...config, assetMapping };
     for (const { tx, fundingParts, guess: originalGuess } of splits) {
-      if (tx.fundingAccount) continue;
+      if (tx.fundingAccount || skipped.has(tx)) continue;
       const guess = assetMapping === config.assetMapping ? originalGuess : inferFundingAccount({ ...tx, fundingParts }, fundingConfig, currentLedger);
       if (!guess.account) continue;
       tx.fundingParts = fundingParts;
@@ -940,13 +965,14 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
       fundingChanged = true;
     }
     // Matching can use the new funding accounts before review starts. Resumed batches keep prior review decisions.
-    if (fundingChanged && batch.revision === 1 && currentLedger) {
+    if ((finishCombinedFunding || (fundingChanged && batch.revision === 1)) && currentLedger) {
       for (const tx of batch.txs) {
         delete tx.matches;
         delete tx.duplicateOf;
         tx.issues = tx.issues?.filter((issue) => !duplicateReviewIssue(issue) && !transferPairIssue(issue) && !otherBatchIssue(issue));
         tx.status = tx.excludedReason ? "excluded" : tx.status === "ready" ? "ready" : "pending";
       }
+      if (finishCombinedFunding) restoreRefundedPurchases(batch.txs, fundingConfig, currentLedger);
       suggestRefundsFromBatch(batch.txs, currentLedger);
       const deduped = markDuplicates(batch.txs, currentLedger.transactions), paired = pairTransfers(batch.txs);
       referenceUncommittedBatches(batch.txs, batches.list().filter((item) => item.batchId !== batch.batchId && item.ledgerProfile === batch.ledgerProfile));
@@ -954,14 +980,19 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     } else if (fundingChanged && currentLedger) {
       refreshLedgerDuplicateHints(txs, currentLedger.transactions);
     }
-    const refundsChanged = syncStatementRefunds(txs, currentLedger?.transactions);
-    if (!fundingChanged && !exclusionsChanged && !refundsChanged) { res.json({ groups: [] }); return; }
+    const refundsChanged = syncStatementRefunds(txs.filter((tx) => !skipped.has(tx)), currentLedger?.transactions);
+    if (!finishCombinedFunding && !fundingChanged && !exclusionsChanged && !refundsChanged) { res.json({ groups: [] }); return; }
     const release = lockBatch(batch.batchId);
     try {
       const latest = getBatch(batch.batchId);
-      requireActiveBatch(latest);
+      requireActiveBatch(latest, true);
       requireRevision(latest, batch.revision);
       if (latest.committed) throw new ImportError(409, "已写入的批次不能再修改");
+      if (finishCombinedFunding && !batch.txs.some(isParsedStatementRow)) {
+        batches.remove(batch.batchId);
+        res.json({ groups: [], skippedCombined: skipped.size, batchRemoved: true });
+        return;
+      }
       if (assetMapping !== config.assetMapping) {
         const candidate = { ...config, assetMapping };
         saveConfig(candidate, { activeLedgerFile: options.activeLedgerFile });
@@ -972,7 +1003,7 @@ export function createApp(options: { dataDir?: string; config?: AppConfig; activ
     } finally {
       release();
     }
-    res.json({ batch: publicBatch(batch), groups: [], config: publicConfig() });
+    res.json({ batch: publicBatch(batch), groups: [], config: publicConfig(), skippedCombined: skipped.size || undefined });
   });
   app.post("/api/batch/:id/funding-mapping", withBatchWrite((req, res, batch) => {
     if (batch.committed) throw new ImportError(409, "已写入的批次不能再修改");

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { api, ApiError, IncompleteReviewError } from "../web/src/api.js";
+import { groupBatchList } from "../web/src/batchList.js";
 import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, validatePostingDraft } from "../web/src/ReviewEditor.js";
 import { calculatePostingAmount } from "../web/src/postingCalculator.js";
 import { applyPendingReviewPatches, reviewPatches, type ReviewPatches } from "../web/src/reviewChanges.js";
@@ -267,6 +268,22 @@ try {
   assert.deepEqual(refundable.options, [foodAccount, fundAccount]);
   console.log("✓ individual and bulk category choices accept every account type, including for transfers and refunds");
 
+  const summary = (batchId: string, committed = false, mergedInto?: string) =>
+    ({ batchId, file: batchId, createdAt: 0, revision: 1, txCount: 1, committed, mergedInto });
+  const list = groupBatchList([
+    summary("active"), summary("ordinary-completed", true), summary("completed-merge", true),
+    summary("nested-merge", false, "active"), summary("nested-source", false, "nested-merge"),
+    summary("completed-source", false, "completed-merge"), summary("deleted-source", false, "deleted-merge"),
+    { ...summary("upload"), combinedFundingPending: true },
+  ]);
+  assert.deepEqual(list.active.map(({ batchId }) => batchId), ["active"]);
+  assert.deepEqual(list.completed.map(({ batchId }) => batchId), ["ordinary-completed", "completed-merge"]);
+  assert.deepEqual(list.staged.map(({ batchId }) => batchId), ["upload"]);
+  assert.deepEqual(list.children.get("active")?.map(({ batchId }) => batchId), ["nested-merge"]);
+  assert.deepEqual(list.children.get("nested-merge")?.map(({ batchId }) => batchId), ["nested-source"]);
+  assert.deepEqual(list.deleted, ["deleted-merge"]);
+  console.log("✓ ordinary and merged completed approvals share an archive; merged sources stay under their immediate approval");
+
   status = 422;
   const reviewReminder = "请将待确认内容处理完毕后，再点击「生成预览」。";
   const reviewProblems = [{ id: "transfer", field: "category", message: "请选择转账对方账户" }];
@@ -294,5 +311,5 @@ try {
   await assert.rejects(() => api.upload([]), (error: unknown) => error instanceof ApiError && error.temporary
     && error.message === "服务连接中断，请重试");
   console.log("✓ empty responses, proxy pages and network exceptions get friendly retry messages");
-  console.log("Web contract regression passed (13 groups).");
+  console.log("Web contract regression passed (14 groups).");
 } finally { globalThis.fetch = originalFetch; }

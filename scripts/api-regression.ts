@@ -1100,7 +1100,7 @@ try {
       { id: groups[0].id, account: "Assets:CN:BOC:1111" },
       { id: groups[1].id, account: "Assets:CN:BOC:2222" },
       { id: groups[2].id, account: "Assets:CN:BOC:2222" },
-      { id: groups[3].id, account: null },
+      { id: groups[3].id, account: "Equity:Coupons:Payment" },
     ];
     await request(mappingBase, `${route}/funding`, { revision, mappings }, 409);
     fs.unlinkSync(fundingLock);
@@ -1158,6 +1158,21 @@ try {
     ].join("\n"));
     assert.ok(imported.txs.every((tx) => tx.status === "pending" && tx.fundingAccount === card && tx.fundingConfidence! < 1
       && tx.fundingParts?.length === 2 && tx.issues?.includes("组合支付，分摊待确认")));
+    const knownRoute = `/api/batch/${imported.batchId}`;
+    const known: { groups: FundingMappingGroup[] } = await request(splitBase, knownRoute + "/funding", { revision: imported.revision });
+    assert.equal(imported.combinedFundingPending, true);
+    assert.deepEqual(known.groups.map(({ label, defaultAccount }) => [label, defaultAccount]), [
+      [method, card], ["红包", undefined], ["积分", undefined], [method, undefined],
+    ]);
+    await request(splitBase, knownRoute + "/generate", { revision: imported.revision }, 409);
+    await request(splitBase, "/api/batches/merge-options", { batches: [
+      { batchId: imported.batchId, revision: imported.revision }, { batchId: batch.batchId, revision: batch.revision },
+    ] }, 409);
+    const removed = await request(splitBase, knownRoute + "/funding", { revision: imported.revision,
+      mappings: known.groups.map(({ id, defaultAccount }) => ({ id, account: defaultAccount ?? null })) });
+    assert.deepEqual(removed, { groups: [], skippedCombined: 2, batchRemoved: true });
+    await request(splitBase, knownRoute, undefined, 404);
+    assert.ok(!(await request(splitBase, "/api/batches")).some(({ batchId }: { batchId: string }) => batchId === imported.batchId));
 
     const store = new BatchStore(path.join(splitData, "batches"));
     const older: ParsedTx = { ...imported.txs[1], id: "older-split", sourceTxId: "older-split", fundingAccount: "", fundingConfidence: 0,
@@ -1213,15 +1228,17 @@ try {
       id, account: !combination ? wallet : combination === creditAndDiscount ? (label === newMethod ? card : coupon) : null,
     })) });
     assert.deepEqual(mapped.groups, []);
-    assert.equal(mapped.batch.txs.length, needsMapping.txs.length);
-    assert.ok(mapped.batch.txs.slice(0, 2).every((tx: ParsedTx, index: number) => tx.status === "pending"
-      && tx.sourceTxId === needsMapping.txs[index].sourceTxId && tx.amount === needsMapping.txs[index].amount && !tx.postings));
+    assert.equal(mapped.skippedCombined, 2);
+    assert.equal(mapped.batch.txCount, 3);
+    assert.equal(mapped.batch.combinedFundingPending, undefined);
+    assert.deepEqual(mapped.batch.txs.map((tx: ParsedTx) => tx.sourceTxId), ["new-split-1", "new-split-3", "new-split-5"]);
+    assert.ok(mapped.batch.txs.every((tx: ParsedTx) => tx.status === "pending" && !tx.postings));
     assert.deepEqual(mapped.batch.txs[0].fundingParts, needsMapping.txs[0].fundingParts);
     assert.deepEqual(mapped.batch.txs.map((tx: ParsedTx) => tx.fundingPartAccounts), [
-      [card, coupon], [null, null], undefined, [null, null], [coupon, card],
+      [card, coupon], undefined, [coupon, card],
     ]);
     assert.equal(mapped.batch.txs[0].fundingAccount, card);
-    assert.equal(mapped.batch.txs[2].fundingAccount, wallet);
+    assert.equal(mapped.batch.txs[1].fundingAccount, wallet);
     assert.deepEqual(mapped.config.assetMapping, [...splitConfig.assetMapping, { keyword: newMethod, source: "alipay", exact: true, account: wallet, kind: "debit" }]);
     assert.deepEqual(await request(splitBase, splitRoute, { revision: mapped.batch.revision }), { groups: [] });
     const reviewRoute = `/api/batch/${needsMapping.batchId}`;
@@ -1243,8 +1260,9 @@ try {
     assert.equal(again.txs[0].fundingAccount, wallet);
     assert.ok(again.txs.every((tx) => tx.fundingPartAccounts === undefined));
     const nextFunding = await request(splitBase, "/api/batch/" + again.batchId + "/funding", { revision: again.revision });
-    assert.deepEqual(nextFunding.groups, components);
-    passed("Alipay combination accounts are independently optional, scoped to the batch, and applied to split review");
+    assert.deepEqual(nextFunding.groups, components.map((component) => component.combination === creditAndDiscount && component.label === newMethod
+      ? { ...component, defaultAccount: wallet } : component));
+    passed("Alipay combinations prefill the first saved account and only import complete batch-local mappings");
   }
   {
     const quickRoot = path.join(temporary, "quick-funding-mapping");
@@ -1785,6 +1803,8 @@ try {
     assert.equal(result.statementSources![0].name, "中信");
     assert.equal(result.statementSources![0].file, "原始账单一.csv");
     assert.ok(merged.batches.filter((item: { mergedInto?: string }) => item.mergedInto === result.batchId).length === 3);
+    assert.deepEqual(merged.batches.find(({ batchId }: { batchId: string }) => batchId === result.batchId).mergedFrom,
+      selection.map(({ batchId }) => batchId));
     assert.equal((await request(combinedBase, firstRoute)).mergedInto, result.batchId);
     await request(combinedBase, firstRoute + "/decide", { revision: grouped.batch.revision, decisions: [] }, 409);
     await request(combinedBase, firstRoute + "/generate", { revision: grouped.batch.revision }, 409);

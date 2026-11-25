@@ -14,6 +14,7 @@ import { activeTransactions } from "../../src/shared/transactionMerge.js";
 import { api, ApiError, IncompleteReviewError, type BatchMergeOptions, type BatchSummary, type ConfigResponse, type GeneratedPreview, type LedgerSummary, type MergeDraft } from "./api";
 import { draftDecision, draftPostings, invalidTags, makeDraft, parseTags, ReviewMetadataFields, ReviewPostingFields, shakeInvalidFields, TransactionSourceDetails, validatePostingDraft, type ReviewDraft } from "./ReviewEditor";
 import AccountSelect from "./AccountSelect";
+import { groupBatchList } from "./batchList";
 import BatchReviewDialog from "./BatchReviewDialog";
 import BeancountCode from "./BeancountCode";
 import ConfigPanel, { SETTINGS_LINKS, type SettingsSection } from "./ConfigPanel";
@@ -78,6 +79,7 @@ type FundingTarget = { id: string; batch: ImportPreview; opening: ReviewOpening;
 type PreviewCheck = { message: string; problems: ReviewProblem[] };
 
 const reviewIcons = {
+  chevron: <path d="m7.5 4.5 5.5 5.5-5.5 5.5" />,
   info: <><circle cx="10" cy="10" r="7.6" /><path d="M10 9.5v4" /><circle cx="10" cy="6.8" r=".9" fill="currentColor" stroke="none" /></>,
   check: <path d="M2.8 10.5 7.6 16.5 17.2 3.5" />,
   cross: <path d="M3.2 3.2 16.8 16.8M16.8 3.2 3.2 16.8" />,
@@ -251,6 +253,7 @@ export default function App() {
   const [ledger, setLedger] = useState<LedgerSummary | null>(null);
   const [batches, setBatches] = useState<BatchSummary[]>([]);
   const [selectedBatchIds, setSelectedBatchIds] = useState(new Set<string>());
+  const [expandedBatchIds, setExpandedBatchIds] = useState(new Set<string>());
   const [batchMergeOptions, setBatchMergeOptions] = useState<BatchMergeOptions | null>(null);
   const [renameStatementsOpen, setRenameStatementsOpen] = useState(false);
   const [batchesRefreshing, setBatchesRefreshing] = useState(false);
@@ -477,8 +480,9 @@ export default function App() {
   const statementSources = useMemo(() => new Map(batch?.statementSources?.map((source) => [source.id, source])), [batch?.statementSources]);
   const sourcesFor = (entries: readonly ParsedTx[]) => [...new Set(entries.flatMap((tx) => tx.statementSourceIds ?? []))]
     .flatMap((id) => statementSources.get(id) ?? []);
-  const selectedBatches = batches.filter((item) => !item.committed && !item.mergedInto && selectedBatchIds.has(item.batchId));
-  const archivedBatches = batches.filter((item) => item.mergedInto);
+  const selectedBatches = batches.filter((item) => !item.committed && !item.mergedInto && !item.combinedFundingPending && selectedBatchIds.has(item.batchId));
+  const batchList = useMemo(() => groupBatchList(batches), [batches]);
+  const archivedCount = batchList.completed.length + batchList.deleted.length;
   const fileErrors = batch?.errors.filter(({ row }) => row === 0) ?? [];
   const rowErrors = batch?.errors.filter(({ row }) => row > 0) ?? [];
   const emptyImportFailed = !!batch?.errors.length && batch.txs.length === 0;
@@ -751,15 +755,16 @@ export default function App() {
   const prepareReview = async (id: string, value: ImportPreview, opening: ReviewOpening, mappings?: FundingMappingChoice[]) => {
     if (batchIdFromUrl() !== id) return;
     const editable = !value.committed && !value.mergedInto;
-    const restoringRefund = editable && value.txs.some((tx) => tx.refundCounterpartId && tx.eventType === "expense" && tx.status === "excluded" && tx.excludedReason);
+    const restoringRefund = editable && !value.combinedFundingPending
+      && value.txs.some((tx) => tx.refundCounterpartId && tx.eventType === "expense" && tx.status === "excluded" && tx.excludedReason);
     if (restoringRefund) {
       const result = await api.recheckLedger(id, value.revision ?? 0);
       if (batchIdFromUrl() !== id) return;
       value = result.batch;
     }
-    if (editable && !value.statementSources?.length && activeTransactions(value.txs).some((tx) => !tx.merge
-      && (tx.source === "wechat" || (!tx.fundingAccount && tx.status !== "excluded" && tx.status !== "duplicate")
-        || (opening === "import" && tx.source === "alipay" && tx.status === "pending" && !tx.fundingPartAccounts && isCombinedPayment(tx))))) {
+    let skippedCombined = 0;
+    if (editable && !value.statementSources?.length && (value.combinedFundingPending || activeTransactions(value.txs).some((tx) => !tx.merge
+      && (tx.source === "wechat" || (!tx.fundingAccount && tx.status !== "excluded" && tx.status !== "duplicate"))))) {
       const result = await api.funding(id, value.revision ?? 0, mappings);
       if (batchIdFromUrl() !== id) return;
       if (result.groups.length) {
@@ -767,7 +772,20 @@ export default function App() {
         return;
       }
       if (result.config) setConfig(result.config);
-      if (result.batch) value = result.batch;
+      skippedCombined = result.skippedCombined ?? 0;
+      if (result.batchRemoved) {
+        clearReview();
+        setBatches((previous) => previous.filter(({ batchId }) => batchId !== id));
+        navigateBatch("", { replace: true });
+        setNotice(`已跳过 ${skippedCombined} 笔映射未填齐的组合支付，未创建导入批次。`);
+        return;
+      }
+      if (result.batch) {
+        value = result.batch;
+        const { revision, txCount, combinedFundingPending } = value;
+        setBatches((previous) => previous.map((item) => item.batchId === id
+          ? { ...item, revision: revision ?? item.revision, txCount, combinedFundingPending } : item));
+      }
     }
     startReview(id, value, opening !== "import");
     if (opening === "reload" && editable) {
@@ -778,6 +796,7 @@ export default function App() {
       }
       setNotice("已重新载入并复查疑似重复");
     }
+    if (skippedCombined) setNotice(`已跳过 ${skippedCombined} 笔映射未填齐的组合支付。`);
   };
 
   const loadReview = async (id: string, opening: ReviewOpening) => {
@@ -824,8 +843,8 @@ export default function App() {
     void perform(async () => {
       setUploading(true);
       const result = await api.upload(selectedFiles).finally(() => setUploading(false));
-      const { file, createdAt, revision, committed, txCount } = result.preview;
-      const saved = { batchId: result.batchId, file, createdAt, revision, committed, txCount };
+      const { file, createdAt, revision, committed, txCount, combinedFundingPending } = result.preview;
+      const saved = { batchId: result.batchId, file, createdAt, revision, committed, txCount, combinedFundingPending };
       setBatches((previous) => [saved, ...previous.filter((item) => item.batchId !== saved.batchId)]);
       navigateBatch(saved.batchId);
       try {
@@ -1108,6 +1127,7 @@ export default function App() {
     setUndoFlashIds(null);
     setBatchMergeOptions(null);
     setRenameStatementsOpen(false);
+    setExpandedBatchIds(new Set());
   };
 
   useEffect(() => {
@@ -1572,29 +1592,57 @@ export default function App() {
       onCancel={(event) => { event.preventDefault(); closeDetails(); }}>{panel}</dialog> : panel;
   };
 
+  const renderBatchDisclosure = (id: string, label: string) => {
+    const expanded = expandedBatchIds.has(id);
+    return <button type="button" className="btn quiet batch-toggle" aria-expanded={expanded} aria-controls={`batch-children-${id}`}
+      aria-label={`${expanded ? "收起" : "展开"}原批次 · ${label}`} onClick={() => setExpandedBatchIds((previous) => {
+        const next = new Set(previous);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      })}><ReviewIcon name="chevron" /></button>;
+  };
+
   const renderBatchRow = (item: BatchSummary) => {
-    const selectable = !item.committed && !item.mergedInto;
-    const label = item.mergedInto ? "查看原批次" : item.committed ? "查看批次" : "继续审批";
-    return <div className={`batch-row${selectable && selectedBatchIds.has(item.batchId) ? " is-selected" : ""}`} key={item.batchId}>
-      {selectable && <label className="batch-select">
-        <input type="checkbox" className="checkbox" aria-label={`选择批次 · ${item.file}`} disabled={busy}
-          checked={selectedBatchIds.has(item.batchId)} onChange={(event) => {
-            const next = new Set(selectedBatchIds);
-            if (event.target.checked) next.add(item.batchId);
-            else next.delete(item.batchId);
-            setSelectedBatchIds(next);
-          }} />
-      </label>}
-      <div className="batch-info"><b title={item.file}>{item.file}</b>
-        <small>{batchTime(item.createdAt)} · {item.txCount} 笔{item.committed && " · 已提交"}{item.mergedInto && " · 已合并"}</small></div>
+    const editable = !item.committed && !item.mergedInto;
+    const selectable = editable && !item.combinedFundingPending;
+    const label = item.combinedFundingPending ? "完成导入" : item.mergedInto ? "查看原批次" : item.committed ? "查看批次" : "继续审批";
+    return <div className={`batch-row${selectable && selectedBatchIds.has(item.batchId) ? " is-selected" : ""}`}>
+      <div className="batch-leading">
+        {batchList.children.has(item.batchId) && renderBatchDisclosure(item.batchId, item.file)}
+        {selectable && <label className="batch-select">
+          <input type="checkbox" className="checkbox" aria-label={`选择批次 · ${item.file}`} disabled={busy}
+            checked={selectedBatchIds.has(item.batchId)} onChange={(event) => {
+              const next = new Set(selectedBatchIds);
+              if (event.target.checked) next.add(item.batchId);
+              else next.delete(item.batchId);
+              setSelectedBatchIds(next);
+            }} />
+        </label>}
+        <div className="batch-info"><b title={item.file}>{item.file}</b>
+          <small>{batchTime(item.createdAt)} · {item.combinedFundingPending ? "待选组合支付账户" : `${item.txCount} 笔`}
+            {item.committed && " · 已提交"}{item.mergedInto && " · 已合并"}</small></div>
+      </div>
       <div className="batch-actions">
-        <button type="button" className={`btn${selectable ? " primary" : ""}`} disabled={busy}
+        <button type="button" className={`btn${editable ? " primary" : ""}`} disabled={busy}
           aria-label={`${label} · ${item.file}`} onClick={() => navigateBatch(item.batchId)}>{label}</button>
-        {selectable && <button type="button" className="btn batch-delete" disabled={busy}
+        {editable && <button type="button" className="btn batch-delete" disabled={busy}
           aria-label={`删除批次 ${item.file}（${batchTime(item.createdAt)}）`} onClick={() => setDeleteTarget(item)}>删除</button>}
       </div>
     </div>;
   };
+
+  const renderBatchChildren = (id: string) => {
+    const expanded = expandedBatchIds.has(id);
+    return <div className="batch-children" id={`batch-children-${id}`} hidden={!expanded}>
+      {expanded && batchList.children.get(id)?.map(renderBatchGroup)}
+    </div>;
+  };
+
+  const renderBatchGroup = (item: BatchSummary) => <div className="batch-group" key={item.batchId}>
+    {renderBatchRow(item)}
+    {batchList.children.has(item.batchId) && renderBatchChildren(item.batchId)}
+  </div>;
 
   const renderReviewRow = ({ tx, refund, entries, amount, originals }: ReviewRow) => {
     const payee = tx.payee || "（无商户）";
@@ -1759,6 +1807,7 @@ export default function App() {
     {error && !fundingTarget && !mappingTarget && !mergeIds && !batchMergeOptions && !renameStatementsOpen
       && <div className="card alert" role="alert"><b>操作未完成</b><p>{error}</p><button className="btn small" onClick={() => setError("")}>关闭</button></div>}
     {!settings && fundingTarget && fundingTarget.id === routedBatchId && <FundingDialog key={fundingTarget.id} groups={fundingTarget.groups} busy={busy} error={error}
+      skipIncomplete={fundingTarget.batch.combinedFundingPending}
       onCancel={() => {
         setFundingTarget(null);
         setError("");
@@ -1808,11 +1857,21 @@ export default function App() {
           </>}
           <button className="btn small" disabled={busy || batchesRefreshing} onClick={() => void refreshBatchList()}>刷新</button>
         </div>
-        {!batches.length ? <p className="muted">{batchesRefreshing ? "正在加载导入批次…" : "暂无已保存批次。"}</p>
-          : <div className="batch-list">{batches.filter((item) => !item.mergedInto).map(renderBatchRow)}</div>}
-        {archivedBatches.length > 0 && <details className="archived-batches">
-          <summary>已合并批次（{archivedBatches.length}）</summary>
-          <div className="batch-list">{archivedBatches.map(renderBatchRow)}</div>
+        {!batches.length && <p className="muted">{batchesRefreshing ? "正在加载导入批次…" : "暂无已保存批次。"}</p>}
+        {batchList.staged.length > 0 && <section className="batch-list" aria-labelledby="staged-batches-heading">
+          <h3 id="staged-batches-heading">待完成导入</h3>
+          {batchList.staged.map(renderBatchGroup)}
+        </section>}
+        {batchList.active.length > 0 && <div className="batch-list">{batchList.active.map(renderBatchGroup)}</div>}
+        {archivedCount > 0 && <details className="archived-batches">
+          <summary>已完成审批（{archivedCount}）</summary>
+          <div className="batch-list">
+            {batchList.completed.map(renderBatchGroup)}
+            {batchList.deleted.map((id) => <div className="batch-group" key={id}>
+              <div className="batch-row">{renderBatchDisclosure(id, "已删除的合并审批")}<b>已删除的合并审批</b></div>
+              {renderBatchChildren(id)}
+            </div>)}
+          </div>
         </details>}
       </section>
     </>}

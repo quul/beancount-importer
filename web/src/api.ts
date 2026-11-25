@@ -8,6 +8,8 @@ export interface BatchSummary extends BatchRevision {
   createdAt: number;
   committed: boolean;
   mergedInto?: string;
+  mergedFrom?: string[];
+  combinedFundingPending?: boolean;
   txCount: number;
 }
 
@@ -133,7 +135,9 @@ export const api = {
     post<{ batch: ImportPreview; excluded: number }>(`/api/batch/${encodeURIComponent(id)}/exclude-suspected`, { revision, reviewSessionId }),
   undoReviewStatus: (id: string, revision: number, reviewSessionId: string) =>
     post<{ batch: ImportPreview; restoredIds: string[] }>(`/api/batch/${encodeURIComponent(id)}/undo-review-status`, { revision, reviewSessionId }),
-  funding: (id: string, revision: number, mappings?: FundingMappingChoice[]) => post<{ groups: FundingMappingGroup[]; batch?: ImportPreview; config?: ConfigResponse }>(`/api/batch/${encodeURIComponent(id)}/funding`, { revision, mappings }),
+  funding: (id: string, revision: number, mappings?: FundingMappingChoice[]) =>
+    post<{ groups: FundingMappingGroup[]; batch?: ImportPreview; config?: ConfigResponse; skippedCombined?: number; batchRemoved?: boolean }>(
+      `/api/batch/${encodeURIComponent(id)}/funding`, { revision, mappings }),
   saveFundingMapping: (batchId: string, revision: number, id: string, account: string) =>
     post<{ batch: ImportPreview; config: ConfigResponse; updated: number }>(
       `/api/batch/${encodeURIComponent(batchId)}/funding-mapping`, { revision, id, account },

@@ -178,8 +178,13 @@ select {
 .dz-sub { font-size: 12px; color: var(--muted); }
 
 .batch-list { margin-top: 8px; }
+.batch-list > h3 { margin: 4px 0 8px; font-size: 13px; }
 .batch-row { display: flex; align-items: center; gap: 14px; padding: 12px 0; border-top: 1px solid var(--line); }
 .batch-row.is-selected { background: var(--accent-soft); }
+.batch-leading { display: flex; align-items: center; flex: 1; gap: 8px; min-width: 0; }
+.btn.batch-toggle { display: grid; place-items: center; flex: none; width: 32px; min-height: 36px; padding: 0; }
+.batch-toggle[aria-expanded="true"] svg { transform: rotate(90deg); }
+.batch-children { margin-inline-start: clamp(10px, 2vw, 20px); padding-inline-start: 8px; border-inline-start: 1px solid var(--line); }
 .batch-select { display: grid; place-items: center; flex: none; width: 32px; min-height: 36px; cursor: pointer; }
 .archived-batches { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); color: var(--muted); }
 .archived-batches .batch-list { color: var(--text); }
@@ -697,7 +702,8 @@ pre.code { max-height: 440px; overflow: auto; margin-bottom: 0; padding: 14px; b
   .card { padding: 12px; }
   .header-details > summary { min-height: 44px; }
   .batch-row { flex-wrap: wrap; gap: 8px; }
-  .batch-info { flex-basis: 100%; }
+  .batch-leading { flex-basis: 100%; }
+  .btn.batch-toggle { min-height: 44px; }
   .review-search { max-width: none; flex-basis: 100%; }
   .review-actions { flex-basis: 100%; }
   .account-select::after { top: 17px; }

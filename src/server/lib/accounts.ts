@@ -110,7 +110,7 @@ export function inferFundingAccount(tx: ParsedTx, config: AppConfig, ledger?: Le
   return matchFundingAccount(raw, tx, config, ledger);
 }
 
-export function matchFundingAccount(raw: string, tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo): FundingGuess {
+export function matchFundingAccount(raw: string, tx: ParsedTx, config: AppConfig, ledger?: LedgerInfo, configuredOnly = false): FundingGuess {
   const available = ledger?.accounts;
   const valid = (name: string) => {
     if (!isFundingAccount(name)) return false;
@@ -145,8 +145,9 @@ export function matchFundingAccount(raw: string, tx: ParsedTx, config: AppConfig
     if (cardAccounts.length > 1) return unknown("账户映射冲突");
     if (cardAccounts.length === 1) return { account: cardAccounts[0], confidence: 0.98, reason: `卡尾号 ${suffix} 与已保存的信用卡映射一致` };
   }
-  const mappings = config.assetMapping.filter((m) => !m.exact && isFundingAccount(m.account));
-  const dynamic = available ? buildAssetMapping(available, tx.date).filter((m) => valid(m.account)) : [];
+  const mappings = config.assetMapping.filter((m) => !m.exact && isFundingAccount(m.account)
+    && (!configuredOnly || !m.source || m.source === tx.source));
+  const dynamic = available && !configuredOnly ? buildAssetMapping(available, tx.date).filter((m) => valid(m.account)) : [];
   const keywords = (m: AppConfig["assetMapping"][number]) => raw.toLowerCase().includes(m.keyword.toLowerCase());
 
   // Wallet investment products must not fall through to the cash wallet.

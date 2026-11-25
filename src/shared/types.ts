@@ -311,6 +311,7 @@ export interface ImportPreview {
   source: SourceType;
   txCount: number;
   txs: ParsedTx[];
+  combinedFundingPending?: boolean;
   /** Separate approval batch for foreign transactions pending when this batch was committed. */
   settlementBatchId?: string;
   errors: Array<{ row: number; message: string }>;
@@ -396,6 +397,7 @@ export interface FundingMappingGroup {
   accounts: string[];
   statementOnly?: boolean;
   combination?: string;
+  defaultAccount?: string;
 }
 
 export interface FundingMappingChoice {
